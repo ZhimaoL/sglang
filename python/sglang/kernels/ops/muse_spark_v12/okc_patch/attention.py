@@ -116,8 +116,14 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
     backend = get_attn_backend()
     if not _fa_backend(backend) or backend.use_mla:
         return None
+    # Cascade (spec topk > 1) and prefill-aware SWA rewrite the tables these kernels
+    # read; DFLASH is chain mode, so both stay off in the judge config.
+    if forward_batch.spec_info is not None and backend.topk > 1:
+        return None
     meta = backend.forward_metadata
     if meta is None or meta.cache_seqlens_int32 is None:
+        return None
+    if backend.is_prefill_aware_swa and meta.pa_swa_page_table is not None:
         return None
     tokens = qkv.shape[0]
     bs = forward_batch.batch_size

@@ -24,6 +24,7 @@ checks both and declines otherwise.
 """
 
 import logging
+import os
 
 import torch
 import triton
@@ -36,6 +37,10 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import moe_ext
 logger = logging.getLogger(__name__)
 
 _POST_NORM_EPS = 1e-8
+# TMA-chain token ceiling: covers verify up to bs 32 x 8 drafts = 256 (the certified
+# regime) and keeps 16K-token prefill chunks on Marlin, whose per-expert buffers the
+# TMA chain's padded [E_local * ceil16(T), I] fp16 workspaces cannot afford there.
+_TMA_MAX_TOKENS = int(os.environ.get("OKC_MOE_TMA_MAX_TOKENS", "256"))
 
 
 _SIDE_STREAMS = []
@@ -566,7 +571,9 @@ def maybe_forward(
         return None
     topk = topk_ids.shape[1]
     use_cuda = _sw.SW_MOE_CUDA and tokens <= 8 and topk <= 8 and "w13c" in state
-    use_tma = _sw.SW_MOE_TMA and tokens > 32 and "w13i" in state
+    use_tma = (
+        _sw.SW_MOE_TMA and 32 < tokens <= _TMA_MAX_TOKENS and "w13i" in state
+    )
     if not (use_cuda or use_tma):
         return None
     if post_expert_norm is None or not _ensure_pw32(layer, state, post_expert_norm):
