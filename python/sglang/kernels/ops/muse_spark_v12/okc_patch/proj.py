@@ -1,0 +1,137 @@
+"""OKC small-m dense projections (muse_bf16_proj v5 graft).
+
+m == 1 runs the FFMA streaming GEMV straight off the resident [N, K] bf16 weight (no
+copies). m = 2..8 runs the lane's tensor-core MMA path (needs a packed B-fragment
+copy of the weight, built lazily per weight; OKC_SW_PROJ_MMA opts into that memory)
+or the tuned Triton dot where that won. Only the court-certified (N, K) shapes are
+claimed; everything else falls through to the stock dispatcher.
+
+Certified per-call wins (kernel court, H200, graph replay, cold L2): the small-T CUDA
+stack is where decode1 1.46x / verify1 1.27-1.29x per layer came from.
+
+Memory cost of OKC_SW_PROJ_MMA, per Muse TP8 layer that hits it: qkv_gate pack
+[2304, 8192] bf16 = 36 MiB + pooler pack [4096, 8192] bf16 = 64 MiB, so about
+100 MiB x 62 layers = 6.1 GiB per rank. OKC_SW_PROJ alone copies nothing.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PROJ_MMA
+from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import proj_ext
+
+
+@triton.jit
+def _dot(x_ptr, w_ptr, out_ptr, M, N,
+         K: tl.constexpr, BLOCK_M: tl.constexpr,
+         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        x_t = tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                      mask=m_mask[:, None], other=0.0)
+        w = tl.load(w_ptr + offs_n[:, None] * K + offs_k[None, :])
+        acc += tl.dot(x_t, tl.trans(w), out_dtype=tl.float32)
+    tl.store(out_ptr + offs_m[:, None] * N + offs_n[None, :], acc.to(tl.bfloat16),
+             mask=m_mask[:, None])
+
+
+def _repack_mma(w):
+    """[N, K] bf16 row-major -> per-(8-row strip, 64-k group) 1KB blocks laid out so
+    lane t's two uint4 hold the exact m16n8k16 B-fragments of 4 consecutive mmas."""
+    N, K = w.shape
+    v = w.view(N // 8, 8, K // 64, 2, 2, 2, 4, 2)       # nb, g, g64, q2, q1, i, c, e
+    return v.permute(0, 2, 1, 6, 3, 4, 5, 7).contiguous().view(-1)  # nb,g64,g,c,q2,q1,i,e
+
+
+def _mma_ok(n, k, m, MR, SK, WPC, G):
+    return (m <= MR and n % (8 * WPC) == 0 and k % (SK * 64 * G) == 0
+            and MR * (k // SK + 8) * 2 <= 135168)
+
+
+# Court-certified winners keyed by the dense site's (N, K) at Muse Spark TP8:
+# qkv_gate (2304, 8192), o (8192, 1024), pooler (4096, 8192), unpooler (8192, 4096).
+_CU_CFG = {
+    (2304, 8192): (1, 1, 2, 4),
+    (8192, 1024): (1, 1, 2, 4),
+    (4096, 8192): (1, 1, 2, 4),
+    (8192, 4096): (1, 1, 2, 4),
+}
+_MMA_CFG = {
+    (2304, 8192): (8, 8, 8, 4),
+    (4096, 8192): (8, 4, 8, 8),
+}
+_TRI_CFG = {
+    (8192, 1024): (32, 128, 4, 4),
+}
+
+# (data_ptr, shape) -> packed B-fragment tensor. Weights are frozen after load, so
+# the pointer identifies the tensor for the process lifetime.
+_MMA_PACKS = {}
+
+
+def _mma_pack(w):
+    key = (w.data_ptr(), tuple(w.shape))
+    pack = _MMA_PACKS.get(key)
+    if pack is None:
+        pack = _repack_mma(w)
+        _MMA_PACKS[key] = pack
+    return pack
+
+
+def small_m_gemm(x, weight):
+    """Claim a [m <= 8, K] @ [N, K]^T bf16 GEMM at a certified shape; None = declined."""
+    if torch.compiler.is_compiling():
+        return None
+    if x.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16:
+        return None
+    if not (x.is_cuda and weight.is_cuda):
+        return None
+    k = x.shape[-1]
+    m = x.numel() // k
+    if m > 8 or m == 0:
+        return None
+    n = weight.shape[0]
+    if weight.shape[1] != k or not weight.is_contiguous():
+        return None
+    x2 = x.view(-1, k)
+    if not x2.is_contiguous():
+        return None
+    out_shape = (*x.shape[:-1], n)
+    if m == 1:
+        cfg = _CU_CFG.get((n, k))
+        if cfg is not None:
+            MT, R, U, WPC = cfg
+            if n % (R * WPC) == 0 and k % (256 * U) == 0:
+                out = torch.empty((1, n), dtype=torch.bfloat16, device=x.device)
+                proj_ext().gemv_bf16_launch(weight, x2, out, 1, n, k, MT, R, U, WPC)
+                return out.view(out_shape)
+        return None
+    if SW_PROJ_MMA:
+        cfg = _MMA_CFG.get((n, k))
+        if cfg is not None:
+            MR, SK, WPC, G = cfg
+            if _mma_ok(n, k, m, MR, SK, WPC, G):
+                wp = _mma_pack(weight)
+                ext = proj_ext()
+                P = torch.empty((SK, m, n), dtype=torch.float32, device=x.device)
+                ext.mma_launch(wp, x2, P, m, n, k, MR, 1, SK, WPC, G)
+                out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+                ext.reduce_launch(P, out, m, n, SK, 0)
+                return out.view(out_shape)
+    cfg = _TRI_CFG.get((n, k))
+    if cfg is not None:
+        BN, BK, warps, stages = cfg
+        if n % BN == 0 and k % BK == 0:
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+            _dot[(n // BN,)](x2, weight, out, m, n, K=k,
+                             BLOCK_M=max(16, triton.next_power_of_2(m)),
+                             BLOCK_N=BN, BLOCK_K=BK,
+                             num_warps=warps, num_stages=stages)
+            return out.view(out_shape)
+    return None
