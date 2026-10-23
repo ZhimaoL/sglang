@@ -38,17 +38,19 @@ verify bs 1 and decode bs <= 8, and the TMA path at verify bs >= 5.
 import os
 
 
-def _flag(name: str) -> bool:
-    return os.environ.get(name, "0") == "1"
+def _flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default) == "1"
 
 
-SW_ATTN = _flag("OKC_SW_ATTN")
-SW_FS = _flag("OKC_SW_FS")
-SW_PROJ = _flag("OKC_SW_PROJ")
-SW_PROJ_MMA = _flag("OKC_SW_PROJ_MMA")
-SW_ROUTER = _flag("OKC_SW_ROUTER")
-SW_MOE_CUDA = _flag("OKC_SW_MOE_CUDA")
-SW_MOE_TMA = _flag("OKC_SW_MOE_TMA")
+# The judge's launch command is fixed, so a submission turns a path on by flipping its
+# default here ("0" -> "1"); the env override stays for local runs.
+SW_ATTN = _flag("OKC_SW_ATTN", "0")
+SW_FS = _flag("OKC_SW_FS", "0")
+SW_PROJ = _flag("OKC_SW_PROJ", "0")
+SW_PROJ_MMA = _flag("OKC_SW_PROJ_MMA", "0")
+SW_ROUTER = _flag("OKC_SW_ROUTER", "0")
+SW_MOE_CUDA = _flag("OKC_SW_MOE_CUDA", "0")
+SW_MOE_TMA = _flag("OKC_SW_MOE_TMA", "0")
 
 _pack_layers = os.environ.get("OKC_MOE_PACK_MAX_LAYERS", "0")
 MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
