@@ -616,6 +616,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        # The OKC small-m path also covers the default (non-cutedsl) backend route.
+        if _okc_proj is not None and bias is None and x.is_cuda:
+            okc_out = _okc_proj.small_m_gemm(x, layer.weight)
+            if okc_out is not None:
+                return okc_out
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(
