@@ -199,6 +199,9 @@ class MuseSpark1xFp4Experts(nn.Module):
         if self.use_marlin:
             self.w13_blockscale_swizzled = None
             self.w2_blockscale_swizzled = None
+        # OKC v14 weight packs; filled by okc_patch.moe.maybe_capture_nvfp4_packs at
+        # weight prep when an OKC_SW_MOE_* switch is set.
+        self._okc_moe_state = None
 
     @torch.no_grad()
     def set_post_expert_norm(self, post_expert_norm: Optional[nn.Module]) -> None:
@@ -695,6 +698,19 @@ class MuseSpark1xFp4Experts(nn.Module):
         ar_workspace: FinalizePushWorkspace | None = None,
     ) -> torch.Tensor:
         if self.use_marlin:
+            if self._okc_moe_state is not None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
+
+                okc_output = okc_moe.maybe_forward(
+                    self,
+                    hidden_states,
+                    topk_scores,
+                    topk_ids,
+                    post_expert_norm,
+                    pre_expert_norm=pre_expert_norm,
+                )
+                if okc_output is not None:
+                    return okc_output
             return self._forward_marlin(
                 hidden_states,
                 topk_scores,

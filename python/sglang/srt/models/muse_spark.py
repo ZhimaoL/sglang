@@ -36,9 +36,15 @@ from sglang.kernels.ops.muse_spark_v12.gemm_ag import (
     gemm_local,
     reserve_projection_workspace,
 )
+from sglang.kernels.ops.muse_spark_v12 import okc_patch
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
+
+if okc_patch.ANY_ATTN:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import attention as okc_attention
+if okc_patch.SW_ROUTER:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
 from sglang.srt.configs.muse_spark import (
     MuseSpark1xTextConfig,
     should_skip_weight_loading,
@@ -472,6 +478,10 @@ class MuseSpark1xAttention(nn.Module):
     ) -> torch.Tensor:
         """Everything between the QKV and output projections: QK norm (and RoPE)
         with the KV store, attention, then the output norm and gate."""
+        if okc_patch.ANY_ATTN:
+            okc_out = okc_attention.try_attention(self, qkv, forward_batch)
+            if okc_out is not None:
+                return okc_out
         split_sizes = [self.q_size, self.kv_size, self.kv_size]
         if self.use_o_gate:
             q, k, v, o_gate = qkv.split(split_sizes + [self.q_size], dim=-1)
@@ -832,7 +842,8 @@ class MuseSpark1xMoE(nn.Module):
             and self.gate.weight.dtype == torch.float32
             and hidden_states.dtype in (torch.bfloat16, torch.float16)
         )
-        if not use_split2 and router_input is None:
+        # With the OKC router on, the fp32 backfill waits until its kernel declines.
+        if not use_split2 and router_input is None and not okc_patch.SW_ROUTER:
             router_input = (
                 hidden_states.float() if self.router_in_fp32 else hidden_states
             )
@@ -877,11 +888,19 @@ class MuseSpark1xMoE(nn.Module):
             if use_side_stream
             else contextlib.nullcontext()
         ):
-            router_logits = (
-                self.gate.forward_split2(hidden_states)
-                if use_split2
-                else self.gate(router_input)
-            )
+            router_logits = None
+            if okc_patch.SW_ROUTER and not use_split2:
+                router_logits = okc_router.router_logits_small(self.gate, hidden_states)
+            if router_logits is None:
+                if not use_split2 and router_input is None:
+                    router_input = (
+                        hidden_states.float() if self.router_in_fp32 else hidden_states
+                    )
+                router_logits = (
+                    self.gate.forward_split2(hidden_states)
+                    if use_split2
+                    else self.gate(router_input)
+                )
             topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
                 None, router_logits, self.top_k, True, want_packed=True
             )
@@ -1087,7 +1106,10 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 return result
         attn_output = self.self_attn(positions, attn_input, forward_batch)
         router_dtype = self._router_dtype
-        if router_dtype is not None and _use_split_bf16_router(attn_output.shape[0]):
+        if router_dtype is not None and (
+            _use_split_bf16_router(attn_output.shape[0])
+            or (okc_patch.SW_ROUTER and attn_output.shape[0] <= okc_router.MAX_TOKENS)
+        ):
             router_dtype = None
         ffn_input, stream, router_input = self._fused_attn_boundary(
             stream,
