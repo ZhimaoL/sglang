@@ -1,22 +1,26 @@
-"""OKC v14 W4A16 MoE chains for the NVFP4 Marlin experts (muse_moe_w4a16 graft).
+"""OKC W4A16 MoE chains for the NVFP4 Marlin experts (muse_moe_w4a16 + wg grafts).
 
-Two chains behind their own switches, dispatched by token count T:
+Three chains behind their own switches, dispatched by token count T:
   T <= 8  (OKC_SW_MOE_CUDA): CUDA K0f (routing bookkeeping + bf16->fp16 x) -> k1
           (gemv1 + silu*mul) -> k2 (gemv2 * (1+w) + ssq) -> K3c (post-expert-norm
           finalize). Court: the decode1/verify1 MoE leg of the 1.46x/1.27x stack.
   T > 32  (OKC_SW_MOE_TMA): Triton TMA chain _k0z -> _k0b_planes -> _k1_gemm1 ->
           _k2_gemm2 -> _k3_final, CFG "large", 2-stream expert split. Court:
-          verify16 1.30x / verify32 1.45x on the MoE load.
-9 <= T <= 32 stays on stock Marlin (v14's own dispatch; measured tie 1.001/1.002).
+          verify16 1.30x / verify32 1.45x on the MoE load. Capped at
+          OKC_MOE_TMA_MAX_TOKENS (256).
+  T >= OKC_MOE_WG_MIN_TOKENS (1536, OKC_SW_MOE_WG): wgmma W4A16 grouped pair
+          (wg_moe.py) on the 16K-token prefill chunks. Court: ~2x Marlin there.
+9 <= T <= 32 and 256 < T < 1536 stay on stock Marlin (both measured Marlin wins).
 
-Both consume repacks of the raw NVFP4 expert weights, captured by
+All chains consume repacks of the raw NVFP4 expert weights, captured by
 maybe_capture_nvfp4_packs right before Marlin repacks them in place
 (modelopt_quant.process_weights_after_loading). Memory per captured Muse layer per
 rank (E_local 32, I = H = 4096): CUDA packs w13c 512 + w2c 256 MiB (nibble-permuted
 copies) + scale refs 96 MiB; TMA packs w13i 512 + sfw13i 128 + sfw2 64 MiB copies +
-a kept ref to raw w2 256 MiB. Both chains on: ~1.8 GiB/layer; budget with
-OKC_MOE_PACK_MAX_LAYERS (the N layers captured first win proportionally; each layer
-dispatches independently).
+a kept ref to raw w2 256 MiB; WG packs wm13 512 + wm2 256 + sfp 96 MiB copies.
+All three on: ~2.7 GiB/layer; budget with OKC_MOE_PACK_MAX_LAYERS (the N layers
+captured first win proportionally; each layer dispatches independently). Flip
+unneeded chain switches off to spend the budget on one regime.
 
 The finalize kernels hard-code the post-expert-norm form the released checkpoint
 uses: weight-first RMSNorm with effective weight (1 + raw), eps 1e-8; eligibility
@@ -503,7 +507,17 @@ def _build_packs(layer) -> dict | None:
         state["sf13c"] = sf13i.view(torch.uint8).contiguous()
         state["w2c"] = _nibperm(w2.contiguous().view(torch.int32).view(torch.uint8))
         state["sf2c"] = w2_sf.view(torch.uint8).contiguous()
-    if "w13i" not in state and "w13c" not in state:
+    if _sw.SW_MOE_WG and HB == 2048 and w2.shape[-1] == 2048:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import wg_moe
+
+        # pack_wg wants the raw stacked [gate; up] rows and raw e4m3 scale bytes.
+        state["wg_wm13"], state["wg_sfp13"] = wg_moe.pack_wg(
+            w13.contiguous(), sf13c.view(torch.uint8), gated=True
+        )
+        state["wg_wm2"], state["wg_sfp2"] = wg_moe.pack_wg(
+            w2.contiguous(), w2_sf.view(torch.uint8), gated=False
+        )
+    if "w13i" not in state and "w13c" not in state and "wg_wm13" not in state:
         return None
     return state
 
@@ -530,7 +544,11 @@ def maybe_capture_nvfp4_packs(layer) -> None:
         "OKC MoE packs captured for layer %d/%s (chains: %s).",
         _captured_layers,
         "all" if _sw.MOE_PACK_MAX_LAYERS >= (1 << 30) else _sw.MOE_PACK_MAX_LAYERS,
-        "+".join(c for c, k in (("cuda", "w13c"), ("tma", "w13i")) if k in state),
+        "+".join(
+            c
+            for c, k in (("cuda", "w13c"), ("tma", "w13i"), ("wg", "wg_wm13"))
+            if k in state
+        ),
     )
 
 
@@ -551,6 +569,46 @@ def _ensure_pw32(layer, state, post_expert_norm) -> bool:
     return True
 
 
+def _moe_wg(layer, x, local_ids, tw, state):
+    """wg grouped chain at prefill token counts: Marlin's own alignment convention
+    (local ids with -1 non-local routes; worst-case grid guarded in-kernel), then
+    gather -> gg1 -> gg2 -> the baseline finalize, exactly as _forward_marlin ends."""
+    from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
+        fused_post_expert_norm_weighted_sum,
+    )
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import wg_moe
+    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.attention import log_once
+
+    num_tokens, size_k = x.shape
+    top_k = local_ids.shape[1]
+    log_once("moe_wg", f"(first T={num_tokens})")
+    block_m = 256 if num_tokens >= wg_moe._BLOCK_M_BIG_MIN else 128
+    align_num_experts = (
+        layer.global_num_experts
+        if layer._expert_map is not None
+        else layer.num_local_experts
+    )
+    sorted_ids, block_experts, n_padded = moe_align_block_size(
+        local_ids, block_m, align_num_experts
+    )
+    y = wg_moe.grouped_wg(
+        x, sorted_ids, block_experts, n_padded,
+        wm13=state["wg_wm13"], sfp13=state["wg_sfp13"], gs13=state["w13_gs32"],
+        wm2=state["wg_wm2"], sfp2=state["wg_sfp2"],
+        num_tokens=num_tokens, top_k=top_k, block_m=block_m,
+    )
+    return fused_post_expert_norm_weighted_sum(
+        y.view(num_tokens, top_k, size_k),
+        tw,
+        norm_weight=layer._post_expert_norm_weight,
+        eps=layer._post_expert_norm_eps,
+        weight_first=layer._post_expert_norm_weight_first,
+        slot_expert_ids=local_ids,
+    )
+
+
 def maybe_forward(
     layer,
     hidden_states,
@@ -559,7 +617,7 @@ def maybe_forward(
     post_expert_norm,
     pre_expert_norm=None,
 ):
-    """Run the v14 chain for this batch, or None to fall back to stock Marlin.
+    """Run an OKC chain for this batch, or None to fall back to stock Marlin.
 
     Same contract as _forward_marlin: applies pre_expert_norm itself, returns the
     EP-partial [T, H] combined output (the caller's all-reduce sums ranks)."""
@@ -574,7 +632,15 @@ def maybe_forward(
     use_tma = (
         _sw.SW_MOE_TMA and 32 < tokens <= _TMA_MAX_TOKENS and "w13i" in state
     )
-    if not (use_cuda or use_tma):
+    # The wg kernels hard-code topk 8 and 32 local experts (the TP8/EP8 shape).
+    use_wg = (
+        _sw.SW_MOE_WG
+        and tokens >= _sw.MOE_WG_MIN_TOKENS
+        and topk == 8
+        and layer.num_local_experts == 32
+        and "wg_wm13" in state
+    )
+    if not (use_cuda or use_tma or use_wg):
         return None
     if post_expert_norm is None or not _ensure_pw32(layer, state, post_expert_norm):
         return None
@@ -588,6 +654,8 @@ def maybe_forward(
         local_ids = layer._expert_map[local_ids]
     local_ids = local_ids.contiguous()
     weights = topk_scores.to(torch.float32).contiguous()
+    if use_wg:
+        return _moe_wg(layer, x, local_ids, weights, state)
     if use_cuda:
         return _moe_cuda(x, local_ids, weights, state)
     return _moe_tma(x, local_ids, weights, state)

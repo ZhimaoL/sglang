@@ -24,6 +24,7 @@ Operating points (kernel court, H200): sliding d1/d16/d32 1.48/1.44/1.45x, v1/v1
 bs > 1 measured at or below FA3, so they stay on FA3 (OKC_FS_SORT_MIN_BS, default 24).
 """
 
+import logging
 import math
 import os
 from typing import Optional
@@ -31,7 +32,23 @@ from typing import Optional
 import torch
 import triton
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_ATTN, SW_FS
+logger = logging.getLogger(__name__)
+_FIRED = set()
+
+
+def log_once(path: str, detail: str = "") -> None:
+    """One INFO line the first time each OKC path dispatches, so a serving check's
+    stdout proves which paths actually fired (PLAN.md assumption 3)."""
+    if path not in _FIRED:
+        _FIRED.add(path)
+        logger.info("OKC path active: %s %s", path, detail)
+
+from sglang.kernels.ops.muse_spark_v12.okc_patch import (
+    SW_ATTN,
+    SW_ATTN_V3,
+    SW_FS,
+    SW_PREFILL_FMHA,
+)
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
 RMS_EPS = 1e-5
@@ -93,6 +110,10 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
         q_len = 1
     elif mode.is_target_verify():
         q_len = -1  # resolved from metadata below
+    elif SW_PREFILL_FMHA and mode.is_extend() and not mode.is_mixed():
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import prefill_attn
+
+        return prefill_attn.try_prefill_attention(attn, qkv, forward_batch)
     else:
         return None
     # The kernels fuse per-head QK RMSNorm, the output RMSNorm and the sigmoid gate;
@@ -195,6 +216,7 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
             return None
     elif q_len != 8 or bs != 1:
         return None
+    log_once(f"fs_full[q_len={q_len}]", f"(first bs={bs})")
     return _fs_full(
         ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
         bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
@@ -202,9 +224,144 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
     )
 
 
+_CNT = {}
+
+
+def _counter(kind, n, S, device):
+    """Persistent int32 ticket counters (attn-v3): allocated zero once per (kind,
+    owners, S) and NEVER reset -- every sliding call adds exactly S tickets per owner,
+    so the kernels' `ticket % S == S - 1` last-arriver test stays exact across eager
+    calls and graph replays (capture executes nothing). Keyed per (n, S), so each
+    captured decode graph replays against its own counter buffer."""
+    key = (kind, n, S, str(device))
+    c = _CNT.get(key)
+    if c is None:
+        c = _CNT[key] = torch.zeros((n,), dtype=torch.int32, device=device)
+    return c
+
+
+# attn-v3 launch knobs per (q_len, bs), bench_v3 sweeps; unlisted shapes take the
+# lane defaults (BN 128 / 4 warps / sc 8 decode, sc 4 verify).
+_V3_TUNE_BY = {
+    (1, 1): (128, 8, 16),
+    (1, 16): (64, 8, 16),
+    (1, 32): (128, 8, 8),
+    (8, 1): (64, 4, 4),
+    (8, 16): (64, 4, 4),
+    (8, 32): (64, 4, 4),
+}
+
+
 def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
              bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
              sm_scale, qk_factor):
+    """Sliding dispatch: the attn-v3 fused kernels on the TP8 shape (judge-checked
+    sliding decode 1.73-1.92x, verify above the v1 3-launch chain), v1 otherwise."""
+    if SW_ATTN_V3 and hq == 16 and hkv == 2 and d == 64 and q_len in (1, 8):
+        log_once(f"sliding_v3[q_len={q_len}]", f"(first bs={bs})")
+        return _sliding_v3(
+            qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+            bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
+            window=window, page_size=page_size, kv_scale=kv_scale, theta=theta,
+            sm_scale=sm_scale, qk_factor=qk_factor,
+        )
+    log_once(f"sliding_v1[q_len={q_len}]", f"(first bs={bs})")
+    return _sliding_v1(
+        qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+        bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
+        window=window, page_size=page_size, kv_scale=kv_scale, theta=theta,
+        sm_scale=sm_scale, qk_factor=qk_factor,
+    )
+
+
+def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+                bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
+                sm_scale, qk_factor):
+    """attn-v3 fused sliding: single-launch decode (_sl_decode_f) or prep +
+    split-with-tail verify (_sl_verify_f2); the last-arriver program folds the
+    combine, output RMSNorm and sigmoid gate into the same launch."""
+    device = qkv.device
+    B, L = bs, q_len
+    group = hq // hkv
+    kc = k_cache.view(k_cache.shape[0], -1)
+    vc = v_cache.view(v_cache.shape[0], -1)
+    out = torch.empty((B * L, hq * d), dtype=torch.bfloat16, device=device)
+    theta_coef = (-2.0 * math.log2(theta) / d) if theta else 0.0
+    alpha = sm_scale * kv_scale * LOG2E
+    gate_col0 = (hq + 2 * hkv) * d
+    if L == 1:
+        BN, warps, sc = _V3_TUNE_BY.get((1, B), (128, 4, 8))
+        S = max(1, min(math.ceil(window / BN), math.ceil(256 / B), 16))
+        chunk = BN * math.ceil(window / (S * BN))
+        P = B * S
+        ws_acc = torch.empty((P * hq, d), dtype=torch.bfloat16, device=device)
+        ws_m = torch.empty((P * hq,), dtype=torch.float32, device=device)
+        ws_l = torch.empty((P * hq,), dtype=torch.float32, device=device)
+        counter = _counter("sd", B, S, device)
+        ak._sl_decode_f[(P,)](
+            qkv, kc, vc,
+            cache_loc, seq_pre, page_table,
+            ws_acc, ws_m, ws_l, counter, out,
+            qkv.stride(0), page_table.stride(0), hq * d, gate_col0,
+            page_table.shape[1] * page_size,
+            alpha, 1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef, kv_scale,
+            EPS=RMS_EPS,
+            GROUP=group, HQ=hq, HKV=hkv,
+            WINDOW=window, PAGE=page_size, HAS_ROPE=bool(theta),
+            S=S, CHUNK=chunk, SC=sc, ACC16=True,
+            D=d,
+            BLOCK_M=max(16, triton.next_power_of_2(hq)),
+            BLOCK_N=BN,
+            BLOCK_H=triton.next_power_of_2(hkv),
+            num_warps=warps, num_stages=3,
+        )
+        return out
+    # L == 8 verify: prep (q norm+RoPE -> ws, own k/v -> cache) + split-with-tail.
+    BN, warps, sc = _V3_TUNE_BY.get((8, B), (128, 4, 4))
+    span = window - 1 + L
+    S = max(1, min(math.ceil(span / BN), math.ceil(256 / (B * hkv)), 16))
+    chunk = BN * math.ceil(span / (S * BN))
+    LG = L * group
+    P = B * hkv * S
+    q_ws = torch.empty((B * hkv * LG, d), dtype=torch.bfloat16, device=device)
+    ws_acc = torch.empty((P * LG, d), dtype=torch.bfloat16, device=device)
+    ws_m = torch.empty((P * LG,), dtype=torch.float32, device=device)
+    ws_l = torch.empty((P * LG,), dtype=torch.float32, device=device)
+    counter = _counter("sv", B * hkv, S, device)
+    br = triton.next_power_of_2(hq + 2 * hkv)
+    ak._sliding_prep[(B * L,)](
+        qkv, q_ws, kc, vc,
+        cache_loc, seq_pre,
+        qkv.stride(0),
+        1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef,
+        EPS=RMS_EPS,
+        L=L, GROUP=group, HQ=hq, HKV=hkv,
+        GROUP_Q=group, HKV_Q=hkv,
+        HAS_ROPE=bool(theta), D=d, BLOCK_R=br,
+        num_warps=4 if br <= 64 else 8, num_stages=1,
+    )
+    ak._sl_verify_f2[(P,)](
+        q_ws, kc, vc,
+        seq_pre, page_table,
+        ws_acc, ws_m, ws_l, counter, qkv, out,
+        page_table.stride(0), qkv.stride(0), hq * d, gate_col0,
+        page_table.shape[1] * page_size - L,
+        alpha, kv_scale,
+        EPS=RMS_EPS,
+        L=L, GROUP=group, HKV=hkv,
+        WINDOW=window, PAGE=page_size,
+        S=S, CHUNK=chunk, SC=sc, ACC16=True,
+        D=d,
+        BLOCK_M=max(16, triton.next_power_of_2(LG)),
+        BLOCK_N=BN,
+        num_warps=warps, num_stages=3,
+    )
+    return out
+
+
+def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+                bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
+                sm_scale, qk_factor):
     """muse_attention_decode v1 sliding path (lane TUNE_BY winners: BN 128, 4 warps)."""
     device = qkv.device
     B, L = bs, q_len
@@ -231,6 +388,7 @@ def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             cache_loc, seq_pre, page_table,
             ws_acc, ws_m, ws_l,
             qkv.stride(0), page_table.stride(0),
+            page_table.shape[1] * page_size,
             alpha, 1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef,
             EPS=RMS_EPS,
             GROUP=group, HQ=hq, HKV=hkv,
@@ -261,6 +419,7 @@ def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             seq_pre, page_table,
             ws_acc, ws_m, ws_l,
             page_table.stride(0),
+            page_table.shape[1] * page_size - L,
             alpha,
             L=L, GROUP=group, HKV=hkv,
             WINDOW=window, PAGE=page_size,
