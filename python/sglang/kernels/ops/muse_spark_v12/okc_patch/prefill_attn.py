@@ -74,7 +74,13 @@ _SCALES = {}
 # RadixAttention.layer_id -> MuseSpark1xAttention; the break only receives static
 # tensors + the layer id (eager_on_graph keeps capture-time argument identity).
 _LAYERS = {}
-HITS = {"ws": 0, "stock": 0, "ws_tokens": 0}
+# ws = fused path ran; stock = stock sequence ran; declined = stock ran although the batch had >= WS_MIN_QLEN
+# real tokens (ragged co-batch, cross-request page table, ...). OKC_PATH_STATS=1 logs at power-of-two counts.
+HITS = {"ws": 0, "stock": 0, "declined": 0, "ws_tokens": 0}
+
+
+def _pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
 
 
 def _scale_tensor(value: float, device) -> torch.Tensor:
@@ -181,10 +187,14 @@ def _attention(qkv, out, layer_id, forward_batch) -> None:
         if _ws(attn, qkv_r, out_r, forward_batch):
             HITS["ws"] += 1
             HITS["ws_tokens"] += real
-            if PATH_STATS and HITS["ws"] % 256 == 0:
-                logger.info("OKC prefill_fmha hits: %s", HITS)
+            if PATH_STATS and _pow2(HITS["ws"]):
+                logger.info("OKC prefill_fmha hits: %s (layer %d, tokens %d)", HITS, layer_id, real)
         else:
             HITS["stock"] += 1
+            if real >= WS_MIN_QLEN:
+                HITS["declined"] += 1
+                if PATH_STATS and _pow2(HITS["declined"]):
+                    logger.info("OKC prefill_fmha declined long batch: %s (layer %d, tokens %d, total %d)", HITS, layer_id, real, total)
             _stock(attn, qkv_r, out_r, forward_batch)
     finally:
         forward_batch.out_cache_loc = orig_loc
