@@ -27,6 +27,10 @@ _DECODE_STEPS_AFTER_SMALL = 2
 # Mid-chunk admission only up to this many running requests: c1 / c4 load, where one stalled follow-up
 # moves the TTFT p90, and where the forced decode steps cost little throughput.
 _MID_CHUNK_MAX_RUNNING = 8
+# Both orderings match every waiting request against the prefix tree to learn its uncached length, which
+# upstream only does on caches whose fast-match flag is set (the serving UnifiedRadixCache's is not). These
+# policies only matter at low concurrency, so the work is capped by queue length instead of by that flag.
+_MAX_MATCH_REQS = 16
 
 
 class SmallPrefillFirst:
@@ -50,7 +54,7 @@ class SmallPrefillFirst:
             or has_chunked_req
             or len(waiting_queue) < 2
             or self._consecutive_small_batches >= _MAX_CONSECUTIVE_SMALL_BATCHES
-            or not tree_cache.supports_fast_match_prefix()
+            or len(waiting_queue) > _MAX_MATCH_REQS
         ):
             self._consecutive_small_batches = 0
             return None
@@ -85,7 +89,7 @@ class SmallPrefillFirst:
             or not waiting_queue
             or num_running > _MID_CHUNK_MAX_RUNNING
             or budget < 4 * page_size
-            or not tree_cache.supports_fast_match_prefix()
+            or len(waiting_queue) > _MAX_MATCH_REQS
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
