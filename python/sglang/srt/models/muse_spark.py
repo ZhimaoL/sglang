@@ -508,6 +508,28 @@ class MuseSpark1xMLP(nn.Module):
         return output
 
 
+_OKC_EXPERT_COUNT_DIR = __import__("os").environ.get("OKC_EXPERT_COUNT_DIR")
+_okc_expert_counts: dict = {}
+
+
+def _okc_count_experts(layer_idx: int, topk_ids: torch.Tensor, num_experts: int, save: bool) -> None:
+    """Diagnostic only: per-forward expert histograms (prefill: T >= 512; verify: 64 <= T < 512), saved by rank 0."""
+    n = topk_ids.shape[0]
+    if n < 64 or torch.cuda.is_current_stream_capturing():
+        return
+    kind = "prefill" if n >= 512 else "verify"
+    rows = _okc_expert_counts.setdefault(kind, {}).setdefault(layer_idx, [])
+    if kind == "verify" and len(rows) >= 4000:
+        return
+    rows.append(torch.bincount(topk_ids.flatten().long(), minlength=num_experts).to(torch.int32).cpu())
+    first = min(_okc_expert_counts[kind])
+    if save and layer_idx == first and len(rows) % 10 == 0:
+        out = {k: {l: torch.stack(v) for l, v in d.items()} for k, d in _okc_expert_counts.items()}
+        path = __import__("os").path.join(_OKC_EXPERT_COUNT_DIR, "expert_counts.pt")
+        torch.save(out, path + ".tmp")
+        __import__("os").replace(path + ".tmp", path)
+
+
 class MuseSpark1xMoE(nn.Module):
     def __init__(
         self,
@@ -883,6 +905,8 @@ class MuseSpark1xMoE(nn.Module):
                 if tensor is not None:
                     tensor.record_stream(main_stream)
 
+        if _OKC_EXPERT_COUNT_DIR:
+            _okc_count_experts(self.layer_idx, topk_ids, self.num_experts, self.ep_rank == 0)
         if (capturer := get_global_experts_capturer()) is not None:
             # Capture on main after the router join, in full unpadded token order.
             # SP experts below still consume the local ids.
