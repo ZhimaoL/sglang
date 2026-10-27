@@ -614,8 +614,14 @@ class ExecComm(msgspec.Struct):
         bool, "Enable layerwise NVTX profiling annotations for the model."
     ] = False
     enable_nccl_nvls: A[
-        bool, "Enable NCCL NVLS for prefill heavy requests when available."
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Enable NCCL NVLS for prefill heavy requests when available. Defaults to the model's preference, otherwise disabled.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+            fallback=False,
+        ),
+    ] = None
     enable_symm_mem: A[
         bool,
         Arg(

@@ -324,6 +324,10 @@ def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.swa_full_tokens_ratio is None:
         overrides["swa_full_tokens_ratio"] = 0.1
         logger.info("Setting swa_full_tokens_ratio to 0.1 for Muse Spark.")
+    # Measured on 8x H200: NVLS all-reduce cuts a cold 4 x 74K-token prefill by ~4% for ~0.25 GB of KV pool per GPU.
+    if cfg.enable_nccl_nvls is None:
+        overrides["enable_nccl_nvls"] = True
+        logger.info("Enable NCCL NVLS by default for Muse Spark")
     if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
         # NaViT shards over the full TP group only, so attention TP narrower
         # than TP needs the replicated (data-parallel) encoder.
