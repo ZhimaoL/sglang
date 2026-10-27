@@ -1,11 +1,26 @@
-"""Lazy loader for the pg inline CUDA extension (built once per box, ~1-2 min of nvcc at the
-first prefill that dispatches to it). The hand wgmma PTX needs the sm_90a feature target."""
+"""Lazy loaders for the OKC inline CUDA extensions, each built once per box (~1-2 min of nvcc at first use).
+pg carries hand wgmma PTX, which needs the sm_90a feature target."""
 
 import os
 import threading
 
 _lock = threading.Lock()
 _PG_EXT = None
+_PROJ_EXT = None
+
+_PROJ_CPP = """
+void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
+                      int64_t k, int64_t MT, int64_t R, int64_t U, int64_t WPC);
+void gemv_router_launch(at::Tensor Wp, at::Tensor X, at::Tensor out, int64_t m, int64_t k,
+                        int64_t MT, int64_t SK, int64_t U, int64_t WPC);
+void mma_launch(at::Tensor Wp, at::Tensor X, at::Tensor out, int64_t m, int64_t nout,
+                int64_t k, int64_t MR, int64_t SPLIT, int64_t SK, int64_t WPC, int64_t G);
+void cmma_launch(at::Tensor Wm, at::Tensor We, at::Tensor X, at::Tensor out, int64_t m,
+                 int64_t nout, int64_t k, int64_t MR, int64_t SPLIT, int64_t SK,
+                 int64_t WPC, int64_t EB);
+void reduce_launch(at::Tensor P, at::Tensor out, int64_t m, int64_t nout, int64_t SK,
+                   int64_t FOLD);
+"""
 
 
 def pg_ext():
@@ -41,3 +56,32 @@ def pg_ext():
                     verbose=False,
                 )
     return _PG_EXT
+
+
+def proj_ext():
+    global _PROJ_EXT
+    if _PROJ_EXT is None:
+        with _lock:
+            if _PROJ_EXT is None:
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_proj import (
+                    _CUDA_SRC,
+                )
+
+                # Name and flags match the certified kernel-track build, so its torch_extensions cache is reused.
+                _PROJ_EXT = load_inline(
+                    name="okc_v5_stream",
+                    cpp_sources=[_PROJ_CPP],
+                    cuda_sources=[_CUDA_SRC],
+                    functions=[
+                        "gemv_bf16_launch",
+                        "gemv_router_launch",
+                        "mma_launch",
+                        "cmma_launch",
+                        "reduce_launch",
+                    ],
+                    extra_cuda_cflags=["-O3"],
+                    verbose=False,
+                )
+    return _PROJ_EXT
