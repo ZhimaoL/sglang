@@ -34,8 +34,12 @@ _MAX_MATCH_REQS = 16
 
 
 class SmallPrefillFirst:
-    def __init__(self, *, enabled: bool):
+    def __init__(self, *, enabled: bool, mid_chunk_enabled: bool = False):
         self._enabled = enabled
+        # Off by default: measured at c4 it costs more (a capped chunk needs more chunks and the
+        # decode steps after each small prefill delay every first turn) than the stalled
+        # follow-ups it rescues.
+        self._mid_chunk_enabled = mid_chunk_enabled
         self._consecutive_small_batches = 0
         self._decode_steps_left = 0
         # The request being chunked; its final (possibly short) chunk is still a first turn.
@@ -85,7 +89,7 @@ class SmallPrefillFirst:
         """(queue with the small requests first, cap on the chunked request's next chunk) that lets the small
         waiting requests join this prefill batch whole, or None. The chunk keeps at least half the budget."""
         if (
-            not self._enabled
+            not self._mid_chunk_enabled
             or not waiting_queue
             or num_running > _MID_CHUNK_MAX_RUNNING
             or budget < 4 * page_size

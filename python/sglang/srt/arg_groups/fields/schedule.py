@@ -75,6 +75,20 @@ class Schedule(msgspec.Struct):
             fallback=False,
         ),
     ] = None
+    mid_chunk_prefill_admission: A[
+        Optional[bool],
+        Arg(
+            help=(
+                "While a large prefill is being chunked and at most 8 requests are running, let the small "
+                "waiting requests join the next chunk's batch whole (the chunk shrinks, keeping at least "
+                "half the token budget), then two decode steps. Defaults to the model's preference, "
+                "otherwise off."
+            ),
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+            fallback=False,
+        ),
+    ] = None
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",

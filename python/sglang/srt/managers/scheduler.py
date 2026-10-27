@@ -1306,7 +1306,8 @@ class Scheduler(
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
         self.small_prefill_first = SmallPrefillFirst(
-            enabled=bool(get_schedule().small_prefill_first)
+            enabled=bool(get_schedule().small_prefill_first),
+            mid_chunk_enabled=bool(get_schedule().mid_chunk_prefill_admission),
         )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
