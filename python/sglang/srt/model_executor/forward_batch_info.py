@@ -699,6 +699,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
 
+    # OKC per-step attention context (okc_patch.attention): the first eligible layer
+    # of a forward builds the shared sort metadata here, later layers reuse it.
+    okc_fs_meta: Optional[dict] = None
+
     # Decode-graph-owned destination for AuxHiddenStatePacker; None when eager.
     aux_hidden_states_buffer: Optional[torch.Tensor] = None
 
