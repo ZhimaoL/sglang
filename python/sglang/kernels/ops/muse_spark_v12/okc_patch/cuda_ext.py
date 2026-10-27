@@ -1,10 +1,10 @@
-"""Lazy loaders for the four OKC inline CUDA extensions.
+"""Lazy loaders for the five OKC inline CUDA extensions.
 
-The sources live in _cuda_src_{proj,moe,ws,wg}.py byte-identical to the certified
+The sources live in _cuda_src_{proj,moe,ws,wg,pg}.py byte-identical to the certified
 kernel-track lanes, and the load_inline names and flags match them, so a box that
 already built the kernel-track extensions hits the torch_extensions cache. First
 cold build is ~1-3 min of nvcc per extension at server start (only when a switch
-needs it). ws/wg carry hand wgmma PTX, which needs the sm_90a feature target:
+needs it). ws/wg/pg carry hand wgmma PTX, which needs the sm_90a feature target:
 TORCH_CUDA_ARCH_LIST pins it, exactly as the certified kernel-track files do
 (plain compute_90 fails to assemble wgmma).
 """
@@ -17,6 +17,7 @@ _PROJ_EXT = None
 _MOE_EXT = None
 _WS_EXT = None
 _WG_EXT = None
+_PG_EXT = None
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -164,3 +165,38 @@ def wg_ext():
                     verbose=False,
                 )
     return _WG_EXT
+
+
+def pg_ext():
+    global _PG_EXT
+    if _PG_EXT is None:
+        with _lock:
+            if _PG_EXT is None:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import (
+                    _CUDA_SRC,
+                )
+
+                _PG_EXT = load_inline(
+                    name="okc_pg_moe_c350",
+                    cpp_sources="void tiles(torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
+                    "void gather(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "int64_t);\n"
+                    "void gg1(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);\n"
+                    "void gg2(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);\n"
+                    "void set_snake_max_t(int64_t);",
+                    cuda_sources=_CUDA_SRC,
+                    functions=["tiles", "gather", "gg1", "gg2", "set_snake_max_t"],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        "--use_fast_math",
+                        "-gencode=arch=compute_90a,code=sm_90a",
+                    ],
+                    verbose=False,
+                )
+    return _PG_EXT

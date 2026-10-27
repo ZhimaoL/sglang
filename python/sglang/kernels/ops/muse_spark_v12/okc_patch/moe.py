@@ -8,8 +8,10 @@ Three chains behind their own switches, dispatched by token count T:
           _k2_gemm2 -> _k3_final, CFG "large", 2-stream expert split. Court:
           verify16 1.30x / verify32 1.45x on the MoE load. Capped at
           OKC_MOE_TMA_MAX_TOKENS (256).
-  T >= OKC_MOE_WG_MIN_TOKENS (1536, OKC_SW_MOE_WG): wgmma W4A16 grouped pair
-          (wg_moe.py) on the 16K-token prefill chunks. Court: ~2x Marlin there.
+  T >= OKC_MOE_PG_MIN_TOKENS (1536, OKC_SW_MOE_PG): pg grouped pair (pg_moe.py,
+          BF16 token images and intermediate) on the 16K-token prefill chunks.
+  T >= OKC_MOE_WG_MIN_TOKENS (1536, OKC_SW_MOE_WG, default off): the older v10 wg
+          pair (wg_moe.py, fp16 staging), kept as an A/B reference only.
 9 <= T <= 32 and 256 < T < 1536 stay on stock Marlin (both measured Marlin wins).
 
 All chains consume repacks of the raw NVFP4 expert weights, captured by
@@ -17,7 +19,8 @@ maybe_capture_nvfp4_packs right before Marlin repacks them in place
 (modelopt_quant.process_weights_after_loading). Memory per captured Muse layer per
 rank (E_local 32, I = H = 4096): CUDA packs w13c 512 + w2c 256 MiB (nibble-permuted
 copies) + scale refs 96 MiB; TMA packs w13i 512 + sfw13i 128 + sfw2 64 MiB copies +
-a kept ref to raw w2 256 MiB; WG packs wm13 512 + wm2 256 + sfp 96 MiB copies.
+a kept ref to raw w2 256 MiB; WG packs wm13 512 + wm2 256 + sfp 96 MiB copies; PG packs
+wsf13 640 + wsf2 320 MiB (W|sf blocks, bf16 scale pairs).
 All three on: ~2.7 GiB/layer; budget with OKC_MOE_PACK_MAX_LAYERS (the N layers
 captured first win proportionally; each layer dispatches independently). Flip
 unneeded chain switches off to spend the budget on one regime.
@@ -517,7 +520,13 @@ def _build_packs(layer) -> dict | None:
         state["wg_wm2"], state["wg_sfp2"] = wg_moe.pack_wg(
             w2.contiguous(), w2_sf.view(torch.uint8), gated=False
         )
-    if "w13i" not in state and "w13c" not in state and "wg_wm13" not in state:
+    if _sw.SW_MOE_PG and HB == 2048 and w2.shape[-1] == 2048:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
+        # pack_wsf wants the raw stacked [gate; up] rows and raw e4m3 scale bytes.
+        state["pg_wsf13"] = pg_moe.pack_wsf(w13.contiguous(), sf13c.view(torch.uint8), gated=True)
+        state["pg_wsf2"] = pg_moe.pack_wsf(w2.contiguous(), w2_sf.view(torch.uint8), gated=False)
+    if not any(k in state for k in ("w13i", "w13c", "wg_wm13", "pg_wsf13")):
         return None
     return state
 
@@ -546,7 +555,7 @@ def maybe_capture_nvfp4_packs(layer) -> None:
         "all" if _sw.MOE_PACK_MAX_LAYERS >= (1 << 30) else _sw.MOE_PACK_MAX_LAYERS,
         "+".join(
             c
-            for c, k in (("cuda", "w13c"), ("tma", "w13i"), ("wg", "wg_wm13"))
+            for c, k in (("cuda", "w13c"), ("tma", "w13i"), ("wg", "wg_wm13"), ("pg", "pg_wsf13"))
             if k in state
         ),
     )
@@ -609,6 +618,42 @@ def _moe_wg(layer, x, local_ids, tw, state):
     )
 
 
+def _moe_pg(layer, x, local_ids, tw, state):
+    """pg grouped chain at prefill token counts: the same alignment (256-token blocks, -1 for
+    non-local routes) and finalize as _moe_wg, with BF16 token images and intermediate."""
+    from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
+        fused_post_expert_norm_weighted_sum,
+    )
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.attention import log_once
+
+    num_tokens, size_k = x.shape
+    top_k = local_ids.shape[1]
+    log_once("moe_pg", f"(first T={num_tokens})")
+    align_num_experts = (
+        layer.global_num_experts
+        if layer._expert_map is not None
+        else layer.num_local_experts
+    )
+    sorted_ids, block_experts, n_padded = moe_align_block_size(
+        local_ids, pg_moe._BLOCK_M, align_num_experts
+    )
+    y = pg_moe.grouped_pg(
+        x, sorted_ids, block_experts, n_padded,
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
+    )
+    return fused_post_expert_norm_weighted_sum(
+        y.view(num_tokens, top_k, size_k),
+        tw,
+        norm_weight=layer._post_expert_norm_weight,
+        eps=layer._post_expert_norm_eps,
+        weight_first=layer._post_expert_norm_weight_first,
+        slot_expert_ids=local_ids,
+    )
+
+
 def maybe_forward(
     layer,
     hidden_states,
@@ -632,7 +677,14 @@ def maybe_forward(
     use_tma = (
         _sw.SW_MOE_TMA and 32 < tokens <= _TMA_MAX_TOKENS and "w13i" in state
     )
-    # The wg kernels hard-code topk 8 and 32 local experts (the TP8/EP8 shape).
+    # The pg and wg kernels hard-code topk 8 and 32 local experts (the TP8/EP8 shape).
+    use_pg = (
+        _sw.SW_MOE_PG
+        and tokens >= _sw.MOE_PG_MIN_TOKENS
+        and topk == 8
+        and layer.num_local_experts == 32
+        and "pg_wsf13" in state
+    )
     use_wg = (
         _sw.SW_MOE_WG
         and tokens >= _sw.MOE_WG_MIN_TOKENS
@@ -640,7 +692,7 @@ def maybe_forward(
         and layer.num_local_experts == 32
         and "wg_wm13" in state
     )
-    if not (use_cuda or use_tma or use_wg):
+    if not (use_cuda or use_tma or use_pg or use_wg):
         return None
     if post_expert_norm is None or not _ensure_pw32(layer, state, post_expert_norm):
         return None
@@ -654,6 +706,8 @@ def maybe_forward(
         local_ids = layer._expert_map[local_ids]
     local_ids = local_ids.contiguous()
     weights = topk_scores.to(torch.float32).contiguous()
+    if use_pg:
+        return _moe_pg(layer, x, local_ids, weights, state)
     if use_wg:
         return _moe_wg(layer, x, local_ids, weights, state)
     if use_cuda:

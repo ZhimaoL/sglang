@@ -47,11 +47,13 @@ are KILL switches: default ON, "0" falls back to the stock (or v0) path.
                      the real bs / token count are read at replay; ragged co-batches
                      and short chunks take the stock sequence inside the same break.
   OKC_PATH_STATS=1   log cumulative replay-time hit counters of the break paths.
-  OKC_SW_MOE_WG=1    wgmma W4A16 grouped GEMM pair on the fp4 experts at
-                     T >= OKC_MOE_WG_MIN_TOKENS (default 1536, = certified
-                     MARLIN_MAX_TOKENS+1): the 16K-token prefill chunks Marlin
-                     currently keeps. Certified ~2x Marlin there. Needs packs
-                     (same OKC_MOE_PACK_MAX_LAYERS budget; ~0.95 GiB/layer).
+  OKC_SW_MOE_PG=1    pg grouped GEMM pair (prefill bank plt_c3, BF16 token images
+                     and intermediate) on the fp4 experts at T >= OKC_MOE_PG_MIN_TOKENS
+                     (default 1536): the 16K-token prefill chunks. Needs packs (same
+                     OKC_MOE_PACK_MAX_LAYERS budget; 0.94 GiB/layer/rank).
+  OKC_SW_MOE_WG=0    the older v10 wg pair at T >= OKC_MOE_WG_MIN_TOKENS. Default OFF:
+                     it stages the BF16 token rows and the intermediate in fp16
+                     (docs/COMPLIANCE-FP16-1025.md), so it is an A/B reference only.
 
 Expected regime (judge config TP8/EP8, Marlin MoE, DFLASH 8 drafts, decode bs <= 32):
 target verify runs T = 8 * bs, draft decode runs T = bs, so the small-T paths fire at
@@ -81,18 +83,22 @@ SW_MOE_TMA = _flag("OKC_SW_MOE_TMA", "0")
 # v1 kill switches (default ON; each falls back gracefully when "0").
 SW_ATTN_V3 = _flag("OKC_SW_ATTN_V3", "1")
 SW_PREFILL_FMHA = _flag("OKC_SW_PREFILL_FMHA", "1")
-SW_MOE_WG = _flag("OKC_SW_MOE_WG", "1")
+SW_MOE_PG = _flag("OKC_SW_MOE_PG", "1")
+# fp16-staging A/B reference only (see the docstring); never on by default.
+SW_MOE_WG = _flag("OKC_SW_MOE_WG", "0")
 
 # Prefill FMHA fires at q_len >= this (certified gate: ws loses to FA3 below ~2048).
 WS_MIN_QLEN = int(os.environ.get("OKC_WS_MIN_QLEN", "2048"))
 # WG grouped GEMM fires at T >= this (court: Marlin wins below; 1536 = certified cut).
 MOE_WG_MIN_TOKENS = int(os.environ.get("OKC_MOE_WG_MIN_TOKENS", "1536"))
+# pg grouped GEMM fires at T >= this (Marlin keeps smaller prefills and every verify step).
+MOE_PG_MIN_TOKENS = int(os.environ.get("OKC_MOE_PG_MIN_TOKENS", "1536"))
 
 _pack_layers = os.environ.get("OKC_MOE_PACK_MAX_LAYERS", "0")
 MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 
 ANY_ATTN = SW_ATTN or SW_FS or SW_PREFILL_FMHA
-ANY_MOE = SW_MOE_CUDA or SW_MOE_TMA or SW_MOE_WG
+ANY_MOE = SW_MOE_CUDA or SW_MOE_TMA or SW_MOE_PG or SW_MOE_WG
 
 __all__ = [
     "SW_ATTN",
@@ -104,9 +110,11 @@ __all__ = [
     "SW_MOE_TMA",
     "SW_ATTN_V3",
     "SW_PREFILL_FMHA",
+    "SW_MOE_PG",
     "SW_MOE_WG",
     "WS_MIN_QLEN",
     "MOE_WG_MIN_TOKENS",
+    "MOE_PG_MIN_TOKENS",
     "MOE_PACK_MAX_LAYERS",
     "ANY_ATTN",
     "ANY_MOE",
