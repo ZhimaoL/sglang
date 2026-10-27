@@ -3963,6 +3963,17 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
+            if adder.chunked_req_limit is None:
+                mid_chunk = self.small_prefill_first.mid_chunk_order(
+                    chunked_req=self.chunked_req,
+                    waiting_queue=self.waiting_queue,
+                    tree_cache=self.tree_cache,
+                    budget=adder.rem_chunk_tokens or 0,
+                    page_size=self.page_size,
+                    num_running=running_batch.batch_size(),
+                )
+                if mid_chunk is not None:
+                    self.waiting_queue, adder.chunked_req_limit = mid_chunk
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
