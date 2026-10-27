@@ -40,7 +40,6 @@ POSITIONAL_FIELD_ORDER = (
     "max_total_tokens",
     "chunked_prefill_size",
     "prefill_decode_interval",
-    "followup_prefill_hold_steps",
     "small_prefill_first",
     "enable_dynamic_chunking",
     "max_prefill_tokens",
