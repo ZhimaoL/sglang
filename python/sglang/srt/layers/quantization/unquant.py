@@ -62,6 +62,13 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
 )
 
+from sglang.kernels.ops.muse_spark_v12 import okc_patch as _okc_patch
+
+if _okc_patch.SW_PROJ:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import proj as _okc_proj
+else:
+    _okc_proj = None
+
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -424,6 +431,10 @@ def _bf16_gemm_dispatch_impl(
     bias: Optional[torch.Tensor],
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if _okc_proj is not None and bias is None and addend is None:
+        okc_out = _okc_proj.small_m_gemm(x, weight)
+        if okc_out is not None:
+            return okc_out
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
@@ -605,6 +616,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        # The OKC small-m path also covers the default (non-cutedsl) backend route.
+        if _okc_proj is not None and bias is None and x.is_cuda:
+            okc_out = _okc_proj.small_m_gemm(x, layer.weight)
+            if okc_out is not None:
+                return okc_out
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(

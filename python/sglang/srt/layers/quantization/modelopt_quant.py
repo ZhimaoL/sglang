@@ -2708,6 +2708,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "w13_weight_scale_2",
                 w13_weight_scale_2.contiguous(),
             )
+            from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+            if okc_patch.ANY_MOE:
+                # The Marlin prep below repacks the raw NVFP4 layout in place, so the
+                # OKC chains snapshot their packs first.
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
+
+                okc_moe.maybe_capture_nvfp4_packs(layer)
             prepare_moe_nvfp4_layer_for_marlin(layer)
             return
 
