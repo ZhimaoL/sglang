@@ -39,6 +39,11 @@ def _build_packs(layer) -> dict | None:
         return None
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
+    if _sw.MOE_PG_ONLY:
+        # A pg-only layer takes pg on every forward, CUDA-graph capture included, so its
+        # extension has to be built here rather than lazily inside the first captured forward.
+        pg_moe.pg_ext()
+
     # pack_wsf wants the raw stacked [gate; up] rows and raw e4m3 scale bytes; gs13 is the
     # per-expert scale Marlin also uses (its constant gain is cancelled by the post-expert norm).
     return {
