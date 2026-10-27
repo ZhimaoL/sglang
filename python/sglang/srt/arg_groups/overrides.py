@@ -319,6 +319,11 @@ def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.kv_cache_dtype == "auto":
         logger.info("Use fp8_e4m3 KV cache by default for Muse Spark")
         overrides["kv_cache_dtype"] = "fp8_e4m3"
+    # 46 of 62 layers slide over 2,048 tokens, so the SWA pool only needs the windows of the live and cached
+    # requests; at the 0.8 fallback it held ~70% of the KV budget and capped the full pool.
+    if cfg.swa_full_tokens_ratio is None:
+        overrides["swa_full_tokens_ratio"] = 0.1
+        logger.info("Setting swa_full_tokens_ratio to 0.1 for Muse Spark.")
     if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
         # NaViT shards over the full TP group only, so attention TP narrower
         # than TP needs the replicated (data-parallel) encoder.
