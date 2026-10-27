@@ -20,6 +20,9 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext
 _BLOCK_M = 256
 _CFG = 350        # the bank's shipped pg configuration (widths 64 / 128 / 256, 5 stages)
 _WMASK = 3        # width classes emitted by pg_tiles: 64 and 128 (256 always)
+# Persistent grid: one CTA per SM (0) or capped at items-per-CTA x this (see _grid).
+import os as _os
+_CTA_ITEMS = int(_os.environ.get("OKC_PG_CTA_ITEMS", "0"))   # 0 = one CTA per SM
 
 
 # v7 placement of the 8 codes of a weight word (see dq8r): magnitude bits at MAG[s] .. MAG[s] + 2, sign at SGN[s]
@@ -100,10 +103,16 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
     ext = pg_ext()
     live = torch.empty((num_pid_m + 1,), dtype=torch.int32, device=x.device)
     ext.tiles(block_experts, n_padded, sorted_ids, live, num_pid_m, _BLOCK_M, numel, _WMASK)
+    # Persistent grid: 0 = one CTA per SM (the bank's default). Capping the CTAs trades cross-item
+    # pipelining for less per-CTA setup; the bound must come from host-side sizes only (a device read
+    # here would be a sync inside the forward and break graph capture).
+    grid = 0
+    if _CTA_ITEMS:
+        grid = min(4096, max(1, -(-(num_pid_m * (2 * 4096 // 128)) // _CTA_ITEMS)))
     xg_t = torch.empty((num_pid_m * 64 * 256 * 64,), dtype=torch.bfloat16, device=x.device)
     ext.gather(x, xg_t, sorted_ids, live, numel)
     inter_t = torch.empty((num_pid_m * 64 * 256 * 64,), dtype=torch.bfloat16, device=x.device)
-    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, 0)
+    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, grid)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
-    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0)
+    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid)
     return y
