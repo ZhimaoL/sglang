@@ -203,6 +203,7 @@ from sglang.srt.managers.overlap_utils import (
     resolve_forward_inputs,
 )
 from sglang.srt.managers.followup_prefill_hold import FollowupPrefillHold
+from sglang.srt.managers.small_prefill_first import SmallPrefillFirst
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -1307,6 +1308,9 @@ class Scheduler(
         self._prefill_decode_interval_remaining = 0
         self.followup_prefill_hold = FollowupPrefillHold(
             hold_steps=get_schedule().followup_prefill_hold_steps or 0
+        )
+        self.small_prefill_first = SmallPrefillFirst(
+            enabled=bool(get_schedule().small_prefill_first)
         )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
@@ -3739,6 +3743,10 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
+        elif self.small_prefill_first.should_decode_first(
+            num_running=running_batch.batch_size()
+        ):
+            new_batch = None
         elif self.followup_prefill_hold.should_hold(
             waiting_queue=self.waiting_queue,
             tree_cache=self.tree_cache,
@@ -3752,6 +3760,11 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
             if new_batch is not None:
                 self.followup_prefill_hold.on_prefill_scheduled()
+                self.small_prefill_first.on_prefill_scheduled(
+                    batch=new_batch,
+                    chunked_req=self.chunked_req,
+                    has_waiting=bool(self.waiting_queue),
+                )
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -3914,6 +3927,13 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
+        small_first = self.small_prefill_first.small_first_order(
+            waiting_queue=self.waiting_queue,
+            tree_cache=self.tree_cache,
+            has_chunked_req=self.chunked_req is not None,
+        )
+        if small_first is not None:
+            self.waiting_queue, chunked_prefill_size = small_first
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
             history_len = self.chunked_req.prefix_len
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)

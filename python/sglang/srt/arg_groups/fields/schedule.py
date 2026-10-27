@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import (
     List,
     Optional,
@@ -58,6 +59,20 @@ class Schedule(msgspec.Struct):
         Arg(
             help="The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
             resolvable=True,
+        ),
+    ] = None
+    small_prefill_first: A[
+        Optional[bool],
+        Arg(
+            help=(
+                "Prefill small requests (under 4,096 new tokens) in their own batch ahead of large waiting ones, "
+                "then run two decode steps before the next prefill, so a follow-up turn that arrives with a long "
+                "first turn shows its first token without waiting for that whole prefill. Defaults to the "
+                "model's preference, otherwise off."
+            ),
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+            fallback=False,
         ),
     ] = None
     followup_prefill_hold_steps: A[
