@@ -1308,6 +1308,9 @@ class MuseSpark1xModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # okc_patch caches per-forward metadata here; CUDA-graph capture runs warmup forwards on the same batch first,
+        # so a cache left from them would keep the captured graph from recomputing it on every replay.
+        forward_batch.okc_fs_meta = None
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
