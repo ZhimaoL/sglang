@@ -24,10 +24,13 @@ class PrefixTokenCache:
         if tail_start <= 0:
             return list(encode(text))
         keys = self._prefix_keys(text=text, end=tail_start)
-        cut, head = self._longest_cached(keys=keys)
+        cut, hit_key, head = self._longest_cached(keys=keys)
         prefix = array("I", head)
         if cut < tail_start:
             prefix.extend(encode(text[cut:tail_start]))
+            # The extended prefix supersedes the hit, so a conversation holds one entry, not one per turn.
+            if hit_key is not None:
+                del self._entries[hit_key]
         self._store(key=keys[-1][1], ids=prefix)
         return prefix.tolist() + list(encode(text[tail_start:]))
 
@@ -44,13 +47,14 @@ class PrefixTokenCache:
             cut = text.find(self._boundary, cut + 1)
         return keys
 
-    def _longest_cached(self, *, keys: List[Tuple[int, bytes]]) -> Tuple[int, array]:
+    def _longest_cached(
+        self, *, keys: List[Tuple[int, bytes]]
+    ) -> Tuple[int, Optional[bytes], array]:
         for position, key in reversed(keys):
             ids = self._entries.get(key)
             if ids is not None:
-                self._entries.move_to_end(key)
-                return position, ids
-        return 0, array("I")
+                return position, key, ids
+        return 0, None, array("I")
 
     def _store(self, *, key: bytes, ids: array) -> None:
         self._entries[key] = ids
