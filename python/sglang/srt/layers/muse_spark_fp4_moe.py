@@ -14,7 +14,7 @@ as the no-post-norm fallback and reference.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch import nn
@@ -95,6 +95,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         top_k: int,
         quant_config: QuantizationConfig,
         params_dtype: Optional[torch.dtype] = None,
+        local_expert_ids: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
         intermediate_size, self.expert_tp = expert_tp.partition(intermediate_size)
@@ -171,13 +172,19 @@ class MuseSpark1xFp4Experts(nn.Module):
         )
         self.register_buffer("_post_expert_norm_weight", None, persistent=False)
 
+        # Only the Marlin path routes through _expert_map; the TRT-LLM kernel assumes the contiguous split.
+        self.local_expert_ids = local_expert_ids if self.use_marlin else None
         expert_map = None
         if num_local_experts != num_experts:
-            start = local_expert_offset
-            expert_map = torch.full((num_experts,), -1, dtype=torch.int32)
-            expert_map[start : start + num_local_experts] = torch.arange(
-                num_local_experts, dtype=torch.int32
+            local_ids = (
+                torch.tensor(self.local_expert_ids, dtype=torch.long)
+                if self.local_expert_ids is not None
+                else torch.arange(
+                    local_expert_offset, local_expert_offset + num_local_experts
+                )
             )
+            expert_map = torch.full((num_experts,), -1, dtype=torch.int32)
+            expert_map[local_ids] = torch.arange(num_local_experts, dtype=torch.int32)
         self.register_buffer("_expert_map", expert_map, persistent=False)
 
         self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)

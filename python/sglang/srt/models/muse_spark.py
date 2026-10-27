@@ -46,6 +46,7 @@ from sglang.srt.configs.muse_spark import (
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers import muse_spark_expert_placement
 from sglang.srt.layers import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
@@ -632,6 +633,12 @@ class MuseSpark1xMoE(nn.Module):
                 intermediate_size=self.intermediate_size,
                 top_k=self.top_k,
                 quant_config=quant_config,
+                local_expert_ids=muse_spark_expert_placement.local_expert_ids(
+                    layer_idx=layer_idx,
+                    num_experts=self.num_experts,
+                    ep_size=self.ep_size,
+                    ep_rank=self.ep_rank,
+                ),
             )
         else:
             self.experts = MuseSpark1xBf16Experts(
@@ -1449,9 +1456,21 @@ class MuseSpark1xForCausalLM(nn.Module):
             return
         parallel = get_parallel()
         if loaded_weight.shape[0] == self.config.num_local_experts:
-            local = loaded_weight.shape[0] // parallel.moe_ep_size
-            start = parallel.moe_ep_rank * local
-            loaded_weight = loaded_weight.narrow(0, start, local)
+            experts = self.get_submodule(name.rsplit(".", 1)[0])
+            if (
+                isinstance(experts, MuseSpark1xFp4Experts)
+                and experts.local_expert_ids is not None
+            ):
+                index = torch.tensor(
+                    experts.local_expert_ids, dtype=torch.long, device=loaded_weight.device
+                )
+                # Byte view: older torch builds lack CPU index_select for the fp8 scale tensors.
+                rows = loaded_weight.view(torch.uint8) if loaded_weight.element_size() == 1 else loaded_weight
+                loaded_weight = rows.index_select(0, index).view(loaded_weight.dtype)
+            else:
+                local = loaded_weight.shape[0] // parallel.moe_ep_size
+                start = parallel.moe_ep_rank * local
+                loaded_weight = loaded_weight.narrow(0, start, local)
         if expert_tp.copy_shard(param, loaded_weight, name):
             return
         if param.shape != loaded_weight.shape:
