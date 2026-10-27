@@ -49,22 +49,34 @@ def _build_packs(layer) -> dict | None:
     }
 
 
-def maybe_capture_nvfp4_packs(layer) -> None:
-    """Build the pg packs of this layer while the raw NVFP4 layout still exists (layer budget permitting)."""
+def maybe_capture_nvfp4_packs(layer) -> bool:
+    """Build the pg packs of this layer while the raw NVFP4 layout still exists (layer budget permitting).
+    True means the layer runs pg only: the caller skips the Marlin repack, and the raw tensors are freed."""
     global _captured_layers
     if not _sw.SW_MOE_PG or _captured_layers >= _sw.MOE_PACK_MAX_LAYERS:
-        return
+        return False
     from sglang.srt.layers.muse_spark_fp4_moe import MuseSpark1xFp4Experts
 
     if not isinstance(layer, MuseSpark1xFp4Experts):
-        return
+        return False
     state = _build_packs(layer)
     if state is None:
         logger.warning("OKC pg pack capture declined (shape/dtype mismatch); layer stays on Marlin.")
-        return
+        return False
+    state["pg_only"] = _sw.MOE_PG_ONLY and layer.num_local_experts == 32 and layer.top_k == 8
     layer._okc_moe_state = state
     _captured_layers += 1
-    logger.info("OKC pg packs captured for MoE layer %d (budget %d).", _captured_layers, _sw.MOE_PACK_MAX_LAYERS)
+    if state["pg_only"]:
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            old = getattr(layer, name)
+            setattr(layer, name, torch.nn.Parameter(old.data.new_empty((0,)), requires_grad=False))
+    logger.info(
+        "OKC pg packs captured for MoE layer %d (budget %d, %s).",
+        _captured_layers,
+        _sw.MOE_PACK_MAX_LAYERS,
+        "pg only" if state["pg_only"] else "Marlin kept",
+    )
+    return state["pg_only"]
 
 
 def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm, pre_expert_norm=None):
@@ -72,26 +84,42 @@ def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm,
     _forward_marlin: applies pre_expert_norm itself, returns the EP-partial [T, H] combined output."""
     global _logged_first_call
     state = layer._okc_moe_state
-    if state is None or torch.compiler.is_compiling():
+    if state is None:
         return None
     tokens = hidden_states.shape[0]
-    if tokens < _sw.MOE_PG_MIN_TOKENS or hidden_states.shape[1] != state["H"] or post_expert_norm is None:
+    if not state["pg_only"] and (tokens < _sw.MOE_PG_MIN_TOKENS or torch.compiler.is_compiling()):
         return None
-    # The pg kernels hard-code topk 8 and 32 local experts (the TP8/EP8 shape).
-    if topk_ids.shape[1] != 8 or layer.num_local_experts != 32:
-        return None
-    if layer._post_expert_norm is not post_expert_norm:
-        layer.set_post_expert_norm(post_expert_norm)
-    if layer._post_expert_norm_weight is None:
+    if tokens == 0:
+        return hidden_states.new_empty((0, hidden_states.shape[1]))
+    # A pg-only layer has no Marlin copy to fall back to, so its declines are errors.
+    decline = _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state)
+    if decline is not None:
+        if state["pg_only"]:
+            raise RuntimeError(f"OKC pg-only MoE layer cannot run this batch: {decline}")
         return None
     if pre_expert_norm is not None:
         hidden_states = pre_expert_norm(hidden_states)
-    if hidden_states.dtype is not torch.bfloat16:
-        return None
     if not _logged_first_call:
         _logged_first_call = True
         logger.info("OKC pg MoE active (first T=%d).", tokens)
     return _moe_pg(layer, hidden_states.contiguous(), topk_scores, topk_ids, state)
+
+
+def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
+    if torch.compiler.is_compiling():
+        return "inside torch.compile"
+    if hidden_states.shape[1] != state["H"] or hidden_states.dtype is not torch.bfloat16:
+        return f"hidden {tuple(hidden_states.shape)} {hidden_states.dtype}"
+    # The pg kernels hard-code topk 8 and 32 local experts (the TP8/EP8 shape).
+    if topk_ids.shape[1] != 8 or layer.num_local_experts != 32:
+        return f"topk {topk_ids.shape[1]}, {layer.num_local_experts} local experts"
+    if post_expert_norm is None:
+        return "no post-expert norm"
+    if layer._post_expert_norm is not post_expert_norm:
+        layer.set_post_expert_norm(post_expert_norm)
+    if layer._post_expert_norm_weight is None:
+        return "post-expert norm without a weight"
+    return None
 
 
 def _moe_pg(layer, x, topk_scores, topk_ids, state):

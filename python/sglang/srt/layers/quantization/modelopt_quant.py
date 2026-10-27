@@ -2712,7 +2712,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # captures its packs first.
             from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
 
-            okc_moe.maybe_capture_nvfp4_packs(layer)
+            if okc_moe.maybe_capture_nvfp4_packs(layer):
+                return
             prepare_moe_nvfp4_layer_for_marlin(layer)
             return
 
