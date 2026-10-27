@@ -1303,6 +1303,9 @@ class Scheduler(
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
+        self.prefill_decode_interval_chunked_only = (
+            get_schedule().prefill_decode_interval_chunked_only
+        )
         self._prefill_decode_interval_remaining = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
@@ -1355,6 +1358,9 @@ class Scheduler(
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
+            return
+        # chunked_req is set here only when this batch left a long prompt with chunks still to run.
+        if self.prefill_decode_interval_chunked_only and self.chunked_req is None:
             return
 
         # DP attention synchronizes this flag across ranks. This keeps every

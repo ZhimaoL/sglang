@@ -60,6 +60,10 @@ class Schedule(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    prefill_decode_interval_chunked_only: A[
+        bool,
+        "Apply --prefill-decode-interval only between the chunks of a chunked prefill: a long prompt no longer stalls the running decodes for its whole prefill, while short prefills (such as follow-up turns) are scheduled without delay.",
+    ] = False
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
