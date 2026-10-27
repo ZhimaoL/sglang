@@ -29,6 +29,8 @@ class SmallPrefillFirst:
         self._enabled = enabled
         self._consecutive_small_batches = 0
         self._decode_steps_left = 0
+        # The request being chunked; its final (possibly short) chunk is still a first turn.
+        self._chunked_rid: Optional[str] = None
 
     def small_first_order(
         self,
@@ -70,9 +72,12 @@ class SmallPrefillFirst:
         self, *, batch: ScheduleBatch, chunked_req: Optional[Req], has_waiting: bool
     ) -> None:
         completes_small = any(
-            req is not chunked_req and req.extend_end - req.prefix_len < _SMALL_NEW_TOKENS
+            req is not chunked_req
+            and req.rid != self._chunked_rid
+            and req.extend_end - req.prefix_len < _SMALL_NEW_TOKENS
             for req in batch.reqs
         )
+        self._chunked_rid = chunked_req.rid if chunked_req is not None else None
         more_prefill = chunked_req is not None or has_waiting
         self._decode_steps_left = (
             _DECODE_STEPS_AFTER_SMALL
