@@ -328,6 +328,11 @@ def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.enable_nccl_nvls is None:
         overrides["enable_nccl_nvls"] = True
         logger.info("Enable NCCL NVLS by default for Muse Spark")
+    # Agentic multi-turn traffic: at 16-32 concurrent conversations each lone ~1K-token follow-up prefill
+    # (~115 ms, ~40 ms of it fixed) stalls every decoding request.
+    if cfg.followup_prefill_hold_steps is None and cfg.attn_dp_size == 1:
+        overrides["followup_prefill_hold_steps"] = 3
+        logger.info("Hold small follow-up prefills up to 3 decode steps under load for Muse Spark")
     if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
         # NaViT shards over the full TP group only, so attention TP narrower
         # than TP needs the replicated (data-parallel) encoder.

@@ -202,6 +202,7 @@ from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
+from sglang.srt.managers.followup_prefill_hold import FollowupPrefillHold
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -1304,6 +1305,9 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
+        self.followup_prefill_hold = FollowupPrefillHold(
+            hold_steps=get_schedule().followup_prefill_hold_steps or 0
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -3735,10 +3739,19 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
+        elif self.followup_prefill_hold.should_hold(
+            waiting_queue=self.waiting_queue,
+            tree_cache=self.tree_cache,
+            num_running=running_batch.batch_size(),
+            has_chunked_req=self.chunked_req is not None,
+        ):
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+            if new_batch is not None:
+                self.followup_prefill_hold.on_prefill_scheduled()
 
         need_mlp_sync = self.require_mlp_sync
         if (

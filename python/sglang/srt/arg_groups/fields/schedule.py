@@ -60,6 +60,19 @@ class Schedule(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    followup_prefill_hold_steps: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Under load (8+ decoding requests, no chunked prefill in flight), hold a prefill whose waiting "
+                "requests need under 4,096 new tokens for up to this many decode steps, so follow-up turns "
+                "that arrive close together share one prefill batch. Defaults to the model's preference, "
+                "otherwise 0 (off)."
+            ),
+            resolvable=True,
+            fallback=0,
+        ),
+    ] = None
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
