@@ -27,8 +27,13 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Session SI's 8-GPU bench (16K / 8K chunks, ms per layer vs torch's fused ops): matmul + RS -0.055..-0.065 at 16K and
+# -0.044 at 8K at any AG group; AG + matmul -0.052 at 16K with a barrier per push step (GROUP 1), worse with fewer
+# barriers and at 8K; a second comm stream loses everywhere. So: matmul + RS on every SP forward the fused ops would
+# take, AG + matmul only from OKC_SP_CE_AG_MIN_TOKENS tokens (full 16K chunks), one stream.
 # AG push steps per barrier (1 = a barrier per source block, tp-1 = one barrier for all of them).
-GROUP = int(os.environ.get("OKC_SP_CE_AG_GROUP", "2"))
+GROUP = int(os.environ.get("OKC_SP_CE_AG_GROUP", "1"))
+AG_MIN_TOKENS = int(os.environ.get("OKC_SP_CE_AG_MIN_TOKENS", "16384"))
 STREAMS = int(os.environ.get("OKC_SP_CE_STREAMS", "1"))
 MAX_TOKENS = int(os.environ.get("OKC_SP_CE_MAX_TOKENS", "16384"))
 
@@ -174,6 +179,8 @@ def _eligible(st, rows, width, dtype):
 
 def ag_matmul(tp_group, x_shard, weight):
     """[S, K] shard -> [W*S, N] = all-gather(x_shard) @ weight^T, or None (keep torch's fused op)."""
+    if x_shard.shape[0] * tp_group.world_size < AG_MIN_TOKENS:
+        return None
     st = _buffers(tp_group, max(x_shard.shape[1], weight.shape[0]), x_shard.device)
     if not _eligible(st, x_shard.shape[0], x_shard.shape[1], x_shard.dtype) or weight.dtype != torch.bfloat16:
         return None
