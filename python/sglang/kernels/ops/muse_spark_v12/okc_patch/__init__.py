@@ -102,6 +102,11 @@ SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
 # / 64) up to this size on sm_90. 1 = upstream behaviour.
 HOPPER_NORM_MAX_CLUSTER = int(os.environ.get("OKC_HOPPER_NORM_MAX_CLUSTER", "1"))
 
+# The running batch's DFLASH verify rides along in prefill / extend forwards (srt/managers/ride_along.py): its 8-row
+# blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
+# "1" one merged forward, "2" diagnostic (same scheduling, the two ordinary forwards back to back).
+RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
+
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
@@ -110,4 +115,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_MOE_OVL",
            "SP_PRENORM_SHARD", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
+           "RIDE_ALONG",
            "ANY_ATTN"]

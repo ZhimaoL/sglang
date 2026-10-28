@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -149,6 +149,10 @@ class GenerationBatchResult:
     fpm_end_event: Optional[torch.cuda.Event] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+
+    # (decode batch snapshot, its result) of a verify step that ran inside this prefill
+    # result's forward (managers/ride_along.py); processed before this result.
+    ride_along: Optional[Tuple[Any, "GenerationBatchResult"]] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:
