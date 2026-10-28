@@ -8,8 +8,8 @@ in a fixed order: fp32 accumulation, bf16 out, deterministic.
 
 Claims only the (N, K, m) the dispatch table was measured at (1xH200, lt_final.py's harness): qkv_gate [2304, 8192] at
 m <= 16 (14.7 / 15.2 us vs F.linear 16.7 and the MMA-pack route 16.7), the gemm_ag pooler slice [512, 8192] at m <= 64
-(7.7-9.5 vs 10.1-10.5) and the unpooler slice [1024, 4096] at m <= 32 (7.9-9.0 vs 10.1-10.2). With it the qkv_gate MMA
-pack (proj.prepare_weight, 2.2 GiB per rank) is not built. Everything else returns None.
+(7.7-9.5 vs 10.1-10.5) and the unpooler slice [1024, 4096] at m <= 32 (7.9-9.0 vs 10.1-10.2). It replaces the qkv_gate MMA
+pack route (a 2.2 GiB per rank copy), which is no longer carried. Everything else returns None.
 """
 
 import torch

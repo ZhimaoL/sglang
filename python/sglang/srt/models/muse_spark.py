@@ -41,8 +41,6 @@ from sglang.kernels.ops.muse_spark_v12 import okc_patch
 
 if okc_patch.ANY_ATTN:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import attention as okc_attention
-if okc_patch.SW_PROJ:
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import proj as okc_proj
 if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
 if okc_patch.SW_MOE_OVL:
@@ -1955,17 +1953,15 @@ class MuseSpark1xForCausalLM(nn.Module):
                 and not self.int4_checkpoint
             ):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
-        # The OKC small-T packs (qkv_gate MMA pack, router hi/lo) are built here: before KV-pool
-        # sizing and outside any CUDA-graph capture; the forwards only look them up.
+        # The OKC small-T state (smallm extension, router hi/lo) is built here: before KV-pool
+        # sizing and outside any CUDA-graph capture; the forwards only look it up.
         if okc_patch.SW_SMALLM:
             from sglang.kernels.ops.muse_spark_v12.okc_patch import smallm as okc_smallm
 
             okc_smallm.prepare()
-        if okc_patch.SW_PROJ or okc_patch.SW_ROUTER:
+        if okc_patch.SW_ROUTER:
             for module in self.modules():
-                if okc_patch.SW_PROJ and isinstance(module, MuseSpark1xAttention):
-                    okc_proj.prepare_weight(module.qkv_proj.weight)
-                elif okc_patch.SW_ROUTER and isinstance(module, MuseSpark1xMoE):
+                if isinstance(module, MuseSpark1xMoE):
                     okc_router.prepare_gate(module.gate)
 
 
