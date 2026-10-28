@@ -140,13 +140,15 @@ def rep_table(home_rank, local_slot, rep_order, rep_rank):
     return torch.tensor(tab + list(rep_order), dtype=torch.int32)
 
 
-def assign_replicas(topk_ids, tab, rank, as_map=False):
+def assign_replicas(topk_ids, tab, rank, as_map=False, passes=False):
     """[T, 8] global top-k ids -> [T, 8] int32 local slots on this rank (-1: another rank computes the route), with
     each active replicated expert on the less loaded of its two holders; as_map: the same decision as this forward's
-    [256] global -> slot map (for pg_route). One CTA; same decision on every rank."""
+    [256] global -> slot map (for pg_route); passes: weigh experts by st passes, not 1. One CTA; same decision on every
+    rank."""
     out = torch.empty((256,) if as_map else topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
     none = out.new_empty((0,))
-    pg_ext().rep_assign(topk_ids.contiguous(), tab, none if as_map else out, out if as_map else none, rank)
+    pg_ext().rep_assign(topk_ids.contiguous(), tab, none if as_map else out, out if as_map else none, rank,
+                        1 if passes else 0)
     return out
 
 
