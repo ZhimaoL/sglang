@@ -253,7 +253,7 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
             eager=_pack_heuristic(*eager),
             num_push_blocks=num_sm,
             num_pull_blocks=64,
-            num_mc_blocks=None if world_size < 4 else 128 // world_size,
+            num_mc_blocks=None if world_size < 4 else _okc_mc_blocks(world_size),
         )
 
     return {
@@ -293,6 +293,13 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
             eager=(128.0 * KB, 128.0 * KB, 128.0 * MB, Range(0, 128 * MB)),
         ),
     }
+
+
+def _okc_mc_blocks(world_size: int) -> int:
+    """OKC (verify-glue VG18): multicast 2-shot pull blocks of 512 threads; upstream 128 / world (16 at TP8, B300 32)."""
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    return okc_patch.AR_TP8_MC_BLOCKS if world_size == 8 else 128 // world_size
 
 
 def _okc_tp8_graph() -> tuple:
