@@ -82,6 +82,9 @@ SP_CE_TP = _flag("OKC_SP_CE_TP", "1")
 SW_MOE_OVL = _flag("OKC_SW_MOE_OVL", "0")
 # NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
 SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
+# NCCL SP MoE section: the pooled rows, top-k scores and top-k ids gathered in ONE NCCL group (one kernel) instead of
+# three all-gathers. Same bytes; the two small gathers' fixed latency goes (cand7 ~1K extend: 17 + 12 us per layer).
+SP_AG_GROUP = _flag("OKC_SP_AG_GROUP", "1")
 
 # Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call. Per request:
 # full layers from OKC_PFMHA_MIN_TOKENS new tokens, sliding layers from OKC_PFMHA_SLIDING_MIN_TOKENS (1xH200 over a 75K
@@ -154,7 +157,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
            "SW_MOE_OVL",
-           "SP_PRENORM_SHARD", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE",
+           "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "RIDE_ALONG", "ANY_ATTN"]
