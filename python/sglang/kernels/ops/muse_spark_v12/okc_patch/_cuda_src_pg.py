@@ -880,36 +880,54 @@ __global__ void __launch_bounds__(256) align_scatter(const int* __restrict__ lid
 // ------------------------------------------------------------------ replica balancer (small-T forwards)
 // tab[e]: bits 0-7 expert e's slot on this rank (255: not held), 8-10 its home rank, bit 11 replicated, 12-14 the
 // replica's rank; tab[256 + j] = the j-th replicated expert in balancing order. Same decision on every rank from the
-// same ids: load[r] = distinct active non-replicated experts homed on r; each active replicated expert, in order, goes
-// to the holder with the lower load (tie: home). out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
+// same ids. An active expert weighs 1, or with passes its st passes ceil(routes / 8) (st's time is c0 + c1 x passes);
+// load[r] = weight of the active non-replicated experts homed on r; each active replicated expert, in order, goes to
+// the holder with the lower load (tie: home); then two sweeps move a replicated expert off the most loaded rank when
+// its other holder stays below. out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
 template <typename IdT>
 __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids, int n_routes,
-                                                     const int* __restrict__ tab, int n_rep, int me,
+                                                     const int* __restrict__ tab, int n_rep, int me, int passes,
                                                      int* __restrict__ out, int* __restrict__ emap_out) {
-    __shared__ int tabs[256], ord[256], act[256], owner[256], load[8];
+    __shared__ int tabs[256], ord[256], cnt[256], owner[256], load[8];
     const int t = threadIdx.x;
     const int v = tab[t];
     tabs[t] = v;
     if (t < n_rep) ord[t] = tab[256 + t];
-    act[t] = 0;
+    cnt[t] = 0;
     owner[t] = (v >> 8) & 7;
     if (t < 8) load[t] = 0;
     __syncthreads();
     for (int i = t; i < n_routes; i += 256) {
         const int e = (int)ids[i];
-        if ((unsigned)e < 256u) act[e] = 1;
+        if ((unsigned)e < 256u) atomicAdd(&cnt[e], 1);
     }
     __syncthreads();
-    if (act[t] && !((v >> 11) & 1)) atomicAdd(&load[(v >> 8) & 7], 1);
+    const int w = passes ? (cnt[t] + 7) >> 3 : (cnt[t] > 0);
+    if (w && !((v >> 11) & 1)) atomicAdd(&load[(v >> 8) & 7], w);
     __syncthreads();
     if (t == 0) {
-        unsigned long long L = 0;   // 8 bits per rank (a load is at most 32 + n_rep < 256)
-        for (int r = 0; r < 8; r++) L |= (unsigned long long)load[r] << (8 * r);
+        int ld[8];
+#pragma unroll
+        for (int r = 0; r < 8; r++) ld[r] = load[r];
         for (int j = 0; j < n_rep; j++) {
-            const int e = ord[j], ve = tabs[e];
-            const int h = (ve >> 8) & 7, r = (ve >> 12) & 7;
-            const int pick = ((L >> (8 * r)) & 0xFF) < ((L >> (8 * h)) & 0xFF) ? r : h;
-            if (act[e]) { owner[e] = pick; L += 1ull << (8 * pick); }
+            const int e = ord[j], c = cnt[e];
+            if (!c) continue;
+            const int ve = tabs[e], h = (ve >> 8) & 7, r = (ve >> 12) & 7;
+            const int pick = ld[r] < ld[h] ? r : h;
+            owner[e] = pick;
+            ld[pick] += passes ? (c + 7) >> 3 : 1;
+        }
+        for (int sweep = 0; sweep < 2; sweep++) {
+            for (int j = 0; j < n_rep; j++) {
+                const int e = ord[j], c = cnt[e];
+                if (!c) continue;
+                const int ve = tabs[e], h = (ve >> 8) & 7, r = (ve >> 12) & 7, we = passes ? (c + 7) >> 3 : 1;
+                const int o = owner[e], q = o == h ? r : h;
+                int mx = ld[0];
+#pragma unroll
+                for (int k = 1; k < 8; k++) mx = max(mx, ld[k]);
+                if (ld[o] == mx && ld[q] + we < ld[o]) { owner[e] = q; ld[o] -= we; ld[q] += we; }
+            }
         }
     }
     __syncthreads();
@@ -1066,8 +1084,8 @@ void tiles(torch::Tensor block_experts, torch::Tensor n_padded, torch::Tensor so
         (int)num_pid_m, (int)bm, (int)wmask, (int)nle, live.data_ptr<int>());
 }
 
-// out: [numel] per-route slots, emap: [256] per-expert map; either may be empty (not written)
-void rep_assign(torch::Tensor ids, torch::Tensor tab, torch::Tensor out, torch::Tensor emap, int64_t me) {
+// out: [numel] per-route slots, emap: [256] per-expert map; either may be empty (not written); passes: st weights
+void rep_assign(torch::Tensor ids, torch::Tensor tab, torch::Tensor out, torch::Tensor emap, int64_t me, int64_t passes) {
     const int n_rep = (int)tab.size(0) - 256;
     TORCH_CHECK(tab.scalar_type() == at::kInt && n_rep >= 0 && n_rep <= 256 && ids.is_contiguous() && me >= 0 &&
                 me < 8 && (out.numel() == 0 || (out.scalar_type() == at::kInt && out.is_contiguous() &&
@@ -1079,10 +1097,10 @@ void rep_assign(torch::Tensor ids, torch::Tensor tab, torch::Tensor out, torch::
     auto stream = at::cuda::getCurrentCUDAStream();
     if (ids.scalar_type() == at::kLong)
         pgk::pg_rep_assign<int64_t><<<1, 256, 0, stream>>>(ids.data_ptr<int64_t>(), (int)ids.numel(),
-                                                             tab.data_ptr<int>(), n_rep, (int)me, o, m);
+                                                             tab.data_ptr<int>(), n_rep, (int)me, (int)passes, o, m);
     else
         pgk::pg_rep_assign<int><<<1, 256, 0, stream>>>(ids.data_ptr<int>(), (int)ids.numel(), tab.data_ptr<int>(),
-                                                       n_rep, (int)me, o, m);
+                                                       n_rep, (int)me, (int)passes, o, m);
 }
 
 void rep_split(torch::Tensor ids, torch::Tensor tab, torch::Tensor cnt, torch::Tensor bc, torch::Tensor cut,
