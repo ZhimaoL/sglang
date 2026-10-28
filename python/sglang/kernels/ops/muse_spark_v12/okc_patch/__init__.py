@@ -144,6 +144,8 @@ SW_RS_NORM_FOLD = _flag("OKC_SW_RS_NORM_FOLD", "1")
 SW_RS_ATTN_BLOCKS = _flag("OKC_SW_RS_ATTN_BLOCKS", "0")
 RS_ATTN_BLOCKS_MIN_ROWS = int(os.environ.get("OKC_RS_ATTN_BLOCKS_MIN_ROWS", "2048"))
 RS_ATTN_BLOCKS_GROUP = int(os.environ.get("OKC_RS_ATTN_BLOCKS_GROUP", "2"))
+# Full-attention layers too, in groups of this many destinations per fmha launch (0 = off; R4: 2-4 launches).
+RS_ATTN_BLOCKS_FULL = int(os.environ.get("OKC_RS_ATTN_BLOCKS_FULL", "0"))
 # NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
 SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
 # pg calls of >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS tokens align their routes with the prefill bank's local-slot align
@@ -286,7 +288,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
            "RIDE_ALONG", "RIDE_CORE", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
-           "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP",
+           "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "RS_ATTN_BLOCKS_FULL",
            "ANY_ATTN"]
 SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "0")  # M 33..128: fused AG + norm, row kernel at 1024 threads
 __all__ += ["SW_AG_NORM_WIDE"]
