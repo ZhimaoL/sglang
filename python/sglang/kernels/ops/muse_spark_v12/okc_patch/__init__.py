@@ -57,6 +57,9 @@ SW_PROJ = _flag("OKC_SW_PROJ", "1")
 # for qkv_gate (m <= 16) and the gemm_ag pooler / unpooler slices (m <= 64 / 32); off, those take F.linear (the old
 # qkv_gate MMA-pack route measured the same 16.7 us at m 8 and is not carried).
 SW_SMALLM = _flag("OKC_SW_SMALLM", "1")
+# Pinned cuBLASLt configs (okc_patch/lt.py) at measured verify (N, K, m) entries outside smallm's range, each >= 5 %
+# per call over F.linear in two runs (serving/kernels/lt/RESULTS.md); dispatched after smallm.
+SW_LT = _flag("OKC_SW_LT", "1")
 SW_ROUTER = _flag("OKC_SW_ROUTER", "1")
 # Kill switches of the v1 attention paths (default on; "0" falls back to the older chain).
 SW_ATTN_V3 = _flag("OKC_SW_ATTN_V3", "1")
@@ -200,7 +203,7 @@ ANY_ATTN = SW_ATTN or SW_WST
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
            "MOE_REP_PREFILL", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS",
-           "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
+           "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",
            "SW_VFG_FULL1",

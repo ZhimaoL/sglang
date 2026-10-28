@@ -1990,6 +1990,15 @@ class MuseSpark1xForCausalLM(nn.Module):
             from sglang.kernels.ops.muse_spark_v12.okc_patch import smallm as okc_smallm
 
             okc_smallm.prepare()
+        if okc_patch.SW_LT:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import lt as okc_lt
+
+            for module in self.modules():
+                if isinstance(module, MuseSpark1xAttention):
+                    okc_lt.prepare(module.qkv_proj.weight)
+                elif isinstance(module, MuseSpark1xMoE) and module.pre_expert_proj is not None:
+                    okc_lt.prepare(module.pre_expert_proj.weight)
+                    okc_lt.prepare(module.post_expert_proj.weight)
         if okc_patch.SW_ROUTER:
             for module in self.modules():
                 if isinstance(module, MuseSpark1xMoE):
