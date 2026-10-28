@@ -1673,25 +1673,40 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=self.num_splits,
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    **kwargs,
-                )
+                result = None
+                if (
+                    getattr(layer, "okc_prefill_fmha", False)
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and not (use_local_attn or use_cascade_attn or return_lse)
+                ):
+                    # OKC: the prefill lane's FP8 FMHA in place of this call; None = FA3 below.
+                    from sglang.kernels.ops.muse_spark_v12.okc_patch import prefill_fmha
+
+                    result = prefill_fmha.try_extend(
+                        self, q, key_cache, value_cache, page_table, cache_seqlens,
+                        cu_seqlens_q, max_seqlen_q, layer, forward_batch, window_size,
+                        causal, kwargs, _fa_out,
+                    )
+                if result is None:
+                    result = flash_attn_with_kvcache(
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn or return_lse,
+                        num_splits=self.num_splits,
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
+                        **kwargs,
+                    )
 
             if return_lse and not use_cascade_attn:
                 if not isinstance(result, tuple):

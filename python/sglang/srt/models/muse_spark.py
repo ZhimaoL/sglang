@@ -398,6 +398,8 @@ class MuseSpark1xAttention(nn.Module):
             use_irope=self.use_rope,
             sliding_window_size=sliding_window or -1,
         )
+        # The FA3 backend's extend call reads this mark (okc_patch/prefill_fmha.py): target layers only.
+        self.attn.okc_prefill_fmha = okc_patch.SW_PREFILL_FMHA
         self.norm_eps = config.rms_norm_eps
         # The output norm and the sigmoid gate are one fused kernel. The norm is
         # weightless here, so this module carries no parameters -- it exists to

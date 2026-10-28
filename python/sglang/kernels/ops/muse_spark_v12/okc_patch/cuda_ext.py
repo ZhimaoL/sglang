@@ -7,6 +7,7 @@ import threading
 _lock = threading.Lock()
 _PG_EXT = None
 _PROJ_EXT = None
+_FMHA_EXT = None
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -86,3 +87,42 @@ def proj_ext():
                     verbose=False,
                 )
     return _PROJ_EXT
+
+
+_FMHA_CPP = """
+void fmha4n_split(torch::Tensor q, torch::Tensor kvt, torch::Tensor out, torch::Tensor po, torch::Tensor pml,
+                  torch::Tensor lens, torch::Tensor k_scale, torch::Tensor v_scale, double smqk_log2e,
+                  int64_t B, int64_t L, int64_t capblks, int64_t S, int64_t win, int64_t nc);
+void combine(torch::Tensor po, torch::Tensor pml, torch::Tensor out, int64_t rows, int64_t S);
+void gatherp(torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor kvt, torch::Tensor page_table,
+             torch::Tensor lens, torch::Tensor seq, torch::Tensor lens_out, int64_t pt_stride, int64_t pagelog,
+             int64_t capblks, int64_t B, int64_t L, int64_t win);
+"""
+
+
+def fmha_ext():
+    global _FMHA_EXT
+    if _FMHA_EXT is None:
+        with _lock:
+            if _FMHA_EXT is None:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_fmha import (
+                    _CUDA_SRC,
+                )
+
+                # The prefill lane's flags for this module (fmha7's TMA / wgmma PTX needs sm_90a).
+                _FMHA_EXT = load_inline(
+                    name="okc_pfmha_c4b",
+                    cpp_sources=[_FMHA_CPP],
+                    cuda_sources=[_CUDA_SRC],
+                    functions=["fmha4n_split", "combine", "gatherp"],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        "--use_fast_math",
+                        "-gencode=arch=compute_90a,code=sm_90a",
+                    ],
+                    verbose=False,
+                )
+    return _FMHA_EXT
