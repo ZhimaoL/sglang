@@ -10,6 +10,7 @@ tighter than the certified bound.
 
 import triton
 import triton.language as tl
+from triton.language.extra import cuda as tlc
 
 @triton.jit
 def _sliding_prep(
@@ -21,7 +22,11 @@ def _sliding_prep(
     L: tl.constexpr, GROUP: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr,
     GROUP_Q: tl.constexpr, HKV_Q: tl.constexpr,   # q workspace layout (merged: 1 x HQ)
     HAS_ROPE: tl.constexpr, D: tl.constexpr, BLOCK_R: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
+    if PDL:   # programmatic dependent launch: wait for the producers before any load or store
+        tlc.gdc_wait()
+        tlc.gdc_launch_dependents()
     t = tl.program_id(0)          # token = b * L + l
     b = t // L
     l = t % L
@@ -591,6 +596,7 @@ def _fs_verify(
     L: tl.constexpr, GROUP: tl.constexpr, HKV: tl.constexpr,
     S: tl.constexpr, SORTED: tl.constexpr, FP8Q: tl.constexpr,
     D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_L: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Full-attention verify streamer, one kv head per program (h is the fastest pid
     dimension so the two heads' 64B halves of a row stay L2-adjacent). All cached keys
@@ -598,6 +604,9 @@ def _fs_verify(
     (round-tripped FP8, written by prep) with the causal-by-position mask. FP8Q runs the
     two big dots in E4M3 (the FA3 baseline's own query precision, which the output bound
     is built around); the [M] x [8] block tail stays bf16."""
+    if PDL:   # programmatic dependent launch: wait for the producers before any load or store
+        tlc.gdc_wait()
+        tlc.gdc_launch_dependents()
     pid = tl.program_id(0)
     b = pid // (S * HKV)
     r = pid % (S * HKV)
@@ -690,10 +699,14 @@ def _fs_reduce(
     S: tl.constexpr, SPP: tl.constexpr, SC: tl.constexpr,
     LG: tl.constexpr, TILES: tl.constexpr,
     D: tl.constexpr, BLOCK_M: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """First level of a two-level merge for large S (small B): each part folds its SPP
     partials into one (m, den, num) triple; _fs_combine then merges the PARTS triples
     (merging triples is the same associative flash-decode reduction)."""
+    if PDL:   # programmatic dependent launch: wait for the producers before any load or store
+        tlc.gdc_wait()
+        tlc.gdc_launch_dependents()
     pid = tl.program_id(0)                        # = bh * TILES + t
     part = tl.program_id(1)
     bh = pid // TILES
@@ -738,10 +751,14 @@ def _fs_combine(
     HKV: tl.constexpr, S: tl.constexpr, BLOCK_S: tl.constexpr, SC: tl.constexpr,
     TILES: tl.constexpr,
     D: tl.constexpr, BLOCK_M: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Flash-decode reduction over S partials (m/l in one [BLOCK_S, M] tile, acc summed
     in [SC, M, D] chunks so S can be large) + the fused v_scale -> per-head RMSNorm ->
     sigmoid(gate) epilogue."""
+    if PDL:   # programmatic dependent launch: wait for the producers before any load or store
+        tlc.gdc_wait()
+        tlc.gdc_launch_dependents()
     pid = tl.program_id(0)                        # = (b * HKV + h) * TILES + t
     bh = pid // TILES
     t = pid % TILES
@@ -972,11 +989,14 @@ def _sl_verify_f2(
     WINDOW: tl.constexpr, PAGE: tl.constexpr,
     S: tl.constexpr, CHUNK: tl.constexpr, SC: tl.constexpr, ACC16: tl.constexpr,
     D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Sliding verify split + in-kernel last-arriver combine (2 launches with prep instead
     of prep + split + combine). Identical streaming to _sliding_split (q from the prep
     workspace keeps registers lean -- the 1-launch inline-q variant spilled); partials can
     be stored bf16 (ACC16) to shrink the single-CTA tail's reads."""
+    if PDL:   # programmatic dependent launch: wait for the producers before any load or store
+        tlc.gdc_wait()
     pid = tl.program_id(0)
     b = pid // (HKV * S)
     h = (pid // S) % HKV
@@ -1052,6 +1072,9 @@ def _sl_verify_f2(
         tl.store(ws_acc_ptr + (pbase + offs_m)[:, None] * D + offs_d[None, :], acc,
                  mask=row_ok[:, None], cache_modifier=".cg")
 
+    if PDL:   # dependents launch once the partials are out (at bs >= 2 the next kernel is a cuBLAS GEMM whose
+        # pre-wait prologue would otherwise compete with this KV stream)
+        tlc.gdc_launch_dependents()
     ticket = tl.atomic_add(counter_ptr + b * HKV + h, 1, sem="acq_rel", scope="gpu")
     if ticket == S - 1:
         # every program of this call has its ticket: re-arm for the next call

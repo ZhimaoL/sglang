@@ -68,6 +68,27 @@ def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
     return torch.topk(scores, k, dim=-1)
 
 
+def _okc_fc_column_split(weight: torch.Tensor, x: torch.Tensor) -> Optional[torch.Tensor]:
+    """The replicated context projection as a column-parallel GEMM + the multicast all-gather (gemm_ag): each TP
+    rank reads its 1 / tp row block of fc.weight (80 of 640 MiB at TP8) instead of all of it. target_hidden is the
+    replicated residual stream, identical on every rank, and every rank takes the same branch (shape-only test).
+    None = not applicable (the caller runs the replicated nn.Linear)."""
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    if not okc_patch.SW_DFLASH_FC_AG or x.dim() != 2 or not x.is_cuda:
+        return None
+    from sglang.kernels.ops.muse_spark_v12.gemm_ag import gemm_ag, gemm_ag_supported
+    from sglang.srt.distributed import get_tp_group
+
+    tp = get_tp_group()
+    if tp.world_size < 2:
+        return None
+    x = x.contiguous()
+    if not gemm_ag_supported(tp.ca_comm, x, weight):
+        return None
+    return gemm_ag(tp.ca_comm, x, weight)
+
+
 def _logical_linear_weight_shape(
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
@@ -780,9 +801,11 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.quantizable:
-            projected = projected[0]
+        projected = None if self.quantizable else _okc_fc_column_split(self.fc.weight, target_hidden)
+        if projected is None:
+            projected = self.fc(target_hidden)
+            if self.quantizable:
+                projected = projected[0]
         return self.hidden_norm(projected)
 
     @torch.no_grad()

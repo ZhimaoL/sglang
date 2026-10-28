@@ -124,6 +124,7 @@ class MuseSpark1xBf16Experts(nn.Module):
         self.use_trtllm = False
         self.use_triton = False
         self._triton_runner_config = None
+        self._okc_local_table: Optional[torch.Tensor] = None
         self._finalize_op: Optional[FusedPostExpertNormWeightedSumTRTLLM] = None
         self.register_buffer("_post_expert_norm_weight", None, persistent=False)
         self.gate_up_proj = nn.Parameter(
@@ -195,6 +196,13 @@ class MuseSpark1xBf16Experts(nn.Module):
             if _triton_bf16_moe_supported(self.gate_up_proj.device):
                 self._triton_runner_config = self._build_triton_runner_config()
                 self.use_triton = True
+                from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+                if okc_patch.SW_BF16_MOE_GLUE:
+                    g = torch.arange(self.num_experts, device=self.gate_up_proj.device)
+                    off = self.local_expert_offset
+                    local = (g >= off) & (g < off + self.num_local_experts)
+                    self._okc_local_table = torch.where(local, g - off, -1).to(torch.int32)
             return
         if getattr(self, "use_megamoe", False):
             from sglang.srt.layers.moe.muse_spark_megamoe import (
@@ -520,12 +528,17 @@ class MuseSpark1xBf16Experts(nn.Module):
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
         offset = self.local_expert_offset
-        local_topk_ids = torch.where(
-            (topk_ids >= offset) & (topk_ids < offset + self.num_local_experts),
-            topk_ids - offset,
-            -1,
-        )
-        local_topk_ids = local_topk_ids.to(torch.int32).contiguous()
+        if self._okc_local_table is not None and topk_ids.dtype is torch.int32 and topk_ids.is_contiguous():
+            # One lookup in the [E] global -> local table built at weight prep, instead of the 6-launch
+            # compare / and / subtract / where chain; same ids.
+            local_topk_ids = self._okc_local_table[topk_ids]
+        else:
+            local_topk_ids = torch.where(
+                (topk_ids >= offset) & (topk_ids < offset + self.num_local_experts),
+                topk_ids - offset,
+                -1,
+            )
+            local_topk_ids = local_topk_ids.to(torch.int32).contiguous()
 
         expert_output = fused_experts(
             hidden_states=hidden_states.contiguous(),
@@ -547,6 +560,9 @@ class MuseSpark1xBf16Experts(nn.Module):
             eps=eps,
             weight_first=weight_first,
             apply_norm=post_expert_norm is not None,
+            # Below 32 tokens the wrapper's torch chain is 11 launches (~35 us at T = 8); the kernel computes the
+            # same fp32 norm and weighted sum (as the pg layers' finalize, which already passes 1).
+            min_tokens_for_fused=1 if self._okc_local_table is not None else 32,
         ).to(hidden_states.dtype)
 
     @torch.no_grad()

@@ -48,6 +48,7 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN_ACC16,
     SW_ATTN_V3,
     SW_FS,
+    SW_PDL,
 )
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
@@ -341,8 +342,8 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         EPS=eps,
         L=L, GROUP=group, HQ=hq, HKV=hkv,
         GROUP_Q=group, HKV_Q=hkv,
-        HAS_ROPE=bool(theta), D=d, BLOCK_R=br,
-        num_warps=4 if br <= 64 else 8, num_stages=1,
+        HAS_ROPE=bool(theta), D=d, BLOCK_R=br, PDL=SW_PDL,
+        num_warps=4 if br <= 64 else 8, num_stages=1, launch_pdl=SW_PDL,
     )
     ak._sl_verify_f2[(P,)](
         q_ws, kc, vc,
@@ -357,8 +358,8 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         S=S, CHUNK=chunk, SC=sc, ACC16=SW_ATTN_ACC16,
         D=d,
         BLOCK_M=max(16, triton.next_power_of_2(LG)),
-        BLOCK_N=BN,
-        num_warps=warps, num_stages=3,
+        BLOCK_N=BN, PDL=SW_PDL,
+        num_warps=warps, num_stages=3, launch_pdl=SW_PDL,
     )
     return out
 
@@ -533,8 +534,8 @@ def _fs_full(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         EPS=eps,
         L=L, GROUP=group, HQ=hq, HKV=hkv,
         GROUP_Q=group, HKV_Q=hkv,
-        HAS_ROPE=False, D=d, BLOCK_R=br,
-        num_warps=4 if br <= 64 else 8, num_stages=1,
+        HAS_ROPE=False, D=d, BLOCK_R=br, PDL=SW_PDL,
+        num_warps=4 if br <= 64 else 8, num_stages=1, launch_pdl=SW_PDL,
     )
     ak._fs_verify[(P,)](
         q_ws, kc, vc,
@@ -545,8 +546,8 @@ def _fs_full(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         L=L, GROUP=group, HKV=hkv,
         S=S, SORTED=True, FP8Q=fp8_pool,
         D=d, BLOCK_M=max(16, triton.next_power_of_2(LG)), BLOCK_N=BN,
-        BLOCK_L=max(16, triton.next_power_of_2(L)),
-        num_warps=4, num_stages=3,
+        BLOCK_L=max(16, triton.next_power_of_2(L)), PDL=SW_PDL,
+        num_warps=4, num_stages=3, launch_pdl=SW_PDL,
     )
     _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, hkv, group, L, S, d,
               gate_col0, kv_scale, eps, device)
@@ -569,8 +570,8 @@ def _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, hkv_l, group_l, L, S, D,
         w2l = torch.empty((bh * parts * LG,), dtype=torch.float32, device=device)
         ak._fs_reduce[(bh * tiles, parts)](
             ws_acc, ws_m, ws_l, w2a, w2m, w2l, parts,
-            S=S, SPP=spp, SC=SC, LG=LG, TILES=tiles, D=D, BLOCK_M=cm,
-            num_warps=4, num_stages=3,
+            S=S, SPP=spp, SC=SC, LG=LG, TILES=tiles, D=D, BLOCK_M=cm, PDL=SW_PDL,
+            num_warps=4, num_stages=3, launch_pdl=SW_PDL,
         )
         ws_acc, ws_m, ws_l = w2a, w2m, w2l
         S = parts
@@ -580,6 +581,6 @@ def _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, hkv_l, group_l, L, S, D,
         qkv.stride(0), out_stride, gate_col0, kv_scale,
         EPS=eps, L=L, GROUP=group_l, HKV=hkv_l, S=S,
         BLOCK_S=triton.next_power_of_2(S), SC=SC, TILES=tiles,
-        D=D, BLOCK_M=cm,
-        num_warps=4, num_stages=3,
+        D=D, BLOCK_M=cm, PDL=SW_PDL,
+        num_warps=4, num_stages=3, launch_pdl=SW_PDL,
     )

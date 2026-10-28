@@ -3,6 +3,9 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import cuda as tlc
+
+from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL
 
 _MIN_TOKENS_FOR_FUSED = 32
 
@@ -22,7 +25,11 @@ def _post_expert_norm_weighted_sum_kernel(
     WEIGHT_FIRST: tl.constexpr,
     HAS_IDS: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
+    if PDL:   # programmatic dependent launch: wait for the expert GEMM before any load or store
+        tlc.gdc_wait()
+        tlc.gdc_launch_dependents()
     tok = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
@@ -114,8 +121,10 @@ def fused_post_expert_norm_weighted_sum(
         WEIGHT_FIRST=weight_first,
         HAS_IDS=slot_expert_ids is not None,
         BLOCK_H=block_h,
+        PDL=SW_PDL,
         num_warps=8 if block_h >= 4096 else 4,
         num_stages=2,
+        launch_pdl=SW_PDL,
     )
     return out
 
