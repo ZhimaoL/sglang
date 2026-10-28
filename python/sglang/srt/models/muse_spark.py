@@ -824,6 +824,7 @@ class MuseSpark1xMoE(nn.Module):
             and self.moe_tp_size == 1
             and not getattr(get_forward(), "sp_active", False)
             and not already_reduced
+            and not getattr(output, "_okc_reduced", False)   # OKC_SW_FINALIZE_AR: the finalize reduced it
         ):
             output = tensor_model_parallel_all_reduce(output)
         if self.post_expert_proj is not None:

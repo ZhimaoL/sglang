@@ -386,6 +386,7 @@ def finalize_routes(layer, y, topk_scores, local_ids):
         # Below 32 tokens the wrapper's torch chain is 14 launches, ~36 us per layer at T = 8 (verify bs 1) against
         # ~4 us for the kernel (session SC); the kernel's math is the same fp32 norm and weighted sum.
         min_tokens_for_fused=1,
+        all_reduce=getattr(layer, "moe_tp_size", 1) == 1,   # OKC_SW_FINALIZE_AR: + the combine all-reduce
     )
 
 
