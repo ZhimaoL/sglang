@@ -19,6 +19,9 @@ bit-identical to the shipped build; only padded columns are skipped. Width codes
 1 = 128, 2 = 192, 3 = 32, 4 = 16); items of <= 64 tokens stage two k-tiles per ring slot.
 """
 
+from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_rep import _CUDA_SRC_REP
+
+
 def _wgmma_asm(n):
     """m64nNk16 f32 += bf16(A regs, '+r') x bf16(B desc) with a runtime scale-d predicate."""
     nacc = n // 2
@@ -998,54 +1001,16 @@ __global__ void __launch_bounds__(256) align_scatter(const int* __restrict__ lid
 }
 
 // ------------------------------------------------------------------ replica balancer (small-T forwards)
-// tab[e]: bits 0-7 expert e's slot on this rank (255: not held), 8-10 its home rank, bit 11 replicated, 12-14 the
-// replica's rank; tab[256 + j] = the j-th replicated expert in balancing order. Same decision on every rank from the
-// same ids. An active expert weighs 1, or with passes its st passes ceil(routes / 8) (st's time is c0 + c1 x passes);
-// load[r] = weight of the active non-replicated experts homed on r; each active replicated expert, in order, goes to
-// the holder with the lower load (tie: home). out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
+// rep_owner (_cuda_src_rep.py, shared with st); out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
+@@REP@@
 template <typename IdT>
 __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids, int n_routes,
                                                      const int* __restrict__ tab, int n_rep, int me, int passes,
                                                      int* __restrict__ out, int* __restrict__ emap_out) {
     __shared__ int tabs[256], ord[256], cnt[256], owner[256], load[8];
+    rep_owner<4>(ids, n_routes, tab, n_rep, passes, tabs, cnt, owner, ord, load);
     const int t = threadIdx.x;
-    const int v = tab[t];
-    tabs[t] = v;
-    if (t < n_rep) ord[t] = tab[256 + t];
-    cnt[t] = 0;
-    owner[t] = (v >> 8) & 7;
-    if (t < 8) load[t] = 0;
-    __syncthreads();
-    for (int i = t; i < n_routes; i += 256) {
-        const int e = (int)ids[i];
-        if ((unsigned)e < 256u) atomicAdd(&cnt[e], 1);
-    }
-    __syncthreads();
-    const int w = passes ? (cnt[t] + 7) >> 3 : (cnt[t] > 0);
-    if (w && !((v >> 11) & 1)) atomicAdd(&load[(v >> 8) & 7], w);
-    __syncthreads();
-    if (t == 0) {
-        // 16 bits per rank in two registers (a passes-weighted load stays below 2^16); no local-memory arrays: this
-        // serial loop sits on every rank's critical path
-        unsigned long long L0 = 0, L1 = 0;
-#pragma unroll
-        for (int r = 0; r < 4; r++) {
-            L0 |= (unsigned long long)load[r] << (16 * r);
-            L1 |= (unsigned long long)load[4 + r] << (16 * r);
-        }
-        for (int j = 0; j < n_rep; j++) {
-            const int e = ord[j], c = cnt[e];
-            if (!c) continue;
-            const int ve = tabs[e], h = (ve >> 8) & 7, r = (ve >> 12) & 7;
-            const unsigned lh = (unsigned)(((h & 4) ? L1 : L0) >> (16 * (h & 3))) & 0xFFFFu;
-            const unsigned lr = (unsigned)(((r & 4) ? L1 : L0) >> (16 * (r & 3))) & 0xFFFFu;
-            const int pick = lr < lh ? r : h;
-            owner[e] = pick;
-            const unsigned long long add = (unsigned long long)(passes ? (c + 7) >> 3 : 1) << (16 * (pick & 3));
-            if (pick & 4) L1 += add; else L0 += add;
-        }
-    }
-    __syncthreads();
+    const int v = tabs[t];
     if (emap_out != nullptr) emap_out[t] = (owner[t] == me && (v & 0xFF) != 0xFF) ? (v & 0xFF) : -1;
     if (out == nullptr) return;
     for (int i = t; i < n_routes; i += 256) {
@@ -1371,4 +1336,4 @@ void gg2(torch::Tensor xg, torch::Tensor wsf, torch::Tensor y, torch::Tensor sor
 """
 
 _CUDA_SRC = _CUDA_SRC.replace("@@WGMMA@@", "".join(_wgmma_asm(n) for n in (256, 192, 128, 64))).replace(
-    "@@WGMMA_N@@", _wgmma_asm(32) + _wgmma_asm(16))
+    "@@WGMMA_N@@", _wgmma_asm(32) + _wgmma_asm(16)).replace("@@REP@@", _CUDA_SRC_REP)

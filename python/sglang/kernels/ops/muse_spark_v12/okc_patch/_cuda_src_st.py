@@ -6,6 +6,8 @@ the pack's bf16 block scales into mma.sync m16n8k16 A fragments (one warp's 16 r
 fragment). Local slots: up to ELOC (32 home + hot-expert replicas), the count from wsf13.
 """
 
+from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_rep import _CUDA_SRC_REP
+
 _CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -114,10 +116,17 @@ struct Tab {
     float gs[ELOC];
 };
 
-// Routing table of the call from local_ids (-1 = not local), identical in every CTA of both kernels: an expert's
-// routes in route order, split in passes of 8 (ascending expert, then pass). No atomics.
+// Replica balancer folded in (rtab != null): every CTA of both kernels runs pg_rep_assign's rep_owner
+// (_cuda_src_rep.py) on the call's global ids instead of that launch; build_tab maps id e to tabs[e]'s slot when
+// owner[e] == me.
+@@REP@@
+
+// Routing table of the call from local_ids (-1 = not local), or from global ids through emap, identical in every CTA
+// of both kernels: an expert's routes in route order, split in passes of 8 (ascending expert, then pass). No atomics.
+// lids != null: the call's per-route slots (what pg_rep_assign returns) for the finalize.
 DINL void build_tab(const int* __restrict__ ids, int numel, int nl, const float* __restrict__ gs, Tab& tb,
-                    unsigned short (*wcnt)[ELOC], int* vbase) {
+                    unsigned short (*wcnt)[ELOC], int* vbase, const int* rtabs, const int* rown, int me,
+                    int* __restrict__ lids) {
     // route r = tid + j * NTHR (j < RPT) sits in 32-route group (w + j * NW): per-group, per-expert counts
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     for (int i = tid; i < (NUMEL_MAX / 32) * ELOC; i += NTHR) (&wcnt[0][0])[i] = 0;
@@ -126,7 +135,12 @@ DINL void build_tab(const int* __restrict__ ids, int numel, int nl, const float*
     for (int j = 0; j < RPT; j++) {
         const int r = tid + j * NTHR;
         id[j] = r < numel ? ids[r] : -1;
+        if (rtabs != nullptr) {
+            const int e = id[j];
+            id[j] = (unsigned)e < 256u && rown[e] == me && (rtabs[e] & 0xFF) != 0xFF ? rtabs[e] & 0xFF : -1;
+        }
         if ((unsigned)id[j] >= (unsigned)nl) id[j] = -1;
+        if (lids != nullptr && r < numel) lids[r] = id[j];
     }
     if (gs != nullptr && tid >= NTHR - ELOC && tid - (NTHR - ELOC) < nl)
         tb.gs[tid - (NTHR - ELOC)] = gs[tid - (NTHR - ELOC)];
@@ -229,7 +243,9 @@ template <int KIND>
 __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restrict__ xin, const char* __restrict__ wsf,
                                                    const float* __restrict__ gs, __nv_bfloat16* __restrict__ out,
                                                    const int* __restrict__ ids, int numel, int nl, int pdl,
-                                                   const __nv_bfloat16* __restrict__ gamma, float eps) {
+                                                   const __nv_bfloat16* __restrict__ gamma, float eps,
+                                                   const int* __restrict__ rtab, int n_rep, int me, int passes,
+                                                   int* __restrict__ lids) {
     constexpr int NWT = KIND == 1 ? 64 : 32;
     constexpr int LSPE = KIND == 1 ? 9 : 8;            // log2 slabs per pass (NWT x 8 slabs)
     __shared__ Tab tb;
@@ -241,6 +257,7 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
     __shared__ float s_rs[2][8];                       // norm fold: rstd of a pass's tokens, per staging buffer
     __shared__ __align__(8) unsigned long long s_xbar[2];   // norm fold: one staging barrier per buffer
     extern __shared__ __align__(16) __nv_bfloat16 s_x[];   // norm fold: [2][8][XROW] staged rows, gamma [H]
+    __shared__ int s_rtab[256], s_rcnt[256], s_rown[256], s_rord[256], s_rload[8];   // replica balancer fold
 
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     if (KIND == 1 && pdl) pdl_trigger();               // KIND 2 CTAs only fit on SMs this kernel has left
@@ -249,7 +266,9 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
         mbar_init(smem_u32(&bars[R + tid]), 32);
     }
     if (tid == R || tid == R + 1) mbar_init(smem_u32(&s_xbar[tid - R]), 1);
-    build_tab(ids, numel, nl, KIND == 1 ? gs : nullptr, tb, s_wcnt, s_vbase);   // ends with __syncthreads
+    if (rtab != nullptr) rep_owner<RPT>(ids, numel, rtab, n_rep, passes, s_rtab, s_rcnt, s_rown, s_rord, s_rload);
+    build_tab(ids, numel, nl, KIND == 1 ? gs : nullptr, tb, s_wcnt, s_vbase, rtab != nullptr ? s_rtab : nullptr,
+              s_rown, me, KIND == 1 && blockIdx.x == 0 ? lids : nullptr);   // ends with __syncthreads
 
     const int U = tb.nva << LSPE;
     const int s0 = (int)(((long long)U * blockIdx.x) / gridDim.x);
@@ -429,8 +448,11 @@ static int st_num_sms() {
 
 // y [numel, 4096] bf16 (local routes written), h scratch [>= (nl + numel / 8) * 8, 4096] bf16, nl = wsf13.size(0)
 // gamma: the pre-expert RMSNorm weight to fold (bf16 [4096], x un-normed) or an empty tensor (x already normed)
+// tab: pg_rep_assign's int32 table [256 + n_rep] (ids = global top-k ids; lids [numel] gets the per-route slots) or
+// an empty tensor (ids = local slots)
 void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tensor gs13, torch::Tensor wsf2,
-            torch::Tensor h, torch::Tensor y, int64_t pdl, torch::Tensor gamma, double eps) {
+            torch::Tensor h, torch::Tensor y, int64_t pdl, torch::Tensor gamma, double eps, torch::Tensor tab,
+            int64_t me, int64_t passes, torch::Tensor lids) {
     const int numel = (int)ids.numel();
     TORCH_CHECK(numel <= stk::NUMEL_MAX && numel == x.size(0) * 8 && x.size(1) == stk::H, "st: T <= 128, top-8, H 4096");
     TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous() && x.is_contiguous(), "st: int32 ids, contiguous x");
@@ -444,6 +466,14 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
     TORCH_CHECK(!fold || (gamma.numel() == stk::H && gamma.scalar_type() == at::kBFloat16 && gamma.is_contiguous()),
                 "st: norm weight bf16 [4096]");
     const auto* gp = fold ? reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr()) : nullptr;
+    const bool rep = tab.numel() > 0;
+    const int n_rep = rep ? (int)tab.numel() - 256 : 0;
+    TORCH_CHECK(!rep || (tab.scalar_type() == at::kInt && tab.is_contiguous() && n_rep >= 0 && n_rep <= 256 &&
+                         me >= 0 && me < 8 && lids.scalar_type() == at::kInt && lids.is_contiguous() &&
+                         lids.numel() == numel),
+                "st: replica table int32 [256 + n_rep], rank < 8, int32 lids like ids");
+    const int* rp = rep ? tab.data_ptr<int>() : nullptr;
+    int* lp = rep ? lids.data_ptr<int>() : nullptr;
     const int G = st_num_sms();
     cudaStream_t st = at::cuda::getCurrentCUDAStream();
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
@@ -457,7 +487,8 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
         attr = true;
     }
     stk::st_gemm<1><<<G, stk::NTHR, fold ? stk::XSTAGE_BYTES : 0, st>>>(xp, reinterpret_cast<const char*>(wsf13.data_ptr()),
-                                            gs13.data_ptr<float>(), hp, ip, numel, nl, (int)pdl, gp, (float)eps);
+                                            gs13.data_ptr<float>(), hp, ip, numel, nl, (int)pdl, gp, (float)eps,
+                                            rp, n_rep, (int)me, (int)passes, lp);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (pdl) {
         cudaLaunchConfig_t cfg = {};
@@ -472,11 +503,14 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
         cfg.numAttrs = 1;
         C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, stk::st_gemm<2>, (const __nv_bfloat16*)hp,
                                           reinterpret_cast<const char*>(wsf2.data_ptr()), (const float*)nullptr, yp, ip,
-                                          numel, nl, 1, (const __nv_bfloat16*)nullptr, 0.f));
+                                          numel, nl, 1, (const __nv_bfloat16*)nullptr, 0.f, rp, n_rep, (int)me,
+                                          (int)passes, (int*)nullptr));
     } else {
         stk::st_gemm<2><<<G, stk::NTHR, 0, st>>>(hp, reinterpret_cast<const char*>(wsf2.data_ptr()), nullptr, yp, ip,
-                                                numel, nl, 0, nullptr, 0.f);
+                                                numel, nl, 0, nullptr, 0.f, rp, n_rep, (int)me, (int)passes, nullptr);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
 """
+
+_CUDA_SRC = _CUDA_SRC.replace("@@REP@@", _CUDA_SRC_REP)

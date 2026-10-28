@@ -9,6 +9,7 @@ fp32 logits [T, E], bit-compatible with what FusedMuseSparkRouting consumes.
 Both split-K kernels store one fp32 partial per K slice and reduce_launch(FOLD=2) sums
 the slices in a fixed order, so the logits are deterministic: every TP rank routes on
 its own copy, and atomics could resolve a top-8 near-tie differently across ranks.
+route_small runs that sum and the routing in one kernel (_cuda_src_route.py).
 
 Measured at the kernel court: T=1 pair GEMV 8.3 us vs 13.5 us fp32 F.linear; the
 Triton split-K was the proj lane's 3.19x m8 winner. Cache cost: hi + lo + interleaved
@@ -104,8 +105,8 @@ def prepare_gate(gate) -> None:
     _SPLITS[key] = (built["hi"], built["lo"], built["pairs"])
 
 
-def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
-    """fp32 logits for T <= 256 from the bf16 hidden states; None = declined."""
+def _partials(gate, hidden_states):
+    """(fp32 split-K partials [SK, T, E], T, E, SK); None = declined."""
     if torch.compiler.is_compiling():
         return None
     weight = gate.weight
@@ -125,12 +126,9 @@ def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
     hi, lo, pairs = entry
     x = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
     if tokens == 1 and hidden % (_SPLIT_K * 256 * 2) == 0:
-        ext = proj_ext()
         part = torch.empty((_SPLIT_K, tokens, ne), dtype=torch.float32, device=x.device)
-        ext.gemv_router_launch(pairs, x, part, tokens, hidden, 1, _SPLIT_K, 2, 2)
-        logits = torch.empty((tokens, ne), dtype=torch.float32, device=x.device)
-        ext.reduce_launch(part, logits, tokens, ne, _SPLIT_K, 2)
-        return logits
+        proj_ext().gemv_router_launch(pairs, x, part, tokens, hidden, 1, _SPLIT_K, 2, 2)
+        return part, tokens, ne, _SPLIT_K
     if tokens <= 8:
         cfg = (max(16, triton.next_power_of_2(tokens)), 32, 256, _SPLIT_K, 0, 4, 3)
     elif _SW_MID:
@@ -146,6 +144,39 @@ def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
         tokens, N=ne, K=hidden,
         BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, SWAP=swap,
         num_warps=warps, num_stages=stages)
-    logits = torch.empty((tokens, ne), dtype=torch.float32, device=x.device)
+    return part, tokens, ne, sk
+
+
+def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
+    """fp32 logits for T <= 256 from the bf16 hidden states; None = declined."""
+    got = _partials(gate, hidden_states)
+    if got is None:
+        return None
+    part, tokens, ne, sk = got
+    logits = torch.empty((tokens, ne), dtype=torch.float32, device=part.device)
     proj_ext().reduce_launch(part, logits, tokens, ne, sk, 2)
     return logits
+
+
+def route_small(gate, hidden_states, op, top_k):
+    """op's (topk_scores, topk_ids, packed ids) from the partials in one launch, bit-identical; None = declined."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import route_ext
+
+    bias = op.expert_bias
+    if (top_k != 8 or gate.weight.shape[0] != 256 or op.router_score_normalization != "sigmoid"
+            or op.local_expert_mapping is not None or op.num_valid_tokens is not None or op.sol_topk_out is not None
+            or bias.dtype is not torch.float32 or not bias.is_contiguous() or bias.numel() != 256):
+        return None
+    got = _partials(gate, hidden_states)
+    if got is None:
+        return None
+    part, tokens, _, sk = got                          # sk 16 or 32
+    tw =torch.empty((tokens, 8), dtype=torch.float32, device=part.device)
+    ti = torch.empty((tokens, 8), dtype=torch.int32, device=part.device)
+    tp = torch.empty((tokens, 8), dtype=torch.int32, device=part.device)
+    mult = op.router_output_multiplier
+    eps = op.router_score_division_eps
+    route_ext().route(part, bias, tw, ti, tp, tokens, sk, float(mult if mult is not None else 1.0),
+                      float(op.route_scale), float(eps if eps is not None else 0.0), 1 if SW_PDL else 0)
+    return tw, ti, tp
