@@ -28,10 +28,11 @@ MOE_PG_ONLY = _flag("OKC_MOE_PG_ONLY", "1")
 _pack_layers = os.environ.get("OKC_MOE_PACK_MAX_LAYERS", "all" if MOE_PG_ONLY else "16")
 MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 # pg's narrow build (_cuda_src_pgn: 128-token blocks, item widths 16 / 64 / 128) for calls of
-# OKC_PG_NARROW_MIN_T..OKC_PG_NARROW_MAX_T tokens (follow-up extends; serving/kernels/extend LOG E4). Same outputs
+# OKC_PG_NARROW_MIN_T..OKC_PG_NARROW_MAX_T tokens (verify steps and follow-up extends; serving/kernels/extend LOG E5 / E6:
+# 0.78-0.81x at verify T 8..256, 0.86-0.92x at extends of 753..2048, 0.97x at 3072, even at 4096). Same outputs
 # for every real token; outside the range the shipped build (256-token blocks, widths 64 / 128 / 256) runs.
 PG_NARROW_MIN_T = int(os.environ.get("OKC_PG_NARROW_MIN_T", "1"))
-PG_NARROW_MAX_T = int(os.environ.get("OKC_PG_NARROW_MAX_T", "2048"))
+PG_NARROW_MAX_T = int(os.environ.get("OKC_PG_NARROW_MAX_T", "3072"))
 
 
 # Verify-side kernel stack (kernel-track grafts): fused sliding-window / full attention for decode and verify,
