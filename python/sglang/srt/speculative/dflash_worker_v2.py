@@ -232,6 +232,12 @@ def _prefill_handoff() -> bool:
     return okc_patch.SW_PREFILL_HANDOFF
 
 
+def _between_chunk() -> bool:
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    return okc_patch.SW_BETWEEN_CHUNK
+
+
 def host_ints_to_device(values, device) -> torch.Tensor:
     """int32 device copy of a host int list with no stream sync.
 
@@ -2543,6 +2549,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 return_kv_loc_plan=True,
             )
+            if _between_chunk():
+                # Between-chunk admission waits on this, not on the whole batch: the draft-KV write below is still
+                # queued behind it when the scheduler picks the next batch.
+                batch_output.okc_target_done = torch.cuda.Event()
+                batch_output.okc_target_done.record()
             kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 
             logits_output, next_token_ids = (

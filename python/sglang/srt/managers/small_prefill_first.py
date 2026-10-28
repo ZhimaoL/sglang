@@ -5,6 +5,8 @@ before any decode, so a follow-up that arrives together with a 74K-token first t
 (~5.6 s on 8x H200) to show anything. Prefilling the small requests alone first and then decoding twice costs one
 small prefill batch and two decode steps. A follow-up that arrives while a first turn is being chunked joins the
 next chunk's batch whole (the chunk shrinks to make room) at low concurrency, then gets the same two decode steps.
+Between-chunk admission (OKC_SW_BETWEEN_CHUNK) keeps the chunk whole instead: the follow-up is prefilled on its own
+between two chunks, and the scheduler picks what follows a chunk only once that chunk's target forward is done.
 Decisions count scheduler passes, so every TP rank makes the same choice.
 """
 
@@ -31,11 +33,25 @@ _MID_CHUNK_MAX_RUNNING = 8
 # upstream only does on caches whose fast-match flag is set (the serving UnifiedRadixCache's is not). These
 # policies only matter at low concurrency, so the work is capped by queue length instead of by that flag.
 _MAX_MATCH_REQS = 16
+# Slack per request in a between-chunk budget: the adder may count a token or so more than the prefix match (the
+# last cached token is re-extended), and a request that does not fit would be chunked.
+_BETWEEN_MARGIN_TOKENS = 64
 
 
 class SmallPrefillFirst:
-    def __init__(self, *, enabled: bool, mid_chunk_enabled: bool = False):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        mid_chunk_enabled: bool = False,
+        between_chunk_enabled: bool = False,
+        between_chunk_max_reqs: int = 8,
+    ):
         self._enabled = enabled
+        self._between_enabled = between_chunk_enabled
+        self._between_max_reqs = between_chunk_max_reqs
+        # One small batch per chunk boundary: set when it is scheduled, cleared when the next chunk is.
+        self._between_done = False
         # Off by default: measured at c4 it costs more (a capped chunk needs more chunks and the
         # decode steps after each small prefill delay every first turn) than the stalled
         # follow-ups it rescues.
@@ -113,14 +129,56 @@ class SmallPrefillFirst:
             return None
         return small + rest, (budget - reserved) // page_size * page_size
 
+    def between_chunk_order(
+        self,
+        *,
+        waiting_queue: List[Req],
+        tree_cache: BasePrefixCache,
+        num_running: int,
+        chunk_size: int,
+    ) -> Optional[Tuple[List[Req], int]]:
+        """(the small waiting requests, a token budget that admits exactly them) to prefill on their own before the
+        chunked request's next chunk, or None (the chunk goes next). The chunked request is not in this batch, so
+        none of these may be chunked: they are taken while they fit the chunk size with a margin."""
+        if (
+            not self._between_enabled
+            or self._between_done
+            or not waiting_queue
+            or num_running + len(waiting_queue) > self._between_max_reqs
+            or len(waiting_queue) > _MAX_MATCH_REQS
+        ):
+            return None
+        small, budget = [], 0
+        for req in waiting_queue:
+            new_tokens = self._new_tokens(req, tree_cache)
+            charge = new_tokens + _BETWEEN_MARGIN_TOKENS
+            if new_tokens < _SMALL_NEW_TOKENS and budget + charge <= chunk_size:
+                small.append(req)
+                budget += charge
+        if not small:
+            return None
+        return small, budget
+
+    def wait_for_chunk_boundary(self, *, num_running: int, num_waiting: int) -> bool:
+        """Pick what follows an in-flight chunk only once its target forward is done: a follow-up that arrives during
+        the chunk can still go next (the scheduler otherwise runs a batch ahead and has queued the next chunk)."""
+        return self._between_enabled and num_running + num_waiting <= self._between_max_reqs
+
     @staticmethod
     def _new_tokens(req: Req, tree_cache: BasePrefixCache) -> int:
         match_kv_cache(req, tree_cache)
         return len(req.origin_input_ids) + len(req.output_ids) - req.num_matched_prefix_tokens
 
     def on_prefill_scheduled(
-        self, *, batch: ScheduleBatch, chunked_req: Optional[Req], has_waiting: bool
+        self,
+        *,
+        batch: ScheduleBatch,
+        chunked_req: Optional[Req],
+        has_waiting: bool,
+        between_chunk: bool = False,
     ) -> None:
+        if self._between_enabled:
+            self._between_done = between_chunk
         completes_small = any(
             req is not chunked_req
             and req.rid != self._chunked_rid
@@ -131,7 +189,7 @@ class SmallPrefillFirst:
         more_prefill = chunked_req is not None or has_waiting
         self._decode_steps_left = (
             _DECODE_STEPS_AFTER_SMALL
-            if self._enabled and completes_small and more_prefill
+            if (self._enabled or between_chunk) and completes_small and more_prefill
             else 0
         )
 
