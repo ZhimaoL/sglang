@@ -476,7 +476,8 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
 
       bs < WST_BAL_MIN_BS: wst_ct14, grid (SMs // bs, bs), uniform split of the batch's longest span, row-sliced
                            K-waiter merge (all CTAs co-resident: SMs // bs * bs <= SMs at 1 CTA / SM).
-      otherwise          : wst_ct14b, SM-count CTAs (cooperative launch), all tiles of the batch balanced over them.
+      otherwise          : wst_ct14b, SM-count CTAs (cooperative launch), all tiles of the batch balanced over them
+                           (default from bs 5: equal at 4, ahead from 6, robust to spread lengths).
 
     Ticket counters persist per (route, bs): every launch moves each counter by exactly 256 (both routes), so they
     are graph-safe without a reset and wrap harmlessly. The partial workspace (5.4 MB fp32) is shared."""

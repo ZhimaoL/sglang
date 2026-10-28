@@ -47,7 +47,9 @@ SW_ATTN_ACC16 = _flag("OKC_SW_ATTN_ACC16", "0")
 # fs streamer (bs 1). From OKC_WST_BAL_MIN_BS up the tiles are balanced over the batch (wst_ct14b, cooperative launch).
 SW_WST = _flag("OKC_SW_WST", "1")
 WST_MIN_BS = int(os.environ.get("OKC_WST_MIN_BS", "1"))
-WST_BAL_MIN_BS = int(os.environ.get("OKC_WST_BAL_MIN_BS", "17"))
+# Dev box (serving/kernels/verify-attn LOG VA2 / VA3): wst_ct14 wins at bs 1-3, ties at 4, bal wins from 6 (by 18 % at
+# bs 16 when the batch's lengths spread over 30K-86K; wst_ct14 splits every request by the longest span).
+WST_BAL_MIN_BS = int(os.environ.get("OKC_WST_BAL_MIN_BS", "5"))
 # Their split-KV O partials: "0" (default) fp32 like FA3; "1" the attention bank's bf16 partials (a separate build).
 WST_ACC16 = _flag("OKC_WST_ACC16", "0")
 # Sequence-parallel prefill on Hopper (layers/layernorm_sp.py okc_hopper_sp): the residual stream, norms, router,
