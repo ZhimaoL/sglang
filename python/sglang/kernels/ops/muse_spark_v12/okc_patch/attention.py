@@ -6,6 +6,9 @@ Two env-gated paths, both consuming the FlashAttention backend's per-step metada
   OKC_SW_ATTN  sliding layers at q_len <= 8: the certified 2-launch decode split
                (q_len == 1) or prep + per-head split + combine (q_len 2..8), replacing
                fused QK norm + RoPE + KV store + FA3 + gated output norm.
+  OKC_SW_WST   full layers at q_len 8, bs >= OKC_WST_MIN_BS: the attention lane's verify-full kernels (wst_ct14 with the
+               row-sliced in-kernel merge, wst_ct14b balanced over the batch from OKC_WST_BAL_MIN_BS up), one
+               launch per layer for QK norm + new KV rows + FP8 attention + merge + output norm and gate.
   OKC_SW_FS    full layers: physical-order streaming over counting-sorted rows. The
                sort metadata depends only on (page_table, seq_lens), so the FIRST full
                layer of a forward builds it IN-GRAPH and stores it on the ForwardBatch
@@ -20,8 +23,8 @@ Decisions depend only on config, forward mode, and batch shape, so a decision ta
 during CUDA-graph capture holds for every replay of that graph.
 
 Operating points (kernel court, H200): sliding d1/d16/d32 1.48/1.44/1.45x, v1/v16/v32
-1.25/1.21/1.14x per call; fs full d32 1.203x, v1-full 1.138x. d16-full and verify-full
-bs > 1 measured at or below FA3, so they stay on FA3 (OKC_FS_SORT_MIN_BS, default 24).
+1.25/1.21/1.14x per call; fs full d32 1.203x, v1-full 1.138x. d16-full stays on FA3
+(OKC_FS_SORT_MIN_BS, default 24); verify-full goes to wst (OKC_SW_WST), the fs verify only below OKC_WST_MIN_BS.
 """
 
 import logging
@@ -49,6 +52,10 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN_V3,
     SW_FS,
     SW_PDL,
+    SW_WST,
+    WST_ACC16,
+    WST_BAL_MIN_BS,
+    WST_MIN_BS,
 )
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
@@ -101,6 +108,45 @@ def _seq_pre(ctx: dict, cache_seqlens, q_len: int):
     return seq
 
 
+def _layer_eps(attn) -> Optional[float]:
+    """The layer's norm eps when the kernels' fused contract holds for it, else None."""
+    # The kernels fuse per-head QK RMSNorm, the output RMSNorm and the sigmoid gate;
+    # a layer without any of the three computes something else.
+    if not (attn.use_qk_norm and attn.use_o_norm and attn.use_o_gate):
+        return None
+    # Both norms take the layer's norm_eps (FusedQKNorm and the output RMSNorm are built
+    # with it); the kernels apply that same EPS to q, k and the output.
+    eps = getattr(attn, "norm_eps", None)
+    if eps is None or attn.attn.logit_cap:
+        return None
+    return float(eps)
+
+
+def _pool_contract(attn, qkv, k_cache):
+    """(hq, hkv, d, is_fp8, kv_scale) when qkv and the layer's pool fit the kernels, else None."""
+    hq, hkv, d = attn.num_heads, attn.num_kv_heads, attn.head_dim
+    if hq % hkv or d & (d - 1) or qkv.shape[1] != (2 * hq + 2 * hkv) * d:
+        return None
+    if qkv.dtype is not torch.bfloat16 or not qkv.is_contiguous():
+        return None
+    if k_cache.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        return None
+    if k_cache.dim() != 3 or k_cache.shape[1] != hkv or k_cache.shape[2] != d:
+        return None
+    is_fp8 = k_cache.dtype is torch.float8_e4m3fn
+    k_scale = attn.attn.k_scale_float
+    v_scale = attn.attn.v_scale_float
+    if is_fp8:
+        kv_scale = 1.0 if k_scale is None else float(k_scale)
+        if (1.0 if v_scale is None else float(v_scale)) != kv_scale:
+            return None
+    else:
+        if k_scale is not None and float(k_scale) != 1.0:
+            return None
+        kv_scale = 1.0
+    return hq, hkv, d, is_fp8, kv_scale
+
+
 def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
     """Dispatch gated_attention to an OKC path; None = stock path."""
     if torch.compiler.is_compiling():
@@ -112,19 +158,10 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
         q_len = -1  # resolved from metadata below
     else:
         return None
-    # The kernels fuse per-head QK RMSNorm, the output RMSNorm and the sigmoid gate;
-    # a layer without any of the three computes something else.
-    if not (attn.use_qk_norm and attn.use_o_norm and attn.use_o_gate):
-        return None
-    # Both norms take the layer's norm_eps (FusedQKNorm and the output RMSNorm are built
-    # with it); the kernels apply that same EPS to q, k and the output.
-    eps = getattr(attn, "norm_eps", None)
+    eps = _layer_eps(attn)
     if eps is None:
         return None
-    eps = float(eps)
     radix = attn.attn
-    if radix.logit_cap:
-        return None
     if forward_batch.dcp_kv_mask is not None:
         return None
     from sglang.srt.layers.cp.utils import is_cp_active
@@ -156,30 +193,14 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
             return None
     elif tokens != bs:
         return None
-    hq, hkv, d = attn.num_heads, attn.num_kv_heads, attn.head_dim
-    if hq % hkv or d & (d - 1) or qkv.shape[1] != (2 * hq + 2 * hkv) * d:
-        return None
-    if qkv.dtype is not torch.bfloat16 or not qkv.is_contiguous():
-        return None
 
     pool = get_token_to_kv_pool()
     k_cache = pool.get_key_buffer(attn.layer_idx)
     v_cache = pool.get_value_buffer(attn.layer_idx)
-    if k_cache.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+    contract = _pool_contract(attn, qkv, k_cache)
+    if contract is None:
         return None
-    if k_cache.dim() != 3 or k_cache.shape[1] != hkv or k_cache.shape[2] != d:
-        return None
-    is_fp8 = k_cache.dtype is torch.float8_e4m3fn
-    k_scale = radix.k_scale_float
-    v_scale = radix.v_scale_float
-    if is_fp8:
-        kv_scale = 1.0 if k_scale is None else float(k_scale)
-        if (1.0 if v_scale is None else float(v_scale)) != kv_scale:
-            return None
-    else:
-        if k_scale is not None and float(k_scale) != 1.0:
-            return None
-        kv_scale = 1.0
+    hq, hkv, d, is_fp8, kv_scale = contract
 
     window = radix.sliding_window_size
     is_swa_layer = window is not None and window > -1
@@ -211,7 +232,61 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
             window=window + 1, page_size=backend.page_size,
             kv_scale=kv_scale, theta=theta, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
         )
-    if not SW_FS or theta is not None or backend.page_size != 1:
+    if theta is not None or backend.page_size != 1:
+        return None
+    return _full_rows(
+        ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+        bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d, is_fp8=is_fp8,
+        kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
+    )
+
+
+def verify_full_rows(attn, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+                     bs, q_len=8, ctx=None) -> Optional[torch.Tensor]:
+    """A full-attention layer's verify blocks on explicit rows (ride-along riders inside an EXTEND forward): the
+    same eligibility and routing as a TARGET_VERIFY step in try_attention (wst from OKC_WST_MIN_BS, fs below it).
+
+    qkv: the blocks' pre-norm projection rows [bs * q_len, (2 hq + 2 hkv) d] (row slices of the forward's qkv are
+    fine); k_cache / v_cache: the layer's pool [rows, hkv, d] (page size 1); cache_loc: the blocks' reserved slots
+    [bs * q_len] (their new k / v rows are (re)written there); seq_pre: int32 [bs] committed lengths (cache_seqlens -
+    q_len); page_table: int32 rows >= bs (any width, any pitch), positions [0, seq_pre + q_len) of request b in row b;
+    ctx: a per-step dict for the fs route's sort metadata (bs below OKC_WST_MIN_BS). Returns the gated output
+    [bs * q_len, hq * d] bf16, or None when not handled (the caller keeps its own path)."""
+    if torch.compiler.is_compiling() or q_len != 8:
+        return None
+    eps = _layer_eps(attn)
+    if eps is None or attn.rotary_emb is not None:
+        return None
+    window = attn.attn.sliding_window_size
+    if window is not None and window > -1:
+        return None
+    contract = _pool_contract(attn, qkv, k_cache)
+    if contract is None:
+        return None
+    hq, hkv, d, is_fp8, kv_scale = contract
+    if qkv.shape[0] != bs * q_len or cache_loc.numel() != bs * q_len:
+        return None
+    if seq_pre.dtype is not torch.int32 or seq_pre.numel() != bs or page_table.shape[0] < bs:
+        return None
+    return _full_rows(
+        {} if ctx is None else ctx, qkv, k_cache, v_cache, cache_loc, seq_pre.contiguous(), page_table,
+        bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d, is_fp8=is_fp8,
+        kv_scale=kv_scale, sm_scale=d**-0.5, qk_factor=attn.scale_query_by, eps=eps,
+    )
+
+
+def _full_rows(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+               bs, q_len, hq, hkv, d, is_fp8, kv_scale, sm_scale, qk_factor, eps):
+    """Full-layer routing (decode and verify); None = stock path."""
+    # The wst kernels hard-code the TP8 head layout (16 q / 2 kv heads of 64) and read e4m3 cache bytes.
+    if (q_len == 8 and bs >= max(1, WST_MIN_BS) and SW_WST and is_fp8 and hq == 16 and hkv == 2 and d == 64
+            and page_table.dtype is torch.int32 and page_table.stride(1) == 1):
+        log_once(f"wst_full[q_len={q_len}]", f"(first bs={bs})")
+        return _wst_full(
+            qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+            bs=bs, q_len=q_len, kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
+        )
+    if not SW_FS:
         return None
     if q_len == 1:
         if bs != 1 and bs < FS_SORT_MIN_BS:
@@ -444,6 +519,76 @@ def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         D=d, BLOCK_M=cm,
         num_warps=4, num_stages=1,
     )
+    return out
+
+
+_WST_WS = {}
+_SMS = {}
+
+
+def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+              bs, q_len, kv_scale, sm_scale, qk_factor, eps):
+    """Full-layer verify on the attention lane's wst kernels (bank v16c_m7g_rlx3 `_full_wst`, wst_cfg 54, no RoPE):
+    every CTA builds its e4m3 q fragments from qkv (RMSNorm), the split holding the block's new positions writes their
+    k (RMSNorm) / v rows to the cache before staging them, and the (b, kv head) partials (O fp32, bf16 with
+    OKC_WST_ACC16=1; m / l fp32) are folded in-kernel with RMSNorm x sigmoid(gate). Splits come from the device-side lengths only (never the table width).
+
+      bs < WST_BAL_MIN_BS: wst_ct14, grid (SMs // bs, bs), uniform split of the batch's longest span, row-sliced
+                           K-waiter merge (cooperative launch: SMs // bs * bs <= SMs CTAs at 1 CTA / SM).
+      otherwise          : wst_ct14b, SM-count CTAs (cooperative launch), all tiles of the batch balanced over them
+                           (default from bs 5: equal at 4, ahead from 6, robust to spread lengths).
+
+    Ticket counters persist per (route, bs): every launch moves each counter by exactly 256 (both routes), so they
+    are graph-safe without a reset and wrap harmlessly. The partial workspace (5.4 MB fp32) is shared.
+    PDL: both launches are plain (no programmatic serialization, no early trigger), so every earlier kernel on the
+    stream has finished before the first CTA starts, and a PDL-launched successor (the o projection) leaves its
+    griddepcontrol.wait when the whole grid is done."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import wst_ext
+
+    device = qkv.device
+    B, L = bs, q_len
+    LG = L * 8
+    dkey = str(device)
+    G = _SMS.get(dkey)
+    if G is None:
+        G = _SMS[dkey] = torch.cuda.get_device_properties(device).multi_processor_count
+    bal = B >= WST_BAL_MIN_BS and G <= 256
+    S = 0 if bal else G // B
+    # Partial slots: bal (c + b, kv head), fqbt (b, kv head, split) with S * B <= G. One buffer serves every bs and
+    # graph (all launches are stream-ordered); it is sized for bs 32 up front and never freed, since captured graphs
+    # keep its address.
+    nrow = (G + B) * 2 * LG if bal else B * 2 * S * LG
+    ws = _WST_WS.get(("ws", dkey))
+    if ws is None or ws["acc"].shape[0] < nrow:
+        n = max(nrow, (G + 32) * 2 * LG)
+        ws = {
+            "acc": torch.empty((n, 64), dtype=torch.bfloat16 if WST_ACC16 else torch.float32, device=device),
+            "m": torch.empty((n,), dtype=torch.float32, device=device),
+            "l": torch.empty((n,), dtype=torch.float32, device=device),
+        }
+        _WST_WS.setdefault(("all", dkey), []).append(ws)
+        _WST_WS[("ws", dkey)] = ws
+    key = (bal, B, L, S, dkey)
+    tick = _WST_WS.get(key)
+    if tick is None:   # per (b, kv head), +256 per launch
+        tick = _WST_WS[key] = torch.zeros((2 * B,), dtype=torch.int32, device=device)
+    skey = ("scale", float(kv_scale), dkey)
+    vs = _WST_WS.get(skey)
+    if vs is None:
+        vs = _WST_WS[skey] = torch.tensor([float(kv_scale)], dtype=torch.float32, device=device)
+    if cache_loc.dtype != torch.int64:
+        cache_loc = cache_loc.to(torch.int64)
+    out = torch.empty((B * L, 16 * 64), dtype=torch.bfloat16, device=device)
+    smqk = sm_scale * qk_factor * LOG2E
+    ext = wst_ext()
+    kc, vc = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
+    pt_pitch = page_table.stride(0)
+    if bal:
+        ext.wst_attn_bal(qkv, kc, vc, page_table, seq_pre, cache_loc, ws["acc"], ws["m"], ws["l"], vs, smqk,
+                         B, L, pt_pitch, G, 0, 3, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, tick, vs)
+    else:
+        ext.wst_attn_fqbt(qkv, kc, vc, page_table, seq_pre, cache_loc, ws["acc"], ws["m"], ws["l"], vs, smqk,
+                          B, L, pt_pitch, 0, S, 0, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, tick, vs)
     return out
 
 

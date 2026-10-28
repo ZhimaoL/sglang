@@ -42,6 +42,16 @@ SW_ATTN_V3 = _flag("OKC_SW_ATTN_V3", "1")
 # Split-KV partial accumulators of the attn-v3 sliding kernels: "0" (default) keeps them fp32 like FA3; "1" stores
 # them bf16 (the certified attn-v3 setting: half the last-arriver combine's reads).
 SW_ATTN_ACC16 = _flag("OKC_SW_ATTN_ACC16", "0")
+# Full-layer verify (q_len 8) at bs >= OKC_WST_MIN_BS on the attention lane's wst kernels (_cuda_src_wst.py: QK norm,
+# new KV rows, FP8 attention, merge, output norm and gate in one launch) instead of the stock FA3 chain (bs >= 2) or the
+# fs streamer (bs 1). From OKC_WST_BAL_MIN_BS up the tiles are balanced over the batch (wst_ct14b, cooperative launch).
+SW_WST = _flag("OKC_SW_WST", "1")
+WST_MIN_BS = int(os.environ.get("OKC_WST_MIN_BS", "1"))
+# Dev box (serving/kernels/verify-attn LOG VA2 / VA3): wst_ct14 wins at bs 1-3, ties at 4, bal wins from 6 (by 18 % at
+# bs 16 when the batch's lengths spread over 30K-86K; wst_ct14 splits every request by the longest span).
+WST_BAL_MIN_BS = int(os.environ.get("OKC_WST_BAL_MIN_BS", "5"))
+# Their split-KV O partials: "0" (default) fp32 like FA3; "1" the attention bank's bf16 partials (a separate build).
+WST_ACC16 = _flag("OKC_WST_ACC16", "0")
 # Sequence-parallel prefill on Hopper (layers/layernorm_sp.py okc_hopper_sp): the residual stream, norms, router,
 # pooler and unpooler run on 1/tp of the tokens; the experts see every token through an all-gather and return a
 # reduce-scatter, so the bytes on the wire match the two all-reduces they replace.
@@ -102,12 +112,12 @@ SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
 # / 64) up to this size on sm_90. 1 = upstream behaviour.
 HOPPER_NORM_MAX_CLUSTER = int(os.environ.get("OKC_HOPPER_NORM_MAX_CLUSTER", "1"))
 
-ANY_ATTN = SW_ATTN or SW_FS
+ANY_ATTN = SW_ATTN or SW_FS or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
-           "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT",
+           "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_MOE_OVL",
            "SP_PRENORM_SHARD", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
            "ANY_ATTN"]
