@@ -1121,9 +1121,13 @@ class MuseSpark1xMoE(nn.Module):
         )
         if prenorm_shard:
             expert_input = self.pre_expert_norm(expert_input)
-        full_input = gather(expert_input)
-        full_scores = gather(topk_scores)
-        full_ids = gather(topk_ids)
+        grouped = _okc_grouped_gather(tp_group, (expert_input, topk_scores, topk_ids)) if okc_patch.SP_AG_GROUP else None
+        if grouped is not None:
+            full_input, full_scores, full_ids = grouped
+        else:
+            full_input = gather(expert_input)
+            full_scores = gather(topk_scores)
+            full_ids = gather(topk_ids)
         if self.nvfp4_checkpoint:
             output = self.experts(
                 full_input,
@@ -1142,6 +1146,26 @@ class MuseSpark1xMoE(nn.Module):
         shard = output.new_empty((expert_input.shape[0], *output.shape[1:]))
         tp_group.reduce_scatter_tensor(shard, output)
         return shard
+
+
+def _okc_grouped_gather(tp_group, shards):
+    """All-gather each shard along dim 0 inside one NCCL group (one launch), on the pynccl communicator that
+    tp_group.all_gather_into_tensor would use; None when that call would take another path (the caller then gathers
+    one by one). The predicate depends only on the group's state, so every rank takes the same branch."""
+    pyn = tp_group.pynccl_comm
+    if pyn is None or not (not pyn.disabled or tp_group.is_symmetric_memory_enabled()):
+        return None
+    world = tp_group.world_size
+    shards = [s.contiguous() for s in shards]
+    outs = [s.new_empty((s.shape[0] * world, *s.shape[1:])) for s in shards]
+    with pyn.change_state(enable=True):
+        pyn.group_start()
+        try:
+            for out, shard in zip(outs, shards):
+                pyn.all_gather(out, shard)
+        finally:
+            pyn.group_end()
+    return outs
 
 
 class MuseSpark1xDecoderLayer(nn.Module):
