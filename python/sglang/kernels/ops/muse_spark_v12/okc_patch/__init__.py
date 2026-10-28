@@ -84,6 +84,9 @@ WST_ACC16 = _flag("OKC_WST_ACC16", "0")
 # bs >= 2) in place of attn-v3, and full layers at bs 1 in place of wst. "0" keeps attn-v3 / wst.
 SW_VFG = _flag("OKC_SW_VFG", "1")
 SW_VFG_FULL1 = _flag("OKC_SW_VFG_FULL1", "1")
+# Sliding verify batches up to this bs on VP2 (one 16-CTA cluster pair per request, merged in-cluster: no merge kernel)
+# instead of VFG + vfgm / vfgm2. "1" = the bank's routing (VP2 at bs 1 only).
+VP2_MAX_BS = int(os.environ.get("OKC_VP2_MAX_BS", "1"))
 # Sequence-parallel prefill on Hopper (layers/layernorm_sp.py okc_hopper_sp): the residual stream, norms, router,
 # pooler and unpooler run on 1/tp of the tokens; the experts see every token through an all-gather and return a
 # reduce-scatter, so the bytes on the wire match the two all-reduces they replace.
@@ -232,7 +235,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",
-           "SW_VFG_FULL1",
+           "SW_VFG_FULL1", "VP2_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
            "SW_MOE_OVL",
            "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
