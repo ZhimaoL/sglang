@@ -15,6 +15,8 @@
                      OKC_MOE_REP_MAX_TOKENS tokens (256: every verify graph) give each active replicated expert to
                      the less loaded of its two holders; longer ones (OKC_MOE_REP_PREFILL=1) split its routes
                      between the two at a token boundary that levels the ranks' routed tokens.
+  OKC_SW_MOE_ST=1    (default) pg-only layers run the st pair (okc_patch/st_moe.py, same packs) at
+                     T <= OKC_MOE_ST_MAX_TOKENS (32): verify steps at bs 1..4.
 
 Switches are read once at import, so dispatch is stable across CUDA-graph capture and replay.
 The judge's launch command is fixed, so the submitted defaults are the ones below.
@@ -45,6 +47,12 @@ MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
 # for every real token; outside the range the shipped build (256-token blocks, widths 64 / 128 / 256) runs.
 PG_NARROW_MIN_T = int(os.environ.get("OKC_PG_NARROW_MIN_T", "1"))
 PG_NARROW_MAX_T = int(os.environ.get("OKC_PG_NARROW_MAX_T", "3072"))
+# st small-T pair (okc_patch/st_moe.py) on pg-only layers at T <= OKC_MOE_ST_MAX_TOKENS (verify bs 1..4): the same
+# packs read by mma.sync n8 tiles instead of pg's 64-token wgmma tiles. OKC_MOE_ST_PDL=1 (default) launches its down
+# kernel with programmatic dependent launch.
+SW_MOE_ST = _flag("OKC_SW_MOE_ST", "1")
+MOE_ST_MAX_TOKENS = min(32, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "32")))
+MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 
 
 # Verify-side kernel stack (kernel-track grafts): fused sliding-window / full attention for decode and verify,
@@ -128,7 +136,7 @@ HOPPER_NORM_MAX_CLUSTER = int(os.environ.get("OKC_HOPPER_NORM_MAX_CLUSTER", "1")
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T",
+           "MOE_REP_PREFILL", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT",

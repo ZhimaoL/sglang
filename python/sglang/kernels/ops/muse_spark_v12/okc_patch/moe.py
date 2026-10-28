@@ -2,7 +2,9 @@
 
 At T >= OKC_MOE_PG_MIN_TOKENS a captured layer runs pg_moe.grouped_pg and then the same finalize as
 _forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin. A pg-only layer (the
-default) runs pg at every T; with hot-expert replicas its forwards of <= OKC_MOE_REP_MAX_TOKENS tokens map the routes
+default) runs a chain picked by dispatch_path from T: the st pair (st_moe.grouped_st, same packs) at T <=
+OKC_MOE_ST_MAX_TOKENS, pg's small-T front end up to 2048 routes, then moe_align / align_local; pg's narrow build over
+OKC_PG_NARROW_MIN_T..MAX_T. With hot-expert replicas its forwards of <= OKC_MOE_REP_MAX_TOKENS tokens map the routes
 through pg_moe.assign_replicas instead of the static home map, longer ones (OKC_MOE_REP_PREFILL) through
 pg_moe.split_replicas.
 The pg packs are re-encodings of the raw NVFP4 expert tensors, so maybe_capture_nvfp4_packs must run
@@ -74,6 +76,10 @@ def _build_packs(layer) -> dict | None:
         pg_moe.pg_ext()
         if _sw.PG_NARROW_MIN_T <= _sw.PG_NARROW_MAX_T:
             pg_moe.pg_narrow_ext()
+        if _sw.SW_MOE_ST:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext
+
+            st_ext()
 
     # pack_wsf wants the raw stacked [gate; up] rows and raw e4m3 scale bytes; gs13 is the
     # per-expert scale Marlin also uses (its constant gain is cancelled by the post-expert norm).
