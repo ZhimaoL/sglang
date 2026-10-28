@@ -64,13 +64,14 @@ SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
 
 # Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call. Per request:
 # full layers from OKC_PFMHA_MIN_TOKENS new tokens, sliding layers from OKC_PFMHA_SLIDING_MIN_TOKENS (1xH200 over a 75K
-# prefix: full 1.39x FA3 at 128 tokens .. 2.6x at 2048; sliding 0.94x at 256, 1.17x at 753, 1.45-1.68x from 1024).
+# prefix: full 0.85x FA3 at 32 tokens, 1.07x at 64, 1.39x at 128 .. 2.6x at 2048; sliding 0.85x at 512, 1.16x at 640,
+# 1.17x at 753, 1.45-1.68x from 1024).
 # A co-batch (bs <= OKC_PFMHA_RAGGED_MAX_BS, every request over the threshold) runs one call per request (1.55-1.93x
 # FA3's batched call at bs 2-8 of 753-1500-token follow-ups).
 SW_PREFILL_FMHA = _flag("OKC_SW_PREFILL_FMHA", "1")
 PFMHA_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_MIN_TOKENS", "128"))
 PFMHA_SLIDING = _flag("OKC_PFMHA_SLIDING", "1")
-PFMHA_SLIDING_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_SLIDING_MIN_TOKENS", "512"))
+PFMHA_SLIDING_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_SLIDING_MIN_TOKENS", "640"))
 PFMHA_RAGGED = _flag("OKC_PFMHA_RAGGED", "1")
 PFMHA_RAGGED_MAX_BS = int(os.environ.get("OKC_PFMHA_RAGGED_MAX_BS", "32"))
 
