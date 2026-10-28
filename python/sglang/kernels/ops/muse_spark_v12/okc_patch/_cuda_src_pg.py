@@ -155,8 +155,16 @@ constexpr int SB  = (16384 + 2 * WSB + 1023) / 1024 * 1024;   // PAIR stage: X 2
 #else   // PGN_WSET
 constexpr int SB  = 37888;               // stage stride: X 32768 + W|sf 5120 (a whole number of 1024 B atoms)
 #endif  // PGN_WSET
+#ifndef PGN_CTAS
+#define PGN_CTAS 1                       // pg_gemm CTAs per SM (2: the narrow64 build at 80 launch registers)
+#endif
+#if PGN_CTAS == 2
+constexpr int PREGS = 24, CREGS = 104;   // setmaxnreg targets
+static_assert(128 * PREGS + 256 * CREGS <= 384 * 80, "setmaxnreg budget exceeds the launch allocation");
+#else
 constexpr int PREGS = 40, CREGS = 232;   // setmaxnreg targets
 static_assert(128 * PREGS + 256 * CREGS <= 384 * 168, "setmaxnreg budget exceeds the launch allocation");
+#endif
 constexpr int EPI1 = XB / 2;             // gg1 epilogue per WG: its half of the inter tile [256 t][64 B] (SW64)
 constexpr int EPI2_PITCH = 144;          // gg2 epilogue row pitch (64 bf16 + 16 B pad: conflict-free stmatrix)
 constexpr int EPI2 = 64 * EPI2_PITCH;    // gg2 epilogue buffer per consumer WG: 64 tokens per pass
@@ -766,7 +774,7 @@ DINL int n_wide_entries(const int* __restrict__ live) {
 // compiles to a serialized pipeline (32 HGMMA / 32 ARRIVE / 32 DEPBAR) - keep it off.
 // PAIR64: 64-token items stage two k-tiles per ring slot (see kstep).
 template <int GATED, int NST, int MODE, int WSET = 3, int PAIR64 = 1, int SPL = 0>
-__global__ void __launch_bounds__(384, 1) pg_gemm(
+__global__ void __launch_bounds__(384, PGN_CTAS) pg_gemm(
     const char* __restrict__ xg,         // token images [num_pid_m, NKT, 256 t, 128 B] bf16, 128B-swizzled
     const char* __restrict__ wsf,        // [E, NWT, NKT, WSB] merged W|sf
     const float* __restrict__ gs,        // [E] global scales (GATED)
@@ -1589,7 +1597,7 @@ static void launch(const torch::Tensor& xg, const torch::Tensor& wsf, const floa
     }
     const int NWT = wsf.size(1);
     TORCH_CHECK(wsf.size(2) == pgk::NKT && wsf.size(3) == pgk::WSB, "pg: wsf layout");
-    pg_launch(fn, dim3(grid > 0 ? grid : pg_num_sms()), dim3(384), smem, pdl,
+    pg_launch(fn, dim3(grid > 0 ? grid : PGN_CTAS * pg_num_sms()), dim3(384), smem, pdl,
               reinterpret_cast<const char*>(xg.data_ptr()), reinterpret_cast<const char*>(wsf.data_ptr()),
               gs, out, sorted_ids, block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, numel, snake);
 }

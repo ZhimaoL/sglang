@@ -111,10 +111,12 @@ def pg_narrow64_ext():
             if _PG_NARROW64_EXT is None:
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
 
+                ctas = int(os.environ.get("OKC_PG64_CTAS", "1"))   # prototype: 2 CTAs per SM, 3 ring slots each
                 _PG_NARROW64_EXT = _pg_load(
-                    "okc_pg_moe_n24x64s7_int_d3_b6", _CUDA_SRC,
+                    "okc_pg_moe_n24x64s7_int_d3_b6" if ctas == 1 else "okc_pg_moe_n24x64s3c2_int_d3_b6", _CUDA_SRC,
                     ["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
-                    ["-DPGN_WSET=24", "-DPGN_NST=7", "-DPGN_XNT=64"],
+                    ["-DPGN_WSET=24", "-DPGN_NST=7", "-DPGN_XNT=64"] if ctas == 1
+                    else ["-DPGN_WSET=24", "-DPGN_NST=3", "-DPGN_XNT=64", "-DPGN_CTAS=2"],
                 )
     return _PG_NARROW64_EXT
 
