@@ -703,6 +703,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # of a forward builds the shared sort metadata here, later layers reuse it.
     okc_fs_meta: Optional[dict] = None
 
+    # EXTEND forward whose logits rows are these flat token rows instead of each
+    # request's last row: a prefill that also carries running requests' verify
+    # rows (speculative/dflash_ride_along.py). None everywhere else.
+    extend_logits_rows: Optional[torch.Tensor] = None
+    # The same forward: its first this many requests are the prefills, the rest the
+    # riders' verify blocks, which the attention backend may run as their own call.
+    extend_attn_split: Optional[int] = None
+
     # Decode-graph-owned destination for AuxHiddenStatePacker; None when eager.
     aux_hidden_states_buffer: Optional[torch.Tensor] = None
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.metadata import (
@@ -125,6 +127,71 @@ class FlashAttentionMetadata:
 
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
+
+    # Ride-along EXTEND: leading prefill requests + trailing verify blocks
+    extend_split: Optional[ExtendAttnSplit] = None
+
+
+class ExtendAttnSplit(msgspec.Struct):
+    """A ride-along EXTEND batch (ForwardBatch.extend_attn_split): the first
+    ``head_reqs`` requests are prefills, the rest the running requests' verify blocks."""
+
+    head_reqs: int
+    head_tokens: int
+    tail_tokens: int
+    head_max_q: int
+    tail_max_q: int
+    # The prefills' longest context: the width of their page-table rows.
+    head_max_k: int
+    tail_cu_seqlens_q: torch.Tensor
+    tail_cu_seqlens_k: torch.Tensor
+    # The batch as the prefill-attention hook sees the prefill requests alone.
+    head_forward_batch: ForwardBatch
+
+
+def build_extend_attn_split(
+    forward_batch: ForwardBatch, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor
+) -> ExtendAttnSplit:
+    n = forward_batch.extend_attn_split
+    lens = forward_batch.extend_seq_lens_cpu
+    head_seq_lens_cpu = forward_batch.seq_lens_cpu[:n]
+    head_forward_batch = copy.copy(forward_batch)
+    head_forward_batch.batch_size = n
+    head_forward_batch.extend_seq_lens_cpu = lens[:n]
+    head_forward_batch.seq_lens_cpu = head_seq_lens_cpu
+    return ExtendAttnSplit(
+        head_reqs=n,
+        head_tokens=sum(lens[:n]),
+        tail_tokens=sum(lens[n:]),
+        head_max_q=max(lens[:n]),
+        tail_max_q=max(lens[n:]),
+        head_max_k=int(head_seq_lens_cpu.max()),
+        tail_cu_seqlens_q=cu_seqlens_q[n:] - cu_seqlens_q[n],
+        tail_cu_seqlens_k=cu_seqlens_k[n:] - cu_seqlens_k[n],
+        head_forward_batch=head_forward_batch,
+    )
+
+
+# Sliding layers split off the riders only beside a prefill this large: the riders'
+# own FA3 sliding call costs ~160 us, which fmha7's gain on the prefill pays back
+# only on ~16K-token chunks (1xH200: 16K + 32 riders split +98 vs one call +121 us;
+# a 970-token extend + 15 riders split +162 vs one call +21 us).
+_RIDE_SLIDING_SPLIT_MIN_TOKENS = 8192
+
+
+def ride_split_mode(split: ExtendAttnSplit, is_swa_layer: bool, fmha_layer: bool):
+    """How a ride-along layer runs its attention (serving/kernels/ride-along LOG R4):
+    None = one FA3 call over every row (fmha7 declines a batch with 8-row requests);
+    True / False = the prefills (fmha7 hook, else FA3) and the riders' blocks (FA3,
+    verify-shaped) as two calls, the riders' on a side stream / after the prefills'.
+    Full layers always split (fmha7 keeps the prefill: 970-token extend + 15 riders
+    +242 us vs +545 in one call); the side stream only pays beside a ragged prefill
+    head, whose per-request calls leave the GPU gaps (+224 vs +363 us)."""
+    if is_swa_layer and (
+        not fmha_layer or split.head_tokens < _RIDE_SLIDING_SPLIT_MIN_TOKENS
+    ):
+        return None
+    return split.head_reqs > 1
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -275,6 +342,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
+        self._extend_split_stream: Optional[torch.cuda.Stream] = None
         device_capability = get_device_capability()
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
@@ -1317,7 +1385,129 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
+        if (
+            forward_batch.extend_attn_split is not None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+        ):
+            metadata.extend_split = build_extend_attn_split(
+                forward_batch, metadata.cu_seqlens_q, metadata.cu_seqlens_k
+            )
+
         self.forward_metadata = metadata
+
+    def _forward_extend_split(
+        self,
+        q,
+        key_cache,
+        value_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        split: ExtendAttnSplit,
+        layer: RadixAttention,
+        causal: bool,
+        window_size,
+        kwargs: dict,
+        out: Optional[torch.Tensor],
+        *,
+        side_stream: bool,
+    ) -> torch.Tensor:
+        """A ride-along layer as two calls into one output: the prefill requests through
+        the prefill-attention hook (FA3 when it declines), then the riders' blocks as
+        their own verify-shaped FA3 call, on a side stream beside the prefills' or after
+        them."""
+        n, t = split.head_reqs, split.head_tokens
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if out is None:
+            # FA3 returns bf16 for FP8 queries.
+            out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+            out = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim), dtype=out_dtype
+            )
+        head_out, tail_out = out[:t], out[t : t + split.tail_tokens]
+
+        def part_kwargs(rows):
+            part = dict(kwargs)
+            for name in ("k_descale", "v_descale"):
+                if part.get(name) is not None:
+                    part[name] = part[name][rows]
+            return part
+
+        def fa3(rows, tokens, cu_q, cu_k, max_q, part_out, rows_page_table, splits):
+            flash_attn_with_kvcache(
+                q=q[tokens],
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=rows_page_table,
+                cache_seqlens=cache_seqlens[rows],
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k_new=cu_k,
+                max_seqlen_q=max_q,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                num_splits=splits,
+                out=part_out,
+                ver=self.fa_impl_ver,
+                **part_kwargs(rows),
+            )
+
+        def head():
+            rows = slice(0, n)
+            head_page_table = page_table[rows, : split.head_max_k]
+            if getattr(layer, "okc_prefill_fmha", False):
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import prefill_fmha
+
+                result = prefill_fmha.try_extend(
+                    self, q[:t], key_cache, value_cache, head_page_table,
+                    cache_seqlens[rows], cu_seqlens_q[: n + 1], split.head_max_q,
+                    layer, split.head_forward_batch, window_size, causal,
+                    part_kwargs(rows), head_out,
+                )
+                if result is not None:
+                    if result.data_ptr() != head_out.data_ptr():
+                        head_out.copy_(result.view_as(head_out))
+                    return
+            fa3(
+                rows,
+                slice(0, t),
+                cu_seqlens_q[: n + 1],
+                cu_seqlens_k[: n + 1],
+                split.head_max_q,
+                head_out,
+                head_page_table,
+                self.num_splits,
+            )
+
+        def tail():
+            rows = slice(n, None)
+            fa3(
+                rows,
+                slice(t, t + split.tail_tokens),
+                split.tail_cu_seqlens_q,
+                split.tail_cu_seqlens_k,
+                split.tail_max_q,
+                tail_out,
+                page_table[rows],
+                self.num_splits,
+            )
+
+        if not side_stream:
+            head()
+            tail()
+            return out
+        main = torch.cuda.current_stream()
+        if self._extend_split_stream is None:
+            self._extend_split_stream = torch.cuda.Stream()
+        side = self._extend_split_stream
+        side.wait_stream(main)
+        head()
+        with torch.cuda.stream(side):
+            tail()
+        main.wait_stream(side)
+        return out
 
     def get_paged_mha_kv_cache(
         self,
@@ -1745,6 +1935,35 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     **kwargs,
                 )
+            elif (
+                metadata.extend_split is not None
+                and not (use_local_attn or use_cascade_attn or return_lse)
+                and not layer.is_cross_attention
+                and (
+                    split_mode := ride_split_mode(
+                        metadata.extend_split,
+                        is_swa_layer,
+                        getattr(layer, "okc_prefill_fmha", False),
+                    )
+                )
+                is not None
+            ):
+                result = self._forward_extend_split(
+                    q,
+                    key_cache,
+                    value_cache,
+                    page_table,
+                    cache_seqlens,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    metadata.extend_split,
+                    layer,
+                    causal,
+                    window_size,
+                    kwargs,
+                    _fa_out,
+                    side_stream=split_mode,
+                )
             else:
                 result = None
                 if (
@@ -1775,7 +1994,13 @@ class FlashAttentionBackend(AttentionBackend):
                         window_size=window_size,
                         softcap=layer.logit_cap,
                         return_softmax_lse=use_cascade_attn or return_lse,
-                        num_splits=self.num_splits,
+                        # Ride-along sliding layers: the split heuristic over the riders'
+                        # short blocks costs ~+25-40 us per layer; one split is free.
+                        num_splits=(
+                            1
+                            if metadata.extend_split is not None and is_swa_layer
+                            else self.num_splits
+                        ),
                         out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,

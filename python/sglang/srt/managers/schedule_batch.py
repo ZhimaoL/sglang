@@ -2346,6 +2346,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # The prepared decode batch whose verify step runs inside this prefill batch's
+    # forward (managers/ride_along.py); consumed and cleared by run_batch.
+    ride_along_batch: Optional[ScheduleBatch] = None
 
     # For split prefill
     split_index: int = 0

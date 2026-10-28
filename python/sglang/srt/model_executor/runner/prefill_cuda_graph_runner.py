@@ -1924,6 +1924,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
             max_seq_len_override=self.max_context_size,
+            extend_logits_rows=forward_batch.extend_logits_rows,
+            extend_attn_split=forward_batch.extend_attn_split,
         )
         forward_batch.kv_loc_plan.bind_replay(
             static_forward_batch,
