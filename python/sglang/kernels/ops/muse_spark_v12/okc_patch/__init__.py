@@ -46,6 +46,9 @@ WS_MIN_QLEN = int(os.environ.get("OKC_WS_MIN_QLEN", "2048"))
 # pooler and unpooler run on 1/tp of the tokens; the experts see every token through an all-gather and return a
 # reduce-scatter, so the bytes on the wire match the two all-reduces they replace.
 SW_SP = _flag("OKC_SW_SP", "1")
+# SP only above this many tokens (a prefill CUDA-graph bucket boundary, so a batch and its padded bucket agree): on a
+# ~1K-token follow-up extend the extra collectives cost more than the 1/tp compute saves (cached TTFT +30 ms, session SB).
+SP_MIN_TOKENS = int(os.environ.get("OKC_SP_MIN_TOKENS", "4096"))
 # Replicated pooler / unpooler at decode and verify M (<= 512 tokens) on Hopper: column-parallel slice + the
 # multicast all-gather (muse_spark_v12/gemm_ag.py), which upstream enables above 8 tokens on B300 only. Every
 # rank otherwise streams the full 128 MiB of the pair per layer and step (session SC: ~2 ms of a bs=1 step).
@@ -60,4 +63,4 @@ ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3",
-           "SW_PREFILL_FMHA", "WS_MIN_QLEN", "SW_SP", "SW_GEMM_AG", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]
+           "SW_PREFILL_FMHA", "WS_MIN_QLEN", "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]

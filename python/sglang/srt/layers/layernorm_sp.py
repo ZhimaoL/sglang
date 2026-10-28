@@ -67,6 +67,7 @@ class _OkcHopperSP:
     active: bool = False
     symm: bool = False
     symm_min_tokens: int = 0
+    min_tokens: int = 0
 
 
 _okc_hopper = _OkcHopperSP()
@@ -105,7 +106,13 @@ def initialize_layernorm_sp(*, model_config) -> None:
         not get_parallel().enable_layernorm_sp and _okc_hopper_sp_wanted(architecture)
     )
     if _okc_hopper.active:
-        from sglang.kernels.ops.muse_spark_v12.okc_patch import SP_SYMM, SP_SYMM_MIN_TOKENS
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import (
+            SP_MIN_TOKENS,
+            SP_SYMM,
+            SP_SYMM_MIN_TOKENS,
+        )
+
+        _okc_hopper.min_tokens = SP_MIN_TOKENS
 
         _okc_hopper.symm = SP_SYMM and _HAS_TORCH_SYMM_MEM_FUSED
         _okc_hopper.symm_min_tokens = SP_SYMM_MIN_TOKENS
@@ -120,7 +127,7 @@ def layernorm_sp_enabled() -> bool:
     return get_flags().sp.enabled
 
 
-def runs_sp(forward_mode) -> bool:
+def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
     """Whether this forward runs SP: an enabled model, prefill only.
 
     Code outside the CUDA-graph-captured region must use this and not
@@ -129,7 +136,14 @@ def runs_sp(forward_mode) -> bool:
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-    return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
+    if not (layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND):
+        return False
+    # Every Muse call site passes the forward's token count; the OKC Hopper path keeps small extends unsharded.
+    return not (
+        _okc_hopper.active
+        and num_tokens is not None
+        and num_tokens <= _okc_hopper.min_tokens
+    )
 
 
 class _SPForwardState:
@@ -203,7 +217,7 @@ def maybe_exit_gather(
     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
     replay, where the writes made inside the captured region do not re-execute.
     """
-    if not runs_sp(forward_mode) or input_ids is None:
+    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0]):
         return hidden_states, hidden_states_before_norm
     num_tokens = input_ids.shape[0]
     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)

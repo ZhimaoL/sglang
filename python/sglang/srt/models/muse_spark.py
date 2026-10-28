@@ -1367,7 +1367,9 @@ class MuseSpark1xModel(nn.Module):
         )
         if input_embeds is None and self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
-        sp_active = layernorm_sp.runs_sp(forward_batch.forward_mode)
+        sp_active = layernorm_sp.runs_sp(
+            forward_batch.forward_mode, num_tokens=hidden_states.shape[0]
+        )
         get_forward().set("sp_active", sp_active)
         if sp_active:
             hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
@@ -1468,7 +1470,10 @@ class MuseSpark1xForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         if aux_hidden_states is not None and layernorm_sp.runs_sp(
-            forward_batch.forward_mode
+            forward_batch.forward_mode,
+            num_tokens=(
+                input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
+            ),
         ):
             # DFLASH consumes every prompt token in replicated token order.
             # Gather the taps before logits pruning applies full-token indices;
@@ -1490,7 +1495,9 @@ class MuseSpark1xForCausalLM(nn.Module):
         if (
             input_ids is None
             and input_embeds is not None
-            and layernorm_sp.runs_sp(forward_batch.forward_mode)
+            and layernorm_sp.runs_sp(
+                forward_batch.forward_mode, num_tokens=input_embeds.shape[0]
+            )
         ):
             hidden_states = layernorm_sp.sp_exit_gather(
                 hidden_states, num_tokens=input_embeds.shape[0]
