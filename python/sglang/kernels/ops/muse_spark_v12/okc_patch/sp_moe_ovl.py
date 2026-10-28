@@ -12,12 +12,14 @@ per-row work around it is sliced into k row ranges of the shard (the same ranges
     comm streams:   top-k AG | AG(0) AG(1) ..   |                  |   RS(0)   RS(1) ..
 The transfers are copy-engine P2P pushes (Tensor.copy_ into the peers' torch symmetric-memory buffers, the transport
 of the async-TP linears): no SMs, so they run under the pooler / alignment / finalize / unpooler slices. AG: every
-rank pushes its top-k (fp32 scores and int32 ids as one int32 row) as soon as the router's side stream is done, on its
-own stream and barrier channel, so pg's route alignment runs while the rows are in flight; then each slice of its
+rank pushes its top-k (fp32 scores and int32 ids as one int32 row) as soon as the router's side stream is done, ahead
+of its row copies, with a barrier of its own (channel 1), so pg's route alignment runs while the rows are in flight;
+then each slice of its
 pooled, pre-expert-normed rows (the norm is per row) into slot `rank` of every peer's buffer, published by one
 symm-mem barrier (a one-CTA kernel) before pg. RS: per slice, every rank pushes the finalized partial rows of
 each peer's tokens to that peer, a barrier publishes them, and the peer sums the tp slots in fp32 and rounds once to
-bf16 (NCCL's ring rounds per hop): the same expert math, only the summation order differs.
+bf16 (NCCL's ring rounds per hop): the same expert math, only the summation order differs. The RS barriers run on a
+stream of their own, so no slice's pushes wait behind an earlier slice's barrier (the one that absorbs the EP straggler).
 
 Buffer reuse across layers and forwards is ordered by the data: a peer writes my buffers for the next use only after
 it has passed a barrier that I enter after my reads of this use (x / top-k: my first RS barrier follows my pg; RS
@@ -33,9 +35,11 @@ import torch
 logger = logging.getLogger(__name__)
 
 # Row slices of the shard at the edges (pooler / AG pushes, finalize / RS pushes / reduce / unpooler).
-SPLITS = int(os.environ.get("OKC_MOE_OVL_SPLITS", "4"))
+# session SI (4 slices, 2 streams): 112 MiB of row pushes ran at ~211 GB/s in 4 MiB copies on two streams; one stream
+# of bigger copies runs ~330-357 GB/s (TP-CE bench)
+SPLITS = int(os.environ.get("OKC_MOE_OVL_SPLITS", "2"))
 # Comm streams for the pushes of one slice (2+: peers in parallel on more copy engines).
-STREAMS = int(os.environ.get("OKC_MOE_OVL_STREAMS", "2"))
+STREAMS = int(os.environ.get("OKC_MOE_OVL_STREAMS", "1"))
 # Chunk token range that takes the pipeline (a ~1K extend's collectives are latency-bound: nothing to hide).
 MIN_TOKENS = int(os.environ.get("OKC_MOE_OVL_MIN_TOKENS", "4096"))
 MAX_TOKENS = int(os.environ.get("OKC_MOE_OVL_MAX_TOKENS", "16384"))
@@ -139,13 +143,17 @@ def pipeline(st, x_shard, scores, ids, prep_fn, pg_fn, fin_fn, post=None, rows=N
         for s in streams[1:]:
             streams[0].wait_stream(s)
 
-    # AG of the top-k (rank-major) on its own stream and barrier channel, as soon as the router is done: pg's route
-    # alignment then runs while the rows are still in flight
+    # AG of the top-k (rank-major) first, on the row stream so its small copies are not queued behind row copies on the
+    # copy engines (session SI: on a stream of its own it landed ~190 us after the router), published by a barrier of
+    # its own (channel 1, on TS) so pg's route alignment runs while the rows are still in flight
     if routed is not None:
-        TS.wait_event(routed)
-    with torch.cuda.stream(TS):
+        X.wait_event(routed)
+    with torch.cuda.stream(X):
         tk = torch.cat((scores.float().contiguous().view(torch.int32), ids.to(torch.int32)), dim=1).view(-1)
-    push([TS], st.tk, TK, lambda p: tk, 0, S)
+    push([X], st.tk, TK, lambda p: tk, 0, S)
+    ev = torch.cuda.Event()
+    ev.record(X)
+    TS.wait_event(ev)
     yield 1, TS
     ev_tk = torch.cuda.Event()
     ev_tk.record(TS)
@@ -172,7 +180,9 @@ def pipeline(st, x_shard, scores, ids, prep_fn, pg_fn, fin_fn, post=None, rows=N
     cur.wait_event(ev_x)
     y = pg_fn(st.x[me][:W * S * H].view(W * S, H), prep)
 
-    # RS per slice: finalize the slice's rows (W blocks of m), push block p to peer p, barrier
+    # RS per slice: finalize the slice's rows (W blocks of m), push block p to peer p; each slice's barrier runs on TS
+    # (channel 1), so the next slice's pushes leave as soon as its finalize ends instead of queueing behind a barrier
+    # that waits for the slowest rank (session SI: slices 1.. waited behind slice 0's straggler wait)
     ev_rs = []
     for a, m in sl:
         r0, r1 = W * a, W * (a + m)
@@ -183,9 +193,12 @@ def pipeline(st, x_shard, scores, ids, prep_fn, pg_fn, fin_fn, post=None, rows=N
         X.wait_event(ev)
         flat = out.view(W, m * H)
         push(st.streams, st.rs, H, lambda p: flat[p], W * a, m)
-        yield 0, X
         ev = torch.cuda.Event()
         ev.record(X)
+        TS.wait_event(ev)
+        yield 1, TS
+        ev = torch.cuda.Event()
+        ev.record(TS)
         ev_rs.append(ev)
 
     result = torch.empty((S, H if post is None else post[1]), dtype=torch.bfloat16, device=scores.device)
@@ -196,9 +209,9 @@ def pipeline(st, x_shard, scores, ids, prep_fn, pg_fn, fin_fn, post=None, rows=N
             torch.sum(slots, dim=0, out=result[a:a + m])
         else:
             post[0](slots.sum(dim=0), result[a:a + m])
-    # Every comm-stream op is joined (the last reduce waited for the last RS barrier, which followed every push; the
-    # top-k stream was joined before the alignment); the pushed tensors stay referenced until here, so their blocks
-    # are not handed out while the copy engines still read them.
+    # Every comm-stream op is joined (the last reduce waited for the last RS barrier on TS, which followed every push on
+    # X; the top-k barrier was joined before the alignment); the pushed tensors stay referenced until here, so their
+    # blocks are not handed out while the copy engines still read them.
     del keep, y, prep
     return result
 
