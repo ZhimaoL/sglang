@@ -40,6 +40,10 @@ MOE_REP_PASSES = _flag("OKC_MOE_REP_PASSES", "1")
 # the split from this size up: its kernels cost 9-15 us per layer, which at prefill routing it repays only on 16K
 # chunks (S8 arm C ~1K extends: <= 1 us of straggler saved; 1xH200 bench: +5..+21 us at T 753..5632, -20 at 16384)
 MOE_REP_SPLIT_MIN_TOKENS = int(os.environ.get("OKC_MOE_REP_SPLIT_MIN_TOKENS", "8192"))
+# Between them, from OKC_MOE_REP_EXTEND_MIN_TOKENS (extends): the balancer inside the local-slot align (pg_moe.align_local,
+# pg cost weights, count order). Slowest rank per layer at R1: T 1024 -9, 4096 -31 us; T 512 no gain (serving-replicas M29).
+MOE_REP_EXTEND = _flag("OKC_MOE_REP_EXTEND", "1")
+MOE_REP_EXTEND_MIN_TOKENS = int(os.environ.get("OKC_MOE_REP_EXTEND_MIN_TOKENS", "1024"))
 # pg's narrow build (-DPGN_WSET: 128-token blocks, widths 16 / 64 / 128) for calls of OKC_PG_NARROW_MIN_T..MAX_T
 # tokens (serving/kernels/extend E5-E7: 0.77-0.80x at verify T 8..256, 0.86-0.97x at extends of 753..3072); the
 # shipped build (256-token blocks) outside. Same outputs for every real token.
@@ -278,7 +282,7 @@ RIDE_CORE = _flag("OKC_RIDE_CORE", "1")
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
+           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",

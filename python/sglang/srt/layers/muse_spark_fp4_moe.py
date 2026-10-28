@@ -209,6 +209,9 @@ class MuseSpark1xFp4Experts(nn.Module):
             plan = self.replica_plan
             rep_table = _rep_table(plan["home"], slot, plan["order"], plan["rank"])
         self.register_buffer("_okc_rep_table", rep_table, persistent=False)
+        # per-expert route counter of the extend balancer (pg_moe.align_local_rep; its scan re-zeroes it)
+        self.register_buffer("_okc_rep_gcnt", None if rep_table is None else torch.zeros(256, dtype=torch.int32),
+                             persistent=False)
 
         self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
         if not self.use_marlin and not self.quant_method.enable_flashinfer_trtllm_moe:

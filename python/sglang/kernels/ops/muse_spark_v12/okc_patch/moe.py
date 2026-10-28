@@ -209,6 +209,8 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
         name += "+rep"
     elif mode == "split" and not name.startswith("small"):
         name += "+split"
+    elif mode == "extend":
+        name += "+repx"
     return name
 
 
@@ -306,12 +308,24 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
 def _rep_mode(layer, tokens):
     """The replica balancer a T-token forward uses: "assign" (<= OKC_MOE_REP_MAX_TOKENS), "split" (>=
     OKC_MOE_REP_SPLIT_MIN_TOKENS: its 3 kernels cost ~9 us per layer, more than they save at ~1K extends), else None
-    (the static home map; replicas idle)."""
+    (the static home map; replicas idle), or "extend" between them from OKC_MOE_REP_EXTEND_MIN_TOKENS (the balancer
+    inside the align)."""
     if getattr(layer, "_okc_rep_table", None) is None:
         return None
     if tokens <= _sw.MOE_REP_MAX_TOKENS:
         return "assign"
-    return "split" if _sw.MOE_REP_PREFILL and tokens >= _sw.MOE_REP_SPLIT_MIN_TOKENS else None
+    if _sw.MOE_REP_PREFILL and tokens >= _sw.MOE_REP_SPLIT_MIN_TOKENS:
+        return "split"
+    if _sw.MOE_REP_EXTEND and tokens >= _sw.MOE_REP_EXTEND_MIN_TOKENS and layer.num_local_experts <= 64:
+        return "extend"
+    return None
+
+
+def _align_rep(layer, topk_ids, bm):
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
+    return pg_moe.align_local(topk_ids, None, layer.num_local_experts, bm, layer._okc_rep_table,
+                              getattr(layer, "_okc_rep_gcnt", None), layer.replica_plan["me"])
 
 
 def local_routes(layer, topk_ids):
@@ -328,6 +342,8 @@ def local_routes(layer, topk_ids):
     if mode == "split":
         # prefill chunks: every expert is active; each replicated expert's routes split to level routed tokens
         return pg_moe.split_replicas(topk_ids, layer._okc_rep_table, layer.replica_plan["me"])
+    if mode == "extend":
+        return _align_rep(layer, topk_ids, pg_moe.block_m(topk_ids.shape[0]))[0]
     local_ids = topk_ids.to(torch.int32)
     if layer._expert_map is not None:
         local_ids = layer._expert_map[local_ids]
@@ -364,6 +380,9 @@ def pg_prep(layer, topk_ids):
 
     emap = layer._expert_map
     bm = pg_moe.block_m(topk_ids.shape[0])
+    if _rep_mode(layer, topk_ids.shape[0]) == "extend":
+        # extend-sized: the balancer inside the align (pg cost weights, count order)
+        return _align_rep(layer, topk_ids, bm)
     if (_sw.PG_LOCAL_ALIGN and topk_ids.shape[0] >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS
             and (emap is None or emap.dtype is torch.int32) and layer.num_local_experts <= 64):
         # Large chunks: one count of the routes into the local-slot counters (map and int32 cast folded in)

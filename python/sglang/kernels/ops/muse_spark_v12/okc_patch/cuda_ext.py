@@ -56,7 +56,7 @@ def glue_ext():
 
 # Host entry points of _cuda_src_pg (both builds): T = torch::Tensor, i = int64_t,
 # d = double.
-_PG_SIG = {"align": "TTTTTTTTTiiii", "tiles": "TTTTiiiii", "rep_assign": "TTTTii", "rep_split": "TTTTTTii",
+_PG_SIG = {"align": "TTTTTTTTTTiiiii", "tiles": "TTTTiiiii", "rep_assign": "TTTTii", "rep_split": "TTTTTTii",
            "gather": "TTTTii", "route": "TTTTTTiiii", "gather_norm": "TTdTTTiii", "gg1": "TTTTTTiiii",
            "gg2": "TTTTTTiiii", "set_snake_max_t": "i", "ag_rows": "TTTTTTTiiiiii"}
 _ARG = {"T": "torch::Tensor", "i": "int64_t", "d": "double"}
@@ -83,7 +83,7 @@ def pg_ext():
 
                 # The name differs from the prefill bank's build and from the lanes' branches: the small-T front end,
                 # the PDL launch flags, the local-slot align, tiles' local-slot count and the replica balancers.
-                _PG_EXT = _pg_load("okc_pg_moe_c350_int_d3_b4", _CUDA_SRC, _PG_SIG)
+                _PG_EXT = _pg_load("okc_pg_moe_c350_int_d3_b5", _CUDA_SRC, _PG_SIG)
     return _PG_EXT
 
 
