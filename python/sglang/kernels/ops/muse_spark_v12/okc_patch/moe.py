@@ -195,7 +195,12 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
         if pg_moe.block_m(tokens) != pg_moe._BLOCK_M:
             name += "-narrow"
     if getattr(layer, "_okc_rep_table", None) is not None:
-        name += "+rep" if tokens <= _sw.MOE_REP_MAX_TOKENS else ("+split" if _sw.MOE_REP_PREFILL else "")
+        # the small front end maps through a per-expert map (route_map): the balancer's at <= MOE_REP_MAX_TOKENS, else
+        # the static one (split_replicas is per route, so it runs on the st / align / local chains only)
+        if tokens <= _sw.MOE_REP_MAX_TOKENS:
+            name += "+rep"
+        elif _sw.MOE_REP_PREFILL and not name.startswith("small"):
+            name += "+split"
     return name
 
 
