@@ -60,12 +60,46 @@ def is_muse_spark_architecture(architecture: Optional[str]) -> bool:
     return architecture in MUSE_SP_ARCHITECTURES
 
 
+class _OkcHopperSP:
+    """Muse SP prefill on Hopper without --enable-layernorm-sp: NCCL collectives instead of the
+    Blackwell CUTLASS ones, and the MoE all-gathers its inputs instead of the A2A dispatcher."""
+
+    active: bool = False
+
+
+_okc_hopper = _OkcHopperSP()
+
+
+def _okc_hopper_sp_wanted(architecture: Optional[str]) -> bool:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_SP
+
+    parallel = get_parallel()
+    return (
+        SW_SP
+        and is_muse_spark_architecture(architecture)
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 9
+        and parallel.tp_size > 1
+        and parallel.attn_dp_size == 1
+        and parallel.moe_tp_size == 1
+        and not getattr(parallel, "enable_megamoe_for_layernorm_sp", False)
+    )
+
+
+def okc_hopper_sp() -> bool:
+    return _okc_hopper.active
+
+
 def initialize_layernorm_sp(*, model_config) -> None:
     """Materialize ``flags.sp.enabled``; runs once per worker after distributed
     setup, alongside ``initialize_dp_attention``."""
     architectures = model_config.hf_config.architectures
+    architecture = architectures[0] if architectures else None
+    _okc_hopper.active = (
+        not get_parallel().enable_layernorm_sp and _okc_hopper_sp_wanted(architecture)
+    )
     get_flags().sp.enabled = bool(
-        get_parallel().enable_layernorm_sp
+        (get_parallel().enable_layernorm_sp or _okc_hopper.active)
         and architectures
         and architectures[0] in SP_SUPPORTED_ARCHITECTURES
     )
@@ -196,6 +230,7 @@ def sp_fused_matmul_eligible(linear) -> bool:
     if (
         not (_HAS_TORCH_SYMM_MEM_FUSED or getattr(linear, "_sp_use_cutlass", False))
         or linear.bias is not None
+        or _okc_hopper.active
     ):
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod

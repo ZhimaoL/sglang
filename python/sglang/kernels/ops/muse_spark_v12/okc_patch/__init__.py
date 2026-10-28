@@ -42,9 +42,13 @@ SW_ATTN_V3 = _flag("OKC_SW_ATTN_V3", "1")
 # Prefill FMHA hook: measured neutral on the ladder (session K), off so the patch carries no prefill attention.
 SW_PREFILL_FMHA = _flag("OKC_SW_PREFILL_FMHA", "0")
 WS_MIN_QLEN = int(os.environ.get("OKC_WS_MIN_QLEN", "2048"))
+# Sequence-parallel prefill on Hopper (layers/layernorm_sp.py okc_hopper_sp): the residual stream, norms, router,
+# pooler and unpooler run on 1/tp of the tokens; the experts see every token through an all-gather and return a
+# reduce-scatter, so the bytes on the wire match the two all-reduces they replace.
+SW_SP = _flag("OKC_SW_SP", "1")
 
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3",
-           "SW_PREFILL_FMHA", "WS_MIN_QLEN", "ANY_ATTN"]
+           "SW_PREFILL_FMHA", "WS_MIN_QLEN", "SW_SP", "ANY_ATTN"]

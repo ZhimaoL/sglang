@@ -254,6 +254,9 @@ def _split_bf16_router_supported() -> bool:
     return is_cuda() and get_device_capability()[0] == 9
 
 
+_okc_sp_logged = False
+
+
 def _use_split_bf16_router(num_tokens: int) -> bool:
     if num_tokens <= ROUTER_GEMM_MAX_TOKENS or not _split_bf16_router_supported():
         return False
@@ -954,6 +957,8 @@ class MuseSpark1xMoE(nn.Module):
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
         """Return combined source-token shards, before the nonlinear FFN tail."""
+        if layernorm_sp.okc_hopper_sp():
+            return self._forward_gathered_experts(expert_input, topk_scores, topk_ids)
         if self.pre_expert_norm is not None:
             expert_input = self.pre_expert_norm(expert_input)
         if self.use_megamoe:
@@ -977,6 +982,53 @@ class MuseSpark1xMoE(nn.Module):
             dispatch_output, self.experts.post_expert_norm
         )
         return self.sp_dispatcher.combine(combine_input)
+
+    def _forward_gathered_experts(
+        self,
+        expert_input: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """SP prefill without the A2A dispatcher: every rank runs its local experts on the whole
+        sequence, exactly the non-SP EP, and reduce-scatters the partial sums back to the shards.
+        Shards are [M_pad / tp, ...] in rank order, so gathering along dim 0 restores token order."""
+        global _okc_sp_logged
+        if not _okc_sp_logged:
+            _okc_sp_logged = True
+            logger.info(
+                "OKC SP prefill active: %d-token shard, gathered experts.",
+                expert_input.shape[0],
+            )
+        tp_group = get_tp_group()
+        world = tp_group.world_size
+
+        def gather(shard: torch.Tensor) -> torch.Tensor:
+            shard = shard.contiguous()
+            full = shard.new_empty((shard.shape[0] * world, *shard.shape[1:]))
+            tp_group.all_gather_into_tensor(full, shard)
+            return full
+
+        full_input = gather(expert_input)
+        full_scores = gather(topk_scores)
+        full_ids = gather(topk_ids)
+        if self.nvfp4_checkpoint:
+            output = self.experts(
+                full_input,
+                full_scores,
+                full_ids,
+                self.experts.post_expert_norm,
+                pre_expert_norm=self.pre_expert_norm,
+            )
+        else:
+            if self.pre_expert_norm is not None:
+                full_input = self.pre_expert_norm(full_input)
+            output = self.experts(
+                full_input, full_scores, full_ids, self.experts.post_expert_norm
+            )
+        output = output.contiguous()
+        shard = output.new_empty((expert_input.shape[0], *output.shape[1:]))
+        tp_group.reduce_scatter_tensor(shard, output)
+        return shard
 
 
 class MuseSpark1xDecoderLayer(nn.Module):
@@ -1242,7 +1294,9 @@ class MuseSpark1xModel(nn.Module):
                     )
                 for moe_layer in moe_layers:
                     moe_layer.set_finalize_ar_workspace(self._finalize_ar_workspace)
-        if layernorm_sp.layernorm_sp_enabled():
+        if layernorm_sp.layernorm_sp_enabled() and layernorm_sp.okc_hopper_sp():
+            logger.info("OKC SP prefill on Hopper: NCCL collectives, all-gathered experts.")
+        elif layernorm_sp.layernorm_sp_enabled():
             # Scope CUTLASS collectives to Muse; leave the generic Qwen SP
             # path unchanged. Decode never calls the SP participant hooks.
             for layer in self.layers:
