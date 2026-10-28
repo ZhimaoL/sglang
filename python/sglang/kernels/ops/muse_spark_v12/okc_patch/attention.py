@@ -41,6 +41,8 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN_ACC16,
     SW_ATTN_V3,
     SW_PDL,
+    SW_VFG,
+    SW_VFG_FULL1,
     SW_WST,
     WST_ACC16,
     WST_BAL_MIN_BS,
@@ -264,6 +266,13 @@ def verify_full_rows(attn, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table
 def _full_rows(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
                bs, q_len, hq, hkv, d, is_fp8, kv_scale, sm_scale, qk_factor, eps):
     """Full-layer routing (decode and verify); None = stock path."""
+    if (q_len == 8 and bs == 1 and SW_VFG_FULL1 and is_fp8 and hq == 16 and hkv == 2 and d == 64
+            and page_table.dtype is torch.int32 and page_table.stride(1) == 1):
+        log_once("full_vfg[q_len=8]", "(bs=1)")
+        return _vfg_attn(
+            qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+            bs=bs, window=0, kv_scale=kv_scale, theta=None, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
+        )
     # The wst kernels hard-code the TP8 head layout (16 q / 2 kv heads of 64) and read e4m3 cache bytes.
     if (q_len == 8 and bs >= max(1, WST_MIN_BS) and SW_WST and is_fp8 and hq == 16 and hkv == 2 and d == 64
             and page_table.dtype is torch.int32 and page_table.stride(1) == 1):
@@ -307,8 +316,18 @@ _V3_TUNE_BY = {
 def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
              bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
              sm_scale, qk_factor, eps):
-    """Sliding dispatch: the attn-v3 fused kernels on the TP8 shape (judge-checked
-    sliding decode 1.73-1.92x, verify above the v1 3-launch chain), v1 otherwise."""
+    """Sliding dispatch: verify blocks on the bank's VFG / VP2 kernels (FP8 pool, TP8 shape, page size 1), else the
+    attn-v3 fused kernels on the TP8 shape (judge-checked sliding decode 1.73-1.92x, verify above the v1 3-launch
+    chain), v1 otherwise."""
+    if (SW_VFG and q_len == 8 and hq == 16 and hkv == 2 and d == 64 and page_size == 1 and 0 < window <= 2048
+            and k_cache.dtype is torch.float8_e4m3fn and page_table.dtype is torch.int32
+            and page_table.stride(1) == 1):
+        log_once("sliding_vfg[q_len=8]", f"(first bs={bs})")
+        return _vfg_attn(
+            qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+            bs=bs, window=window, kv_scale=kv_scale, theta=theta,
+            sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
+        )
     if SW_ATTN_V3 and hq == 16 and hkv == 2 and d == 64 and q_len in (1, 8):
         log_once(f"sliding_v3[q_len={q_len}]", f"(first bs={bs})")
         return _sliding_v3(
@@ -498,6 +517,52 @@ def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
 
 _WST_WS = {}
 _SMS = {}
+_VFG_WS = {}
+
+
+def _vfg_attn(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+              bs, window, kv_scale, theta, sm_scale, qk_factor, eps):
+    """Verify blocks (q_len 8) on the attention lane's bank v16c_m7g_rlx3 routes (`_vph` / `_vfg`):
+      sliding, bs 1:  VP2 (two 16-CTA clusters, one per kv head; window slices merged in-cluster, no second kernel)
+      sliding, bs > 1 and full, bs 1: VFG, SMs // bs splits per request + the vfgm (>= 32 splits) / vfgm2 merge kernel
+    All of them build q (RMSNorm, RoPE from the fp32 inv_freq table on sliding layers, e4m3) and the block's new k / v
+    cache rows in-kernel and write RMSNorm(O) x sigmoid(gate). Split-KV partials are fp32 (global records, VP2 owner
+    blocks). qkv rows must be the contiguous [bs * 8, 2304] projection (the kernels' row stride is the TP8 width).
+    No ticket counters: every launch is self-contained, so graph capture and replays need no state."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import vfg_ext
+
+    device = qkv.device
+    dkey = str(device)
+    G = _SMS.get(dkey)
+    if G is None:
+        G = _SMS[dkey] = torch.cuda.get_device_properties(device).multi_processor_count
+    if cache_loc.dtype != torch.int64:
+        cache_loc = cache_loc.to(torch.int64)
+    freq = 0
+    if window:
+        fkey = ("freq", float(theta), dkey)
+        f = _VFG_WS.get(fkey)
+        if f is None:   # exactly the reference's fp32 inv_freq table
+            f = _VFG_WS[fkey] = (1.0 / (float(theta) ** (torch.arange(0, 64, 2, device=device).float() / 64))).contiguous()
+        freq = f.data_ptr()
+    out = torch.empty((bs * 8, 16 * 64), dtype=torch.bfloat16, device=device)
+    c2 = qk_factor * sm_scale * kv_scale * LOG2E
+    stream = torch.cuda.current_stream().cuda_stream
+    ext = vfg_ext()
+    if window and bs == 1:
+        ext.muse_vp2_launch(qkv.data_ptr(), page_table.data_ptr(), seq_pre.data_ptr(), cache_loc.data_ptr(),
+                            k_cache.data_ptr(), v_cache.data_ptr(), freq, out.data_ptr(), window, c2,
+                            1.0 / kv_scale, 1.0 / kv_scale, kv_scale, eps, 0, stream)
+        return out
+    ns = max(1, G // bs)
+    wkey = ("ws", dkey)
+    ws = _VFG_WS.get(wkey)
+    if ws is None:   # bs * ns <= SMs partial rows of 128 (8 tokens x 16 heads) x 72 floats; shared by every bs / graph
+        ws = _VFG_WS[wkey] = torch.empty((G * 128 * 72,), dtype=torch.float32, device=device)
+    ext.muse_vfg_launch(qkv.data_ptr(), page_table.data_ptr(), page_table.stride(0), seq_pre.data_ptr(),
+                        cache_loc.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), freq, out.data_ptr(), bs, ns,
+                        window, c2, 1.0 / kv_scale, 1.0 / kv_scale, kv_scale, eps, ws.data_ptr(), 0, stream)
+    return out
 
 
 def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
