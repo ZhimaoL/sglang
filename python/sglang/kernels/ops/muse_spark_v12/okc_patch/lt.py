@@ -100,13 +100,13 @@ def _ext():
     return _EXT if _OK else None
 
 
-def _register(dev, n, k, m):
+def _register(dev, n, k, m, spec=None):
     ent = _IDX.get((dev, n, k, m))
     if ent is None:
         ext = _ext()
         ent = (-1, 0, 1, 1)
         if ext is not None:
-            layout, tile, sk, cu, cl = _TABLE[(n, k)][m]
+            layout, tile, sk, cu, cl = spec or _TABLE[(n, k)][m]
             cfg = (66, tile, sk, 2 if sk > 1 else 0, 0, cu, 35, 0, cl)
             with torch.cuda.device(dev):
                 idx, ws, al_a, al_b = ext.lt_register(m, n, k, layout, list(cfg), _WS_BYTES)
@@ -133,12 +133,17 @@ def lt_gemm(x, weight):
     m = x.numel() // k
     if m not in row or not (x.is_cuda and x.is_contiguous() and weight.is_contiguous()):
         return None
+    return _mm(x, weight, m, row[m])
+
+
+def _mm(x, weight, m, spec):
+    n, k = weight.shape
     dev = x.device.index
     ent = _IDX.get((dev, n, k, m))
     if ent is None:
         if torch.cuda.is_current_stream_capturing():
             return None
-        ent = _register(dev, n, k, m)
+        ent = _register(dev, n, k, m, spec)
     idx, ws_bytes, al_x, al_w = ent
     if idx < 0 or x.data_ptr() % al_x or weight.data_ptr() % al_w:
         return None
@@ -147,6 +152,24 @@ def lt_gemm(x, weight):
         _IDX[(dev, n, k, m)] = (-1, 0, 1, 1)
         return None
     return out.view(*x.shape[:-1], n)
+
+
+# The DFlash fc [8192, 40960] on an SP shard below DFLASH_FC_SP_MIN_ROWS rows, where torch's cuBLAS takes another kernel
+# than for the whole chunk: split-K 1 configs whose rows equal the whole-chunk GEMM's bit for bit at every SP chunk
+# 513..3072 (serving/kernels/verify-glue VG20), the fastest per shard size: (largest m, layout, tile, custom, cluster).
+_FC = ((80, 0, 396, 5, 2), (96, 0, 397, 1, 2), (112, 0, 398, 5, 2), (120, 0, 135, 6, 4), (128, 1, 183, 4, 4),
+       (152, 1, 21, 4, 2), (192, 0, 33, 5, 2), (224, 1, 21, 4, 2), (256, 0, 20, 4, 2), (288, 0, 33, 5, 2),
+       (296, 1, 208, 0, 2), (312, 0, 33, 5, 2), (320, 1, 208, 0, 2), (384, 0, 33, 5, 2))
+
+
+def lt_fc(x, weight):
+    """x [m, 40960] @ fc weight^T for 64 <= m <= 384 at the shard's bit-equal config; None = declined."""
+    m = x.shape[0]
+    if (x.dim() != 2 or tuple(weight.shape) != (8192, 40960) or not 64 <= m <= 384 or x.dtype is not torch.bfloat16
+            or weight.dtype is not torch.bfloat16 or not (x.is_cuda and x.is_contiguous() and weight.is_contiguous())):
+        return None
+    e = next(e for e in _FC if m <= e[0])
+    return _mm(x, weight, m, (e[1], e[2], 1, e[3], e[4]))
 
 
 def prepare(weight):

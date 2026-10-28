@@ -873,12 +873,21 @@ class DFlashDraftModel(nn.Module):
         from sglang.kernels.ops.muse_spark_v12 import okc_patch
 
         # Every rank holds the same shard row count, so all ranks take the same branch (the gather sizes agree).
-        if int(target_hidden.shape[0]) < okc_patch.DFLASH_FC_SP_MIN_ROWS:
-            return None
-        if not getattr(self, "_okc_logged_local", False):
-            self._okc_logged_local = True
-            logger.info("OKC DFlash fc on the SP shard active (%d shard rows).", int(target_hidden.shape[0]))
-        return self.hidden_norm(self.fc(target_hidden))
+        rows = int(target_hidden.shape[0])
+        pin = rows < okc_patch.DFLASH_FC_SP_MIN_ROWS
+        if not pin:
+            projected = self.fc(target_hidden)
+        else:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch.lt import lt_fc
+
+            projected = lt_fc(target_hidden, self.fc.weight) if okc_patch.SW_DFLASH_FC_SP_PIN else None
+            if projected is None:
+                return None
+        tag = "_okc_logged_pin" if pin else "_okc_logged_local"
+        if not getattr(self, tag, False):
+            setattr(self, tag, True)
+            logger.info("OKC DFlash fc on the SP shard active (%d shard rows%s).", rows, ", pinned" if pin else "")
+        return self.hidden_norm(projected)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
