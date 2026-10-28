@@ -52,7 +52,7 @@ def glue_ext():
     return _GLUE_EXT
 
 
-# Host entry points of _cuda_src_pg (and of the narrow build generated from it): T = torch::Tensor, i = int64_t,
+# Host entry points of _cuda_src_pg (both builds): T = torch::Tensor, i = int64_t,
 # d = double.
 _PG_SIG = {"align": "TTTTTTTTTiiii", "tiles": "TTTTiiiii", "rep_assign": "TTTTii", "rep_split": "TTTTTTii",
            "gather": "TTTTii", "route": "TTTTTTiiii", "gather_norm": "TTdTTTii", "gg1": "TTTTTTiiii",
@@ -86,15 +86,15 @@ def pg_ext():
 
 
 def pg_narrow_ext():
-    """The narrow build of pg (_cuda_src_pgn: 128-token blocks, widths 16 / 64 / 128) for mid-T calls."""
+    """The narrow build of pg (its #ifdef PGN_WSET blocks: 128-token blocks, widths 16 / 64 / 128) for mid-T calls."""
     global _PG_NARROW_EXT
     if _PG_NARROW_EXT is None:
         with _lock:
             if _PG_NARROW_EXT is None:
-                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pgn import narrow_source
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
 
                 _PG_NARROW_EXT = _pg_load(
-                    "okc_pg_moe_n17x128s7_int_d3", narrow_source(),
+                    "okc_pg_moe_n17x128s7_int_d3", _CUDA_SRC,
                     ["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
                     ["-DPGN_WSET=17", "-DPGN_NST=7"],
                 )
