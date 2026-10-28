@@ -96,7 +96,7 @@ def pg_narrow_ext():
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
 
                 _PG_NARROW_EXT = _pg_load(
-                    "okc_pg_moe_n17x128s7_int_d3_b4", _CUDA_SRC,
+                    "okc_pg_moe_n17x128s7_int_d3_b5", _CUDA_SRC,
                     ["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
                     ["-DPGN_WSET=17", "-DPGN_NST=7"],
                 )
@@ -112,7 +112,7 @@ def pg_narrow64_ext():
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
 
                 _PG_NARROW64_EXT = _pg_load(
-                    "okc_pg_moe_n24x64s7_int_d3_b4", _CUDA_SRC,
+                    "okc_pg_moe_n24x64s7_int_d3_b5", _CUDA_SRC,
                     ["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
                     ["-DPGN_WSET=24", "-DPGN_NST=7", "-DPGN_XNT=64"],
                 )
