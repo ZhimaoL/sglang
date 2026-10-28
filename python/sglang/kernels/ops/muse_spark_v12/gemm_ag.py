@@ -45,22 +45,30 @@ def _jit_module(n: int, world_size: int) -> Module:
     )
 
 
-def large_m_capable(device=None, num_tokens: Optional[int] = None) -> bool:
-    """Column-parallel projections past SMALL_PROJECTION_MAX_TOKENS: B300 upstream, Hopper with OKC_SW_GEMM_AG."""
+def large_m_capable(
+    device=None, num_tokens: Optional[int] = None, max_tokens: Optional[int] = None
+) -> bool:
+    """Column-parallel projections past SMALL_PROJECTION_MAX_TOKENS: B300 upstream, Hopper with OKC_SW_GEMM_AG.
+
+    ``max_tokens`` (OKC): the caller's Hopper cap (pooler / unpooler); None = GEMM_AG_MAX_TOKENS."""
     capability = torch.cuda.get_device_capability(device)
     if capability == (10, 3):
         return True
     from sglang.kernels.ops.muse_spark_v12.okc_patch import GEMM_AG_MAX_TOKENS, SW_GEMM_AG
 
+    cap = GEMM_AG_MAX_TOKENS if max_tokens is None else max_tokens
     return (
         SW_GEMM_AG
         and capability == (9, 0)
-        and (num_tokens is None or num_tokens <= GEMM_AG_MAX_TOKENS)
+        and (num_tokens is None or num_tokens <= cap)
     )
 
 
 def gemm_ag_supported(
-    comm: Optional[CustomAllReduceV2], x: torch.Tensor, weight: torch.Tensor
+    comm: Optional[CustomAllReduceV2],
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    max_tokens: Optional[int] = None,
 ) -> bool:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
@@ -84,7 +92,7 @@ def gemm_ag_supported(
             or (
                 comm.world_size in (4, 8)
                 and n in (4096, 8192)
-                and large_m_capable(x.device, m)
+                and large_m_capable(x.device, m, max_tokens)
             )
         )
         and weight.shape[1] == k
