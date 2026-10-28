@@ -1,11 +1,15 @@
 """OKC verify-step glue (serving/kernels/verify-glue): small fused replacements for torch chains, each bit-identical
 to the chain it replaces."""
 
+import logging
 from typing import Optional, Tuple
 
 import torch
 
 from sglang.kernels.ops.muse_spark_v12 import okc_patch as _sw
+
+logger = logging.getLogger(__name__)
+_logged_tail = False
 
 
 def tail_boundary(layer, stream: torch.Tensor, ffn_output: torch.Tensor, final_norm) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -44,4 +48,8 @@ def tail_boundary(layer, stream: torch.Tensor, ffn_output: torch.Tensor, final_n
     stream_bf16 = torch.empty_like(ffn_output)
     glue_ext().tail_boundary(ffn_output, stream, w_post, float(post.eps), alpha, beta, w_final,
                              float(final_norm.eps), out, stream_bf16)
+    global _logged_tail
+    if not _logged_tail:
+        _logged_tail = True
+        logger.info("OKC tail boundary active (first M=%d).", m)
     return stream_bf16, out
