@@ -58,7 +58,7 @@ def glue_ext():
 # d = double.
 _PG_SIG = {"align": "TTTTTTTTTiiii", "tiles": "TTTTiiiii", "rep_assign": "TTTTii", "rep_split": "TTTTTTii",
            "gather": "TTTTii", "route": "TTTTTTiiii", "gather_norm": "TTdTTTiii", "gg1": "TTTTTTiiii",
-           "gg2": "TTTTTTiiii", "set_snake_max_t": "i"}
+           "gg2": "TTTTTTiiii", "set_snake_max_t": "i", "ag_rows": "TTTTTTTiiiiii"}
 _ARG = {"T": "torch::Tensor", "i": "int64_t", "d": "double"}
 
 

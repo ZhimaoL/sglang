@@ -16,7 +16,7 @@ replica).
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T
+from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow64_ext, pg_narrow_ext
 
 _BLOCK_M = 256
@@ -136,6 +136,16 @@ def align_local(ids, expert_map=None, n_local=32, block_m=_BLOCK_M):
                    numel, block_m, n_local, n_global)
     return local_ids, sorted_ids, block_experts, n_padded
 
+
+
+def ag_rows(comm, x, scores, ids):
+    """OKC_SP_AG_PUSH: x [S, 4096] bf16 + scores [S, 8] fp32 + ids [S, 8] int32 of every rank -> ([world S, 4096],
+    [world S, 8], [world S, 8]) in rank order, one launch on CustomAllReduceV2's push plane (pg_ag_rows)."""
+    w, s = comm.world_size, x.shape[0]
+    out, osc, oid = x.new_empty((w * s, 4096)), scores.new_empty((w * s, 8)), ids.new_empty((w * s, 8))
+    pg_ext().ag_rows(x, scores, ids, out, osc, oid, comm._push_counter, comm._push_workspaces[comm.rank].data_ptr(),
+                     comm._push_multicast_ptr, w * comm.max_push_size, comm.rank, w, 1 if SW_PDL else 0)
+    return out, osc, oid
 
 def rep_table(home_rank, local_slot, rep_order, rep_rank):
     """int32 [256 + n] table of pg rep_assign (see _cuda_src_pg.py): home_rank [256], local_slot [256] (this rank's slot
