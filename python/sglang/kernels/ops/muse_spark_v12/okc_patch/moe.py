@@ -170,15 +170,37 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
     return None
 
 
-def pg_routes(layer, x, topk_ids, post_expert_norm):
-    """The pg half of maybe_forward for the SP MoE pipeline (okc_patch/sp_moe_ovl.py): x [T, H] already
-    pre-expert-normed -> (y [T, 8, H] per-route outputs, local slot ids [T, 8], -1 = not this rank's expert);
-    finalize_routes then combines any row range. Only for pg-only layers (the pipeline checks)."""
+def pg_prep(layer, topk_ids):
+    """For the SP MoE pipeline (okc_patch/sp_moe_ovl.py): the route alignment of pg, which needs only the top-k ids,
+    so it can run while the token rows are still in flight -> (local slot ids [T, 8], -1 = not this rank's expert,
+    and moe_align_block_size's sorted ids / block experts / padded count)."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+
+    local_ids = topk_ids.to(torch.int32)
+    if layer._expert_map is not None:
+        local_ids = layer._expert_map[local_ids]
+    local_ids = local_ids.contiguous()
+    # Marlin's alignment convention: global expert count with -1 for non-local routes.
+    align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
+    return (local_ids, *moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts))
+
+
+def pg_run(layer, x, prep, post_expert_norm):
+    """pg on x [T, H] (pre-expert-normed) with pg_prep's alignment -> y [T, 8, H] per-route outputs; finalize_routes
+    then combines any row range. pg-only layers (the pipeline checks), so a decline is an error."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
     state = layer._okc_moe_state
-    decline = _decline_reason(layer, x, topk_ids, post_expert_norm, state)
+    local_ids, sorted_ids, block_experts, n_padded = prep
+    decline = _decline_reason(layer, x, local_ids, post_expert_norm, state)
     if decline is not None:
         raise RuntimeError(f"OKC pg-only MoE layer cannot run this batch: {decline}")
-    return _pg_routes(layer, x.contiguous(), topk_ids, state)
+    y = pg_moe.grouped_pg(
+        x.contiguous(), sorted_ids, block_experts, n_padded,
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
+    )
+    return y.view(x.shape[0], 8, x.shape[1])
 
 
 def finalize_routes(layer, y, topk_scores, local_ids):
@@ -201,24 +223,11 @@ def finalize_routes(layer, y, topk_scores, local_ids):
 
 
 def _moe_pg(layer, x, topk_scores, topk_ids, state):
-    y, local_ids = _pg_routes(layer, x, topk_ids, state)
-    return finalize_routes(layer, y, topk_scores, local_ids)
-
-
-def _pg_routes(layer, x, topk_ids, state):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
-    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-    num_tokens, size_k = x.shape
-    local_ids = topk_ids.to(torch.int32)
-    if layer._expert_map is not None:
-        local_ids = layer._expert_map[local_ids]
-    local_ids = local_ids.contiguous()
-    # Marlin's alignment convention: global expert count with -1 for non-local routes.
-    align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
-    sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts)
+    prep = pg_prep(layer, topk_ids)
     y = pg_moe.grouped_pg(
-        x, sorted_ids, block_experts, n_padded,
+        x, *prep[1:],
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
     )
-    return y.view(num_tokens, 8, size_k), local_ids
+    return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, prep[0])
