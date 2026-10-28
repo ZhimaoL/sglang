@@ -41,9 +41,10 @@ MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
 PG_NARROW_MIN_T = int(os.environ.get("OKC_PG_NARROW_MIN_T", "1"))
 PG_NARROW_MAX_T = int(os.environ.get("OKC_PG_NARROW_MAX_T", "3072"))
 # st pair (okc_patch/st_moe.py: the same packs read by mma.sync n8 tiles) on pg-only layers at T <=
-# OKC_MOE_ST_MAX_TOKENS (verify bs 1..4); OKC_MOE_ST_PDL launches its down kernel with PDL.
+# OKC_MOE_ST_MAX_TOKENS (verify bs 1..8); OKC_MOE_ST_PDL launches its down kernel with PDL.
 SW_MOE_ST = _flag("OKC_SW_MOE_ST", "1")
-MOE_ST_MAX_TOKENS = min(32, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "32")))
+# 64: st beats the narrow small front at T 40..64 by 9-15 % (smallt-moe LOG E17); its table holds 512 routes.
+MOE_ST_MAX_TOKENS = min(64, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "64")))
 MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 
 
