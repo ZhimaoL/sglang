@@ -64,6 +64,9 @@ MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 SW_ST_NORM_FOLD = _flag("OKC_SW_ST_NORM_FOLD", "1")
 # st runs pg_rep_assign's balancer (or the home map) in its own CTAs, saving that launch (bit-identical).
 SW_ST_REP_FOLD = _flag("OKC_SW_ST_REP_FOLD", "1")
+# st's per-call fixed cost (smallt-moe LOG E26), bits: 1 cost-balanced slab ranges, 2 K2 reads K1's routing table,
+# 4 the router's route kernel prefetches the layer's replica table and pre-expert norm weight into L2
+ST_FIXED = int(os.environ.get("OKC_ST_FIXED", "7"))
 
 
 # Verify-side kernel stack (kernel-track grafts): fused sliding-window / full attention for decode and verify,
@@ -268,7 +271,7 @@ RIDE_CORE = _flag("OKC_RIDE_CORE", "1")
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
+           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD", "ST_FIXED",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",

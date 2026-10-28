@@ -31,10 +31,14 @@ def _empty(dtype, device):
     return t
 
 
-def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False, norm_weight=None, norm_eps=0.0, rep=None):
+TAB_WORDS = 1280   # >= sizeof(stk::Tab) / 4 (the host checks)
+
+
+def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False, norm_weight=None, norm_eps=0.0, rep=None, fixed=0):
     """x [T, 4096] bf16 (T <= 128), local_ids [T, 8] int32 (-1 = not local) -> y [T*8, 4096] bf16 per-route expert
     outputs with pg's scaling (rows of non-local routes stay unwritten): the contract of pg_moe.grouped_pg.
-    rep = (table, rank, passes): local_ids are global ids, the kernels run pg_rep_assign -> (y, its slots)."""
+    rep = (table, rank, passes): local_ids are global ids, the kernels run pg_rep_assign -> (y, its slots).
+    fixed (OKC_ST_FIXED bits): 1 cost-balanced slab ranges, 2 K2 reads K1's routing table."""
     numel = local_ids.numel()
     h = torch.empty((h_rows(numel, wsf13.shape[0]), 4096), dtype=torch.bfloat16, device=x.device)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
@@ -42,6 +46,8 @@ def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False, norm_weight=None, 
         norm_weight = _empty(torch.bfloat16, x.device)
     tab, me, passes = rep if rep is not None else (_empty(torch.int32, x.device), 0, 0)
     lids = torch.empty(local_ids.shape, dtype=torch.int32, device=x.device) if rep is not None else tab
+    tab_io = (torch.empty((TAB_WORDS,), dtype=torch.int32, device=x.device) if fixed & 2
+              else _empty(torch.int32, x.device))
     st_ext().st_moe(x, local_ids.reshape(-1), wsf13, gs13, wsf2, h, y, 1 if pdl else 0, norm_weight, float(norm_eps),
-                    tab, me, 1 if passes else 0, lids)
+                    tab, me, 1 if passes else 0, lids, tab_io, fixed & 3)
     return y if rep is None else (y, lids)

@@ -108,7 +108,7 @@ DINL void ktile(float acc[4], const uint4 w, const sf_t sfp, const unsigned (&b)
     }
 }
 
-struct Tab {
+struct __align__(16) Tab {
     int nva;
     int va_e[VAMAX];
     int va_n[VAMAX];
@@ -245,7 +245,7 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
                                                    const int* __restrict__ ids, int numel, int nl, int pdl,
                                                    const __nv_bfloat16* __restrict__ gamma, float eps,
                                                    const int* __restrict__ rtab, int n_rep, int me, int passes,
-                                                   int* __restrict__ lids) {
+                                                   int* __restrict__ lids, int* __restrict__ tab_io, int flags) {
     constexpr int NWT = KIND == 1 ? 64 : 32;
     constexpr int LSPE = KIND == 1 ? 9 : 8;            // log2 slabs per pass (NWT x 8 slabs)
     __shared__ Tab tb;
@@ -266,13 +266,44 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
         mbar_init(smem_u32(&bars[R + tid]), 32);
     }
     if (tid == R || tid == R + 1) mbar_init(smem_u32(&s_xbar[tid - R]), 1);
-    if (rtab != nullptr) rep_owner<RPT>(ids, numel, rtab, n_rep, passes, s_rtab, s_rcnt, s_rown, s_rord, s_rload);
-    build_tab(ids, numel, nl, KIND == 1 ? gs : nullptr, tb, s_wcnt, s_vbase, rtab != nullptr ? s_rtab : nullptr,
-              s_rown, me, KIND == 1 && blockIdx.x == 0 ? lids : nullptr);   // ends with __syncthreads
+    // flags & 2: K1's CTA 0 publishes the table (tab_io) and K2 reads it after its PDL wait instead of building it
+    // again: K2 cannot share an SM with K1, so its CTAs on K1's last SMs start after K1 ends and their build was exposed
+    const bool share = (flags & 2) && tab_io != nullptr;
+    if (KIND == 2 && share) {
+        if (pdl) pdl_wait();                           // K1 (and its table) complete from here on
+        for (int i = tid; i < (int)(sizeof(Tab) / 16); i += NTHR)
+            reinterpret_cast<uint4*>(&tb)[i] = reinterpret_cast<const uint4*>(tab_io)[i];
+        __syncthreads();
+    } else {
+        if (rtab != nullptr) rep_owner<RPT>(ids, numel, rtab, n_rep, passes, s_rtab, s_rcnt, s_rown, s_rord, s_rload);
+        build_tab(ids, numel, nl, KIND == 1 ? gs : nullptr, tb, s_wcnt, s_vbase, rtab != nullptr ? s_rtab : nullptr,
+                  s_rown, me, KIND == 1 && blockIdx.x == 0 ? lids : nullptr);   // ends with __syncthreads
+        if (KIND == 1 && share && blockIdx.x == 0)
+            for (int i = tid; i < (int)(sizeof(Tab) / 16); i += NTHR)
+                reinterpret_cast<uint4*>(tab_io)[i] = reinterpret_cast<const uint4*>(&tb)[i];
+    }
 
     const int U = tb.nva << LSPE;
-    const int s0 = (int)(((long long)U * blockIdx.x) / gridDim.x);
-    const int nslab = (int)(((long long)U * (blockIdx.x + 1)) / gridDim.x) - s0;
+    int s0 = (int)(((long long)U * blockIdx.x) / gridDim.x), s1 = (int)(((long long)U * (blockIdx.x + 1)) / gridDim.x);
+    if (flags & 1) {
+        // ranges of equal cost: a pass boundary inside a range costs CSW / 8 slabs (K1 with the norm fold restages and
+        // rebuilds B there, ~2.5 slabs; elsewhere ~0.2), so the CTAs that cross one no longer finish last
+        const int CSW = KIND == 1 && gamma != nullptr ? 20 : 2;
+        auto cost = [&](int s) -> long long { return s <= 0 ? 0LL : 8LL * s + (long long)CSW * ((s - 1) >> LSPE); };
+        const long long F = cost(U);
+        auto bound = [&](int i) -> int {               // smallest s with cost(s) >= F * i / G
+            const long long y = F * i / gridDim.x;
+            int lo = 0, hi = U;
+            while (lo < hi) {
+                const int m = (lo + hi) >> 1;
+                if (cost(m) >= y) hi = m; else lo = m + 1;
+            }
+            return lo;
+        };
+        s0 = bound(blockIdx.x);
+        s1 = bound(blockIdx.x + 1);
+    }
+    const int nslab = s1 - s0;
     if (nslab <= 0) {
         if (KIND == 2 && pdl) pdl_wait();              // completion still implies K1's
         return;
@@ -452,7 +483,7 @@ static int st_num_sms() {
 // an empty tensor (ids = local slots)
 void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tensor gs13, torch::Tensor wsf2,
             torch::Tensor h, torch::Tensor y, int64_t pdl, torch::Tensor gamma, double eps, torch::Tensor tab,
-            int64_t me, int64_t passes, torch::Tensor lids) {
+            int64_t me, int64_t passes, torch::Tensor lids, torch::Tensor tab_io, int64_t flags) {
     const int numel = (int)ids.numel();
     TORCH_CHECK(numel <= stk::NUMEL_MAX && numel == x.size(0) * 8 && x.size(1) == stk::H, "st: T <= 128, top-8, H 4096");
     TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous() && x.is_contiguous(), "st: int32 ids, contiguous x");
@@ -474,6 +505,9 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
                 "st: replica table int32 [256 + n_rep], rank < 8, int32 lids like ids");
     const int* rp = rep ? tab.data_ptr<int>() : nullptr;
     int* lp = rep ? lids.data_ptr<int>() : nullptr;
+    TORCH_CHECK(tab_io.numel() == 0 || (tab_io.scalar_type() == at::kInt && tab_io.is_contiguous() &&
+                                        tab_io.numel() * 4 >= (int64_t)sizeof(stk::Tab)), "st: tab_io int32 >= Tab");
+    int* tp = tab_io.numel() > 0 ? tab_io.data_ptr<int>() : nullptr;
     const int G = st_num_sms();
     cudaStream_t st = at::cuda::getCurrentCUDAStream();
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
@@ -488,7 +522,7 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
     }
     stk::st_gemm<1><<<G, stk::NTHR, fold ? stk::XSTAGE_BYTES : 0, st>>>(xp, reinterpret_cast<const char*>(wsf13.data_ptr()),
                                             gs13.data_ptr<float>(), hp, ip, numel, nl, (int)pdl, gp, (float)eps,
-                                            rp, n_rep, (int)me, (int)passes, lp);
+                                            rp, n_rep, (int)me, (int)passes, lp, tp, (int)flags);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (pdl) {
         cudaLaunchConfig_t cfg = {};
@@ -504,10 +538,11 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
         C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, stk::st_gemm<2>, (const __nv_bfloat16*)hp,
                                           reinterpret_cast<const char*>(wsf2.data_ptr()), (const float*)nullptr, yp, ip,
                                           numel, nl, 1, (const __nv_bfloat16*)nullptr, 0.f, rp, n_rep, (int)me,
-                                          (int)passes, (int*)nullptr));
+                                          (int)passes, (int*)nullptr, tp, (int)flags));
     } else {
         stk::st_gemm<2><<<G, stk::NTHR, 0, st>>>(hp, reinterpret_cast<const char*>(wsf2.data_ptr()), nullptr, yp, ip,
-                                                numel, nl, 0, nullptr, 0.f, rp, n_rep, (int)me, (int)passes, nullptr);
+                                                numel, nl, 0, nullptr, 0.f, rp, n_rep, (int)me, (int)passes, nullptr,
+                                                tp, (int)flags);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }

@@ -214,13 +214,28 @@ def _moe_st(layer, x, topk_scores, topk_ids, state, norm_weight=None, norm_eps=0
     ids = topk_ids if rep is not None else local_routes(layer, topk_ids)
     y = st_moe.grouped_st(
         x, ids, wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.MOE_ST_PDL,
-        norm_weight=norm_weight, norm_eps=norm_eps, rep=rep,
+        norm_weight=norm_weight, norm_eps=norm_eps, rep=rep, fixed=_sw.ST_FIXED,
     )
     if rep is not None:
         y, local_ids = y
     else:
         local_ids = ids
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
+
+
+def l2_prefetch(layer, pre_expert_norm):
+    """The st path's static per-layer inputs the router's route kernel prefetches into L2 (OKC_ST_FIXED & 4): the
+    replica table and the pre-expert norm weight; () when not applicable."""
+    pf = getattr(layer, "_okc_l2_pf", None)
+    if pf is None:
+        if not (_sw.ST_FIXED & 4) or getattr(layer, "_okc_moe_state", None) is None:
+            return ()
+        pf = [t for t in (getattr(layer, "_okc_rep_table", None),) if t is not None]
+        w = pre_expert_norm._get_effective_weight() if _sw.SW_ST_NORM_FOLD and pre_expert_norm is not None else None
+        if w is not None and (w is pre_expert_norm.weight or w is getattr(pre_expert_norm, "_frozen_weight", None)):
+            pf.append(w)                               # a persistent tensor (not one computed per call)
+        pf = layer._okc_l2_pf = tuple(pf)
+    return pf
 
 
 def _st_rep(layer, topk_ids):

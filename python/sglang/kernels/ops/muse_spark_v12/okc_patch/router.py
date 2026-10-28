@@ -158,8 +158,9 @@ def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
     return logits
 
 
-def route_small(gate, hidden_states, op, top_k):
-    """op's (topk_scores, topk_ids, packed ids) from the partials in one launch, bit-identical; None = declined."""
+def route_small(gate, hidden_states, op, top_k, prefetch=()):
+    """op's (topk_scores, topk_ids, packed ids) from the partials in one launch, bit-identical; None = declined.
+    prefetch: up to 2 tensors the kernel's first CTA pulls into L2 (the MoE block's static inputs)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL
     from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import route_ext
 
@@ -177,6 +178,7 @@ def route_small(gate, hidden_states, op, top_k):
     tp = torch.empty((tokens, 8), dtype=torch.int32, device=part.device)
     mult = op.router_output_multiplier
     eps = op.router_score_division_eps
+    pf = list(prefetch)[:2] + [bias[:0]] * (2 - len(prefetch[:2]))
     route_ext().route(part, bias, tw, ti, tp, tokens, sk, float(mult if mult is not None else 1.0),
-                      float(op.route_scale), float(eps if eps is not None else 0.0), 1 if SW_PDL else 0)
+                      float(op.route_scale), float(eps if eps is not None else 0.0), 1 if SW_PDL else 0, *pf)
     return tw, ti, tp

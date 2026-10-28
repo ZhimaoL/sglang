@@ -132,10 +132,10 @@ def st_ext():
 
                 # bf16 scales and the 64-slot table (the lane's okc_st_moe_c1 reads 8-bit codes, 32 slots)
                 _ST_EXT = load_inline(
-                    name="okc_st_moe_c8_s16_e64",
+                    name="okc_st_moe_c9_s16_e64",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, int64_t, torch::Tensor, double, torch::Tensor, "
-                    "int64_t, int64_t, torch::Tensor);",
+                    "int64_t, int64_t, torch::Tensor, torch::Tensor, int64_t);",
                     cuda_sources=_st_src._CUDA_SRC,
                     functions=["st_moe"],
                     extra_cuda_cflags=[
@@ -159,9 +159,9 @@ def route_ext():
 
                 # no --use_fast_math, as reduce_k<2> and the routing kernel
                 _ROUTE_EXT = load_inline(
-                    name="okc_route_c8",
+                    name="okc_route_c9",
                     cpp_sources="void route(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "int64_t, int64_t, double, double, double, int64_t);",
+                    "int64_t, int64_t, double, double, double, int64_t, torch::Tensor, torch::Tensor);",
                     cuda_sources=_CUDA_SRC,
                     functions=["route"],
                     extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],

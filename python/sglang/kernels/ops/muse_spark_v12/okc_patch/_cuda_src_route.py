@@ -55,11 +55,15 @@ __device__ __forceinline__ void cp16(void* sdst, const float* gsrc) {
 template <int SK>
 __global__ void __launch_bounds__(64) route_k(const float* __restrict__ P, int T, const float* __restrict__ bias,
                                               float* __restrict__ tw, int* __restrict__ ti, int* __restrict__ tp,
-                                              float mult, float scale, float eps) {
+                                              float mult, float scale, float eps, const char* pf0, int n0,
+                                              const char* pf1, int n1) {
   constexpr int EPL = 8, TOPK = 8, G = 128;
   __shared__ float4 s_sum[2][32];
   __shared__ float4 s_p[SK][2][32];
   const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, token = blockIdx.x;
+  if (token == 0)   // the MoE's static per-layer inputs into L2 ahead of st (its first loads were HBM latency)
+    for (int i = threadIdx.x * 128; i < n0 + n1; i += 64 * 128)
+      asm volatile("prefetch.global.L2 [%0];" :: "l"(i < n0 ? pf0 + i : pf1 + (i - n0)));
   pdl_wait();
   pdl_trigger();
   {
@@ -146,7 +150,7 @@ __global__ void __launch_bounds__(64) route_k(const float* __restrict__ P, int T
 
 // P [SK, T, 256] fp32 split-K partials -> tw [T, 8] fp32, ti / tp [T, 8] int32
 void route(torch::Tensor P, torch::Tensor bias, torch::Tensor tw, torch::Tensor ti, torch::Tensor tp, int64_t T,
-           int64_t SK, double mult, double scale, double eps, int64_t pdl) {
+           int64_t SK, double mult, double scale, double eps, int64_t pdl, torch::Tensor pf0, torch::Tensor pf1) {
   // router.route_small allocates the outputs; it checks bias (fp32 [256], contiguous)
   TORCH_CHECK(P.is_contiguous() && P.numel() == SK * T * 256 && (SK == 16 || SK == 32), "okc route: P [16|32, T, 256]");
   if (T == 0) return;
@@ -162,6 +166,8 @@ void route(torch::Tensor P, torch::Tensor bias, torch::Tensor tw, torch::Tensor 
   auto k = SK == 16 ? okcr::route_k<16> : okcr::route_k<32>;
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k, (const float*)P.data_ptr<float>(), (int)T,
                                     (const float*)bias.data_ptr<float>(), tw.data_ptr<float>(), ti.data_ptr<int>(),
-                                    tp.data_ptr<int>(), (float)mult, (float)scale, (float)eps));
+                                    tp.data_ptr<int>(), (float)mult, (float)scale, (float)eps,
+                                    (const char*)pf0.data_ptr(), (int)(pf0.numel() * pf0.element_size()),
+                                    (const char*)pf1.data_ptr(), (int)(pf1.numel() * pf1.element_size())));
 }
 """

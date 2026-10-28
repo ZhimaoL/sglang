@@ -43,6 +43,7 @@ from sglang.kernels.ops.muse_spark_v12 import okc_patch
 if okc_patch.ANY_ATTN:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import attention as okc_attention
 if okc_patch.SW_ROUTER:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
 if okc_patch.SW_AR_NORM:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import ar_norm as okc_ar_norm
@@ -937,7 +938,8 @@ class MuseSpark1xMoE(nn.Module):
             # route_small: reduce + routing in one launch (SP keeps the logits for its dispatcher)
             if okc_patch.SW_ROUTER and okc_patch.SW_ROUTE_FUSED and not sp_active:
                 routed_small = okc_router.route_small(
-                    self.gate, hidden_states, self._routing_op(), self.top_k
+                    self.gate, hidden_states, self._routing_op(), self.top_k,
+                    prefetch=okc_moe.l2_prefetch(self.experts, self.pre_expert_norm),
                 )
             if routed_small is not None:
                 topk_scores, topk_ids, packed_topk_ids = routed_small
