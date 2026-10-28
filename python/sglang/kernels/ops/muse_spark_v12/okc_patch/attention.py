@@ -44,6 +44,7 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_VFG,
     SW_VFG_FULL1,
     SW_WST,
+    VP2_MAX_BS,
     WST_ACC16,
     WST_BAL_MIN_BS,
     WST_MIN_BS,
@@ -396,8 +397,9 @@ _VFG_WS = {}
 def _vfg_attn(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
               bs, window, kv_scale, theta, sm_scale, qk_factor, eps):
     """Verify blocks (q_len 8) on the attention lane's bank v16c_m7g_rlx3 routes (`_vph` / `_vfg`):
-      sliding, bs 1:  VP2 (two 16-CTA clusters, one per kv head; window slices merged in-cluster, no second kernel)
-      sliding, bs > 1 and full, bs 1: VFG, SMs // bs splits per request + the vfgm (>= 32 splits) / vfgm2 merge kernel
+      sliding, bs <= max(1, OKC_VP2_MAX_BS): VP2 (two 16-CTA clusters per request, one per kv head; window slices merged
+                      in-cluster, no second kernel)
+      sliding, larger bs, and full, bs 1: VFG, SMs // bs splits per request + the vfgm (>= 32 splits) / vfgm2 merge kernel
     All of them build q (RMSNorm, RoPE from the fp32 inv_freq table on sliding layers, e4m3) and the block's new k / v
     cache rows in-kernel and write RMSNorm(O) x sigmoid(gate). Split-KV partials are fp32 (global records, VP2 owner
     blocks). qkv rows must be the contiguous [bs * 8, 2304] projection (the kernels' row stride is the TP8 width).
@@ -422,9 +424,10 @@ def _vfg_attn(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     c2 = qk_factor * sm_scale * kv_scale * LOG2E
     stream = torch.cuda.current_stream().cuda_stream
     ext = vfg_ext()
-    if window and bs == 1:
-        ext.muse_vp2_launch(qkv.data_ptr(), page_table.data_ptr(), seq_pre.data_ptr(), cache_loc.data_ptr(),
-                            k_cache.data_ptr(), v_cache.data_ptr(), freq, out.data_ptr(), window, c2,
+    if window and bs <= max(1, VP2_MAX_BS):
+        ext.muse_vp2_launch(qkv.data_ptr(), page_table.data_ptr(), page_table.stride(0), seq_pre.data_ptr(),
+                            cache_loc.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), freq, out.data_ptr(), bs,
+                            window, c2,
                             1.0 / kv_scale, 1.0 / kv_scale, kv_scale, eps, 0, stream)
         return out
     ns = max(1, G // bs)
