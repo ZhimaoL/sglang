@@ -1098,6 +1098,17 @@ class MuseSpark1xMoE(nn.Module):
             tp_group.all_gather_into_tensor(full, shard)
             return full
 
+        # The pre-expert RMSNorm is per row: on the shard before the gather it costs 1/tp of normalizing every
+        # rank's copy of the whole chunk (16K chunk: 13 vs 85 us per layer), with the same values. pg-only and BF16
+        # experts apply it as a plain op; the FlashInfer path fuses it into its input quantization, so it keeps it.
+        state = getattr(self.experts, "_okc_moe_state", None)
+        prenorm_shard = (
+            okc_patch.SP_PRENORM_SHARD
+            and self.pre_expert_norm is not None
+            and (not self.nvfp4_checkpoint or (state is not None and state["pg_only"]))
+        )
+        if prenorm_shard:
+            expert_input = self.pre_expert_norm(expert_input)
         full_input = gather(expert_input)
         full_scores = gather(topk_scores)
         full_ids = gather(topk_ids)
@@ -1107,10 +1118,10 @@ class MuseSpark1xMoE(nn.Module):
                 full_scores,
                 full_ids,
                 self.experts.post_expert_norm,
-                pre_expert_norm=self.pre_expert_norm,
+                pre_expert_norm=None if prenorm_shard else self.pre_expert_norm,
             )
         else:
-            if self.pre_expert_norm is not None:
+            if self.pre_expert_norm is not None and not prenorm_shard:
                 full_input = self.pre_expert_norm(full_input)
             output = self.experts(
                 full_input, full_scores, full_ids, self.experts.post_expert_norm
