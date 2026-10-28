@@ -667,7 +667,7 @@ __global__ void __launch_bounds__(256) pg_gather_norm(const __nv_bfloat16* __res
     const int nv = eff_nv<WSET>(ent >> 20);
     const int* sid = sorted_ids + pm * XNT;
     char* img = xg + (size_t)pm * NKT * XB;
-    for (int t = w; t < nv; t += 8) {
+    for (int t = w + 8 * blockIdx.z; t < nv; t += 8 * gridDim.z) {   // gridDim.z CTAs share a block's rows
         const int rid = sid[t];
         uint2 o[4] = {make_uint2(0u, 0u), make_uint2(0u, 0u), make_uint2(0u, 0u), make_uint2(0u, 0u)};
         if (rid < numel) {
@@ -1277,15 +1277,16 @@ void align(torch::Tensor ids, torch::Tensor emap, torch::Tensor local_ids, torch
 }
 
 void gather_norm(torch::Tensor x, torch::Tensor gamma, double eps, torch::Tensor xg, torch::Tensor sorted_ids,
-                 torch::Tensor live, int64_t numel, int64_t pdl) {
+                 torch::Tensor live, int64_t numel, int64_t pdl, int64_t split) {
     TORCH_CHECK(x.size(1) == pgk::NKT * 64 && numel == x.size(0) * 8 && x.is_contiguous(), "pg gather: K 4096, topk 8");
     TORCH_CHECK(gamma.numel() == pgk::NKT * 64 && gamma.scalar_type() == at::kBFloat16 && gamma.is_contiguous(),
                 "pg gather_norm: bf16 [4096] weight");
     const int npm = live.size(0) - 1;
+    const dim3 grid(pgk::NKT / 8, npm, split > 1 ? (unsigned)split : 1u);   // split: CTAs per block's token rows
 #ifdef PGN_WSET
-    pg_launch(pgk::pg_gather_norm<PGN_WSET>, dim3(pgk::NKT / 8, npm), dim3(256), 0, pdl != 0,
+    pg_launch(pgk::pg_gather_norm<PGN_WSET>, grid, dim3(256), 0, pdl != 0,
 #else   // PGN_WSET
-    pg_launch(pgk::pg_gather_norm<3>, dim3(pgk::NKT / 8, npm), dim3(256), 0, pdl != 0,
+    pg_launch(pgk::pg_gather_norm<3>, grid, dim3(256), 0, pdl != 0,
 #endif  // PGN_WSET
               reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
               reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr()), (float)eps,
