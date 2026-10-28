@@ -618,27 +618,44 @@ __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids
 // r; then the replicated experts by route count (descending, ties: lower id), each in turn: x = clamp((load[home] +
 // c[e] - load[replica]) / 2, 0, c[e]); the replica takes e's routes of the tokens before cut[e], the end of the first
 // sb-token block at which e's cumulative count reaches x (0 if x is 0), the home the rest, and both loads grow by their
-// parts. pg_rep_cut (one CTA) writes cut[256] (0 = the home takes every route); pg_rep_split maps route i (token i / k)
-// to its local slot on this rank, or -1.
-__global__ void __launch_bounds__(1024) pg_rep_cut(const int* __restrict__ ids, int n_routes, int topk,
-                                                   const int* __restrict__ tab, int n_rep, int sb, int nb,
+// parts. pg_rep_count (one CTA per sb-token block) counts the routes of every expert (global atomics into cnt, zeroed by
+// the caller) and of each replicated expert per block (bc[j][b]: the block is the CTA's own, so no atomics); pg_rep_cut
+// (one CTA) takes the decision and writes cut[256] (0 = the home takes every route); pg_rep_split maps route i (token
+// i / k) to its local slot on this rank, or -1.
+__global__ void __launch_bounds__(256) pg_rep_count(const int* __restrict__ ids, int n_routes, int topk,
+                                                    const int* __restrict__ tab, int n_rep, int sb, int nb,
+                                                    int* __restrict__ cnt, int* __restrict__ bc) {
+    __shared__ int c_s[256], ridx[256], b_s[64];
+    const int t = threadIdx.x, b = blockIdx.x;
+    c_s[t] = 0;
+    ridx[t] = -1;
+    if (t < 64) b_s[t] = 0;
+    __syncthreads();
+    if (t < n_rep) ridx[tab[256 + t]] = t;
+    __syncthreads();
+    const int i1 = min(n_routes, (b + 1) * sb * topk);
+    for (int i = b * sb * topk + t; i < i1; i += 256) {
+        const int e = ids[i];
+        if ((unsigned)e >= 256u) continue;
+        atomicAdd(&c_s[e], 1);
+        if (ridx[e] >= 0) atomicAdd(&b_s[ridx[e]], 1);
+    }
+    __syncthreads();
+    if (c_s[t]) atomicAdd(&cnt[t], c_s[t]);
+    if (t < n_rep) bc[t * nb + b] = b_s[t];
+}
+
+__global__ void __launch_bounds__(1024) pg_rep_cut(const int* __restrict__ tab, int n_rep, int sb, int nb,
+                                                   const int* __restrict__ cnt_g, const int* __restrict__ bc_g,
                                                    int* __restrict__ cut) {
     extern __shared__ int bc[];                 // [n_rep][nb] route counts per sb-token block, then cumulative
     __shared__ int cnt[256], ridx[256], load[8];
     const int t = threadIdx.x;
-    if (t < 256) { cnt[t] = 0; ridx[t] = -1; }
+    if (t < 256) { cnt[t] = cnt_g[t]; ridx[t] = -1; }
     if (t < 8) load[t] = 0;
-    for (int i = t; i < n_rep * nb; i += 1024) bc[i] = 0;
+    for (int i = t; i < n_rep * nb; i += 1024) bc[i] = bc_g[i];
     __syncthreads();
     if (t < n_rep) ridx[tab[256 + t]] = t;
-    __syncthreads();
-    for (int i = t; i < n_routes; i += 1024) {
-        const int e = ids[i];
-        if ((unsigned)e >= 256u) continue;
-        atomicAdd(&cnt[e], 1);
-        const int j = ridx[e];
-        if (j >= 0) atomicAdd(&bc[j * nb + (i / topk) / sb], 1);
-    }
     __syncthreads();
     if (t < 256 && ridx[t] < 0) atomicAdd(&load[(tab[t] >> 8) & 7], cnt[t]);
     if (t < n_rep) {
@@ -727,20 +744,24 @@ void rep_assign(torch::Tensor ids, torch::Tensor tab, torch::Tensor out, int64_t
                                                        n_rep, (int)me, out.data_ptr<int>());
 }
 
-void rep_split(torch::Tensor ids, torch::Tensor tab, torch::Tensor cut, torch::Tensor out, int64_t me, int64_t sb) {
+void rep_split(torch::Tensor ids, torch::Tensor tab, torch::Tensor cnt, torch::Tensor bc, torch::Tensor cut,
+               torch::Tensor out, int64_t me, int64_t sb) {
     const int n_rep = (int)tab.size(0) - 256;
     const int topk = (int)ids.size(1), n_routes = (int)ids.numel();
     const int nb = (int)((ids.size(0) + sb - 1) / sb);
     const int smem = n_rep * nb * 4;
     TORCH_CHECK(tab.scalar_type() == at::kInt && out.scalar_type() == at::kInt && ids.scalar_type() == at::kInt &&
-                cut.scalar_type() == at::kInt && cut.numel() == 256 && n_rep >= 0 && n_rep <= 64 &&
-                ids.is_contiguous() && out.is_contiguous() && out.numel() == ids.numel() && me >= 0 && me < 8 &&
-                nb >= 1 && smem <= 48 * 1024,
-                "pg rep_split: int32 ids [T, k], table [256 + n_rep <= 64], cut [256], out like ids, rank < 8, "
-                "n_rep x token blocks <= 12288");
+                cut.scalar_type() == at::kInt && cut.numel() == 256 && cnt.scalar_type() == at::kInt &&
+                cnt.numel() == 256 && bc.scalar_type() == at::kInt && bc.numel() >= n_rep * nb && n_rep >= 0 &&
+                n_rep <= 64 && ids.is_contiguous() && out.is_contiguous() && out.numel() == ids.numel() && me >= 0 &&
+                me < 8 && nb >= 1 && smem <= 48 * 1024,
+                "pg rep_split: int32 ids [T, k], table [256 + n_rep <= 64], cnt / cut [256] (cnt zeroed), "
+                "bc [n_rep x token blocks <= 12288], out like ids, rank < 8");
     auto stream = at::cuda::getCurrentCUDAStream();
-    pgk::pg_rep_cut<<<1, 1024, smem, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(), n_rep,
-                                               (int)sb, nb, cut.data_ptr<int>());
+    pgk::pg_rep_count<<<nb, 256, 0, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(), n_rep,
+                                              (int)sb, nb, cnt.data_ptr<int>(), bc.data_ptr<int>());
+    pgk::pg_rep_cut<<<1, 1024, smem, stream>>>(tab.data_ptr<int>(), n_rep, (int)sb, nb, cnt.data_ptr<int>(),
+                                               bc.data_ptr<int>(), cut.data_ptr<int>());
     const int grid = (n_routes + 255) / 256 < 4 * pg_num_sms() ? (n_routes + 255) / 256 : 4 * pg_num_sms();
     pgk::pg_rep_split<<<grid, 256, 0, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(),
                                                 cut.data_ptr<int>(), (int)me, out.data_ptr<int>());

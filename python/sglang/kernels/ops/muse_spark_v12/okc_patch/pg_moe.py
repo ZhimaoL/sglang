@@ -122,9 +122,11 @@ def split_replicas(topk_ids, tab, rank):
     while n_rep * -(-T // sb) > 12288:
         sb *= 2
     ids = topk_ids.to(torch.int32).contiguous()
+    cnt = torch.zeros((256,), dtype=torch.int32, device=ids.device)
+    bc = torch.empty((max(1, n_rep * -(-T // sb)),), dtype=torch.int32, device=ids.device)
     cut = torch.empty((256,), dtype=torch.int32, device=ids.device)
     out = torch.empty(ids.shape, dtype=torch.int32, device=ids.device)
-    pg_ext().rep_split(ids, tab, cut, out, rank, sb)
+    pg_ext().rep_split(ids, tab, cnt, bc, cut, out, rank, sb)
     return out
 
 
