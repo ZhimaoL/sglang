@@ -1103,6 +1103,9 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.post_attention_residual_gate,
             self.pre_feedforward_layernorm,
         )
+        # OKC (OKC_NORM_PREFETCH): at TP > 1 this boundary's predecessor is the o-proj all-reduce, so the norm may load
+        # the stream and its weights before griddepcontrol.wait
+        self._fused_attn_boundary._okc_prefetch_stream = get_parallel().tp_size > 1
         self._fused_ffn_boundary = None
         self._next_layer = None
         # OKC: the model's final norm, bound on the last layer only (not a submodule: the model owns it).

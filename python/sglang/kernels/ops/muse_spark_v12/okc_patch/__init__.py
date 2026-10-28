@@ -73,6 +73,9 @@ SW_PDL = _flag("OKC_SW_PDL", "1")
 # the o-proj all-reduce ~5 us early (SI bs1 per layer: norm 3.07 -> 3.90 us); without it the next kernel's launch is
 # exposed (1 GPU, _dot -> cluster norm: 7.96 -> 12.13 us per boundary). TP8 A/B: verify-glue dot_ar_norm_bench.py.
 PDL_DOT_TRIGGER = _flag("OKC_PDL_DOT_TRIGGER", "1")
+# Post-attention boundary (cluster norm_residual, M <= 32, TP > 1): load the fp32 stream and the weights before
+# griddepcontrol.wait; only the all-reduced branch loads after it (the o-proj AR writes nothing else and triggers last).
+NORM_PREFETCH = _flag("OKC_NORM_PREFETCH", "1")
 # DFlash context projection fc (5 x 8192 -> 8192, replicated 640 MiB bf16, 159 us per verify step) as a column-split
 # GEMM + the multicast all-gather (gemm_ag) at <= GEMM_AG_MAX_TOKENS tokens.
 SW_DFLASH_FC_AG = _flag("OKC_SW_DFLASH_FC_AG", "1")
@@ -113,7 +116,7 @@ ANY_ATTN = SW_ATTN or SW_FS
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS",
-           "SW_PG_SMALL", "SW_PDL", "PDL_DOT_TRIGGER", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_TAIL_NORM", "SW_ARGMAX_SPLIT",
+           "SW_PG_SMALL", "SW_PDL", "PDL_DOT_TRIGGER", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_TAIL_NORM", "SW_ARGMAX_SPLIT",
            "SW_CAND_AG_MERGE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "ANY_ATTN"]
