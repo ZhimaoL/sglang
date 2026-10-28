@@ -611,6 +611,92 @@ __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids
     }
 }
 
+// ------------------------------------------------------------------ replica balancer (prefill chunks)
+// At a long prefill every expert is active and a rank's pg time follows its routed tokens, so the routes of a replicated
+// expert are split between its two holders instead of handed to one. Every rank takes the same decision from the same
+// top-k ids (integer arithmetic only): c[e] = routes of expert e; load[r] = routes of the non-replicated experts homed on
+// r; then the replicated experts by route count (descending, ties: lower id), each in turn: x = clamp((load[home] +
+// c[e] - load[replica]) / 2, 0, c[e]); the replica takes e's routes of the tokens before cut[e], the end of the first
+// sb-token block at which e's cumulative count reaches x (0 if x is 0), the home the rest, and both loads grow by their
+// parts. pg_rep_cut (one CTA) writes cut[256] (0 = the home takes every route); pg_rep_split maps route i (token i / k)
+// to its local slot on this rank, or -1.
+__global__ void __launch_bounds__(1024) pg_rep_cut(const int* __restrict__ ids, int n_routes, int topk,
+                                                   const int* __restrict__ tab, int n_rep, int sb, int nb,
+                                                   int* __restrict__ cut) {
+    extern __shared__ int bc[];                 // [n_rep][nb] route counts per sb-token block, then cumulative
+    __shared__ int cnt[256], ridx[256], load[8];
+    const int t = threadIdx.x;
+    if (t < 256) { cnt[t] = 0; ridx[t] = -1; }
+    if (t < 8) load[t] = 0;
+    for (int i = t; i < n_rep * nb; i += 1024) bc[i] = 0;
+    __syncthreads();
+    if (t < n_rep) ridx[tab[256 + t]] = t;
+    __syncthreads();
+    for (int i = t; i < n_routes; i += 1024) {
+        const int e = ids[i];
+        if ((unsigned)e >= 256u) continue;
+        atomicAdd(&cnt[e], 1);
+        const int j = ridx[e];
+        if (j >= 0) atomicAdd(&bc[j * nb + (i / topk) / sb], 1);
+    }
+    __syncthreads();
+    if (t < 256 && ridx[t] < 0) atomicAdd(&load[(tab[t] >> 8) & 7], cnt[t]);
+    if (t < n_rep) {
+        int acc = 0;
+        for (int b = 0; b < nb; b++) { acc += bc[t * nb + b]; bc[t * nb + b] = acc; }
+    }
+    __syncthreads();
+    if (t == 0) {
+        int ord[64];
+        for (int j = 0; j < n_rep; j++) {       // insertion sort: count descending, expert id ascending
+            const int e = tab[256 + j];
+            int k = j;
+            while (k > 0 && (cnt[ord[k - 1]] < cnt[e] || (cnt[ord[k - 1]] == cnt[e] && ord[k - 1] > e))) {
+                ord[k] = ord[k - 1];
+                k--;
+            }
+            ord[k] = e;
+        }
+        for (int j = 0; j < n_rep; j++) {
+            const int e = ord[j], v = tab[e], h = (v >> 8) & 7, r = (v >> 12) & 7, c = cnt[e];
+            const int* cum = bc + ridx[e] * nb;
+            int x = (load[h] + c - load[r]) / 2;
+            x = x < 0 ? 0 : (x > c ? c : x);
+            int part = 0, cu = 0;
+            if (x > 0) {
+                int lo = 0, hi = nb - 1;        // first block with cum >= x (cum[nb - 1] = c >= x)
+                while (lo < hi) { const int mid = (lo + hi) >> 1; if (cum[mid] >= x) hi = mid; else lo = mid + 1; }
+                part = cum[lo];
+                cu = (lo + 1) * sb;
+            }
+            load[r] += part;
+            load[h] += c - part;
+            cnt[e] = -1 - cu;                   // stash the cut (cnt is no longer needed for e)
+        }
+    }
+    __syncthreads();
+    if (t < 256) cut[t] = ridx[t] >= 0 ? -1 - cnt[t] : 0;
+}
+
+__global__ void __launch_bounds__(256) pg_rep_split(const int* __restrict__ ids, int n_routes, int topk,
+                                                    const int* __restrict__ tab, const int* __restrict__ cut, int me,
+                                                    int* __restrict__ out) {
+    __shared__ int tabs[256], cuts[256];
+    tabs[threadIdx.x] = tab[threadIdx.x];
+    cuts[threadIdx.x] = cut[threadIdx.x];
+    __syncthreads();
+    for (int i = blockIdx.x * 256 + threadIdx.x; i < n_routes; i += gridDim.x * 256) {
+        const int e = ids[i];
+        int s = -1;
+        if ((unsigned)e < 256u) {
+            const int v = tabs[e];
+            const int owner = (i / topk) < cuts[e] ? (v >> 12) & 7 : (v >> 8) & 7;
+            if (owner == me && (v & 0xFF) != 0xFF) s = v & 0xFF;
+        }
+        out[i] = s;
+    }
+}
+
 }  // namespace pgk
 
 // ------------------------------------------------------------------ host
@@ -639,6 +725,25 @@ void rep_assign(torch::Tensor ids, torch::Tensor tab, torch::Tensor out, int64_t
     else
         pgk::pg_rep_assign<int><<<1, 256, 0, stream>>>(ids.data_ptr<int>(), (int)ids.numel(), tab.data_ptr<int>(),
                                                        n_rep, (int)me, out.data_ptr<int>());
+}
+
+void rep_split(torch::Tensor ids, torch::Tensor tab, torch::Tensor cut, torch::Tensor out, int64_t me, int64_t sb) {
+    const int n_rep = (int)tab.size(0) - 256;
+    const int topk = (int)ids.size(1), n_routes = (int)ids.numel();
+    const int nb = (int)((ids.size(0) + sb - 1) / sb);
+    const int smem = n_rep * nb * 4;
+    TORCH_CHECK(tab.scalar_type() == at::kInt && out.scalar_type() == at::kInt && ids.scalar_type() == at::kInt &&
+                cut.scalar_type() == at::kInt && cut.numel() == 256 && n_rep >= 0 && n_rep <= 64 &&
+                ids.is_contiguous() && out.is_contiguous() && out.numel() == ids.numel() && me >= 0 && me < 8 &&
+                nb >= 1 && smem <= 48 * 1024,
+                "pg rep_split: int32 ids [T, k], table [256 + n_rep <= 64], cut [256], out like ids, rank < 8, "
+                "n_rep x token blocks <= 12288");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    pgk::pg_rep_cut<<<1, 1024, smem, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(), n_rep,
+                                               (int)sb, nb, cut.data_ptr<int>());
+    const int grid = (n_routes + 255) / 256 < 4 * pg_num_sms() ? (n_routes + 255) / 256 : 4 * pg_num_sms();
+    pgk::pg_rep_split<<<grid, 256, 0, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(),
+                                                cut.data_ptr<int>(), (int)me, out.data_ptr<int>());
 }
 
 void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::Tensor live, int64_t numel) {

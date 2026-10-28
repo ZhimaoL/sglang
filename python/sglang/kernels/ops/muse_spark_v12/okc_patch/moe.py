@@ -3,7 +3,8 @@
 At T >= OKC_MOE_PG_MIN_TOKENS a captured layer runs pg_moe.grouped_pg and then the same finalize as
 _forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin. A pg-only layer (the
 default) runs pg at every T; with hot-expert replicas its forwards of <= OKC_MOE_REP_MAX_TOKENS tokens map the routes
-through pg_moe.assign_replicas instead of the static home map.
+through pg_moe.assign_replicas instead of the static home map, longer ones (OKC_MOE_REP_PREFILL) through
+pg_moe.split_replicas.
 The pg packs are re-encodings of the raw NVFP4 expert tensors, so maybe_capture_nvfp4_packs must run
 right before prepare_moe_nvfp4_layer_for_marlin repacks them in place.
 """
@@ -172,6 +173,25 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
     return None
 
 
+def local_routes(layer, topk_ids):
+    """[T, 8] global top-k ids -> [T, 8] int32 local expert slots on this rank, -1 where another rank computes the
+    route: the static home map, or with hot-expert replicas a per-forward balancer that every rank computes alike from
+    the same ids (T and the ids are the same on every rank: a TP batch, or the SP gathered chunk)."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
+    rep_table = getattr(layer, "_okc_rep_table", None)
+    if rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
+        # verify-sized: each active replicated expert to the holder with fewer active experts
+        return pg_moe.assign_replicas(topk_ids, rep_table, layer.replica_plan["me"])
+    if rep_table is not None and _sw.MOE_REP_PREFILL:
+        # prefill-sized: every expert is active; each replicated expert's routes split to level routed tokens
+        return pg_moe.split_replicas(topk_ids, rep_table, layer.replica_plan["me"])
+    local_ids = topk_ids.to(torch.int32)
+    if layer._expert_map is not None:
+        local_ids = layer._expert_map[local_ids]
+    return local_ids.contiguous()
+
+
 def _moe_pg(layer, x, topk_scores, topk_ids, state):
     from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
         fused_post_expert_norm_weighted_sum,
@@ -180,15 +200,7 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
     num_tokens, size_k = x.shape
-    rep_table = getattr(layer, "_okc_rep_table", None)
-    if rep_table is not None and num_tokens <= _sw.MOE_REP_MAX_TOKENS:
-        # T is the same on every rank (TP batch), so all ranks take this branch together.
-        local_ids = pg_moe.assign_replicas(topk_ids, rep_table, layer.replica_plan["me"])
-    else:
-        local_ids = topk_ids.to(torch.int32)
-        if layer._expert_map is not None:
-            local_ids = layer._expert_map[local_ids]
-        local_ids = local_ids.contiguous()
+    local_ids = local_routes(layer, topk_ids)
     # Marlin's alignment convention: global expert count with -1 for non-local routes.
     align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
     sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts)

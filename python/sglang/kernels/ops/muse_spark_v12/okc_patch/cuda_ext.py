@@ -35,13 +35,14 @@ def pg_ext():
                     _CUDA_SRC,
                 )
 
-                # The name changed with tiles' local-expert count and rep_assign (a shared name would rebuild
-                # over another tree's torch_extensions cache).
+                # The name changed with tiles' local-expert count, rep_assign and rep_split (a shared name would
+                # rebuild over another tree's torch_extensions cache).
                 _PG_EXT = load_inline(
-                    name="okc_pg_moe_c350_rep",
+                    name="okc_pg_moe_c350_rep2",
                     cpp_sources="void tiles(torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t);\n"
                     "void rep_assign(torch::Tensor, torch::Tensor, torch::Tensor, int64_t);\n"
+                    "void rep_split(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t);\n"
                     "void gather(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "int64_t);\n"
                     "void gg1(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
@@ -50,7 +51,7 @@ def pg_ext():
                     "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);\n"
                     "void set_snake_max_t(int64_t);",
                     cuda_sources=_CUDA_SRC,
-                    functions=["tiles", "gather", "gg1", "gg2", "set_snake_max_t", "rep_assign"],
+                    functions=["tiles", "gather", "gg1", "gg2", "set_snake_max_t", "rep_assign", "rep_split"],
                     extra_cuda_cflags=[
                         "-O3",
                         "--use_fast_math",

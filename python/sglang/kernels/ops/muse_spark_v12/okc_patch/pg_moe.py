@@ -112,6 +112,22 @@ def assign_replicas(topk_ids, tab, rank):
     return out
 
 
+def split_replicas(topk_ids, tab, rank):
+    """Prefill form of assign_replicas: [T, 8] global top-k ids -> [T, 8] int32 local slots on this rank (-1: another
+    rank computes the route), each replicated expert's routes split between its two holders at a token boundary so
+    their routed-token loads level (pg_rep_cut / pg_rep_split in _cuda_src_pg.py). Same decision on every rank."""
+    T = topk_ids.shape[0]
+    n_rep = tab.numel() - 256
+    sb = 64   # token block of the cut; coarser when the per-block counts would not fit the CTA's shared memory
+    while n_rep * -(-T // sb) > 12288:
+        sb *= 2
+    ids = topk_ids.to(torch.int32).contiguous()
+    cut = torch.empty((256,), dtype=torch.int32, device=ids.device)
+    out = torch.empty(ids.shape, dtype=torch.int32, device=ids.device)
+    pg_ext().rep_split(ids, tab, cut, out, rank, sb)
+    return out
+
+
 def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
     """x [T, 4096] bf16 -> y [T*8, 4096] bf16 per-route expert outputs (rows of non-local routes stay
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded
