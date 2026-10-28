@@ -1316,8 +1316,10 @@ class Scheduler(
             mid_chunk_enabled=bool(get_schedule().mid_chunk_prefill_admission),
             between_chunk_enabled=okc_patch.SW_BETWEEN_CHUNK,
             between_chunk_max_reqs=okc_patch.BETWEEN_CHUNK_MAX_REQS,
+            fold_enabled=okc_patch.SW_FOLLOWUP_ADMIT,
         )
         self._okc_between_batch = False
+        self._okc_fold_batch = False
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1364,6 +1366,7 @@ class Scheduler(
             block_size=int(get_spec().speculative_num_draft_tokens or 0),
             max_tokens=self.chunked_prefill_size,
         )
+        self.small_prefill_first.fold_rides_along = self.ride_along.enabled
         if self.ride_along.enabled:
             logger.info(
                 "Ride-along verify on (mode %d): running requests verify inside "
@@ -3817,6 +3820,7 @@ class Scheduler(
                     chunked_req=self.chunked_req,
                     has_waiting=bool(self.waiting_queue),
                     between_chunk=self._okc_between_batch,
+                    folded=self._okc_fold_batch,
                 )
 
         need_mlp_sync = self.require_mlp_sync
@@ -3988,6 +3992,7 @@ class Scheduler(
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         self._okc_between_batch = False
+        self._okc_fold_batch = False
         small_first = self.small_prefill_first.small_first_order(
             waiting_queue=self.waiting_queue,
             tree_cache=self.tree_cache,
@@ -4052,6 +4057,19 @@ class Scheduler(
                 self.page_size,
             )
             if adder.chunked_req_limit is None:
+                # Follow-up admission above the between-chunk load cap: the small newest arrivals join this chunk pass.
+                fold = self.small_prefill_first.fold_order(
+                    chunked_req=self.chunked_req,
+                    waiting_queue=self.waiting_queue,
+                    tree_cache=self.tree_cache,
+                    budget=adder.rem_chunk_tokens or 0,
+                    page_size=self.page_size,
+                    num_running=running_batch.batch_size(),
+                )
+                if fold is not None:
+                    self.waiting_queue, adder.chunked_req_limit = fold
+                    self._okc_fold_batch = True
+            if adder.chunked_req_limit is None and not self._okc_fold_batch:
                 mid_chunk = self.small_prefill_first.mid_chunk_order(
                     chunked_req=self.chunked_req,
                     waiting_queue=self.waiting_queue,

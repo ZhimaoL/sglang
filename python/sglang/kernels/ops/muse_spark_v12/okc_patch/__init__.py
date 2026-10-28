@@ -225,6 +225,15 @@ SW_PREFILL_HANDOFF = _flag("OKC_SW_PREFILL_HANDOFF", "0")
 # turn (~2.1 s at c4, which moved the c4 TTFT p90 past the 2x gate in S8). Same work, same chunk size. Default off.
 SW_BETWEEN_CHUNK = _flag("OKC_SW_BETWEEN_CHUNK", "0")
 BETWEEN_CHUNK_MAX_REQS = int(os.environ.get("OKC_BETWEEN_CHUNK_MAX_REQS", "8"))
+# Follow-up admission (srt/managers/small_prefill_first.py fold_order): between-chunk admission at low load and, above
+# the load cap, the small newest arrivals (< 4096 uncached tokens, newest 16 matched) fold into every chunk pass whole
+# (the chunk shrinks, keeping >= half its budget; in a chunk's last pass they take the leftover before the next first
+# turn). Under ride-along a follow-up otherwise waits FCFS behind the remaining first turns (c32: ~40 s), past the
+# device SWA cache's ~8 s retention of its conversation tail, and re-prefills its whole prompt (session SI arm R: 30 of
+# 32 first follow-ups, c32 p90 TTFT 42 s; serving/kernels/court/LOG.md C12). Folded follow-ups verify inside the next
+# chunk forward when ride-along is on (no forced decode steps); otherwise they get small-prefill-first's two. Implies
+# OKC_SW_BETWEEN_CHUNK. Same tokens per forward. Default off.
+SW_FOLLOWUP_ADMIT = _flag("OKC_SW_FOLLOWUP_ADMIT", "0")
 
 # The running batch's DFLASH verify rides along in prefill / extend forwards (srt/managers/ride_along.py): its 8-row
 # blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
@@ -245,5 +254,6 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_AR_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
-           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "RIDE_ALONG",
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
+           "RIDE_ALONG",
            "ANY_ATTN"]

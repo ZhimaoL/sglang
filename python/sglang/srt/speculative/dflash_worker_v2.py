@@ -235,7 +235,7 @@ def _prefill_handoff() -> bool:
 def _between_chunk() -> bool:
     from sglang.kernels.ops.muse_spark_v12 import okc_patch
 
-    return okc_patch.SW_BETWEEN_CHUNK
+    return okc_patch.SW_BETWEEN_CHUNK or okc_patch.SW_FOLLOWUP_ADMIT
 
 
 def host_ints_to_device(values, device) -> torch.Tensor:
@@ -2453,6 +2453,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         num_prefill = len(prefill_batch.reqs)
         num_prefill_tokens = int(prefill_batch.extend_num_tokens)
+        target_done = None
+        if _between_chunk():
+            # As in forward_batch_generation: the scheduler's chunk-boundary wait.
+            target_done = torch.cuda.Event()
+            target_done.record()
 
         # Prefill requests: the target worker's sampler on their last rows.
         prefill_logits_output = LogitsProcessorOutput(
@@ -2519,6 +2524,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             new_seq_lens=prefill_batch.seq_lens,
         )
+        if target_done is not None:
+            prefill_result.okc_target_done = target_done
         decode_result = GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=rider_logits),
             next_token_ids=out_tokens.reshape(-1),
