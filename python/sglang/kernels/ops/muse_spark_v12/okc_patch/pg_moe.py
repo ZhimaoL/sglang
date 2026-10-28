@@ -93,17 +93,18 @@ def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
                      dim=-1).contiguous()
 
 
-def align_local(ids, expert_map=None, n_local=32):
+def align_local(ids, expert_map=None, n_local=32, block_m=_BLOCK_M):
     """Large-T front end (the prefill bank's local-slot align): ids [T, 8] global expert ids (int32 / int64) mapped by
     expert_map ([E] int32, global -> local slot, -1 remote), or with expert_map None already local slot ids (-1 = not
     this rank's, e.g. a balancer's slots over 32 + R replicas) -> (local_ids [T, 8] int32, sorted_ids, block_experts,
-    n_padded): moe_align_block_size(local_ids, 256, n_local)'s layout without its 256-expert sort, sized for n_local
-    slots (<= 64). Routes inside a slot's range come in no fixed order; pg's per-route rows do not depend on it."""
+    n_padded): moe_align_block_size(local_ids, block_m, n_local)'s layout without its 256-expert sort, sized for n_local
+    slots (<= 64); block_m = the pg build's token block (256, or 128 for a narrow build). Routes inside a slot's range
+    come in no fixed order; pg's per-route rows do not depend on it."""
     numel = ids.numel()
     device = ids.device
-    nblocks = (numel + n_local * (_BLOCK_M - 1) + _BLOCK_M - 1) // _BLOCK_M
+    nblocks = (numel + n_local * (block_m - 1) + block_m - 1) // block_m
     local_ids = torch.empty(ids.shape, dtype=torch.int32, device=device)
-    sorted_ids = torch.empty((nblocks * _BLOCK_M,), dtype=torch.int32, device=device)
+    sorted_ids = torch.empty((nblocks * block_m,), dtype=torch.int32, device=device)
     block_experts = torch.empty((nblocks,), dtype=torch.int32, device=device)
     n_padded = torch.empty((1,), dtype=torch.int32, device=device)
     cnt = torch.zeros((n_local,), dtype=torch.int32, device=device)
@@ -112,7 +113,7 @@ def align_local(ids, expert_map=None, n_local=32):
     emap = expert_map if expert_map is not None else local_ids.new_empty((0,))
     n_global = expert_map.shape[0] if expert_map is not None else n_local
     pg_ext().align(ids.contiguous(), emap, local_ids, cnt, off, cur, sorted_ids, block_experts, n_padded,
-                   numel, _BLOCK_M, n_local, n_global)
+                   numel, block_m, n_local, n_global)
     return local_ids, sorted_ids, block_experts, n_padded
 
 
