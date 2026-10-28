@@ -223,6 +223,12 @@ def pg_prep(layer, topk_ids):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
+    emap = layer._expert_map
+    if (_sw.PG_LOCAL_ALIGN and topk_ids.shape[0] >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS
+            and (emap is None or emap.dtype is torch.int32) and layer.num_local_experts <= 64):
+        # Large chunks: one count of the routes into the local-slot counters (map and int32 cast folded in)
+        # instead of the cast + map gather + 256-expert moe_align / count_and_sort chain; same values downstream.
+        return pg_moe.align_local(topk_ids, emap, layer.num_local_experts)
     local_ids = topk_ids.to(torch.int32)
     if layer._expert_map is not None:
         local_ids = layer._expert_map[local_ids]
