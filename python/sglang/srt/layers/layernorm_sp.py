@@ -66,6 +66,7 @@ class _OkcHopperSP:
 
     active: bool = False
     symm: bool = False
+    symm_min_tokens: int = 0
 
 
 _okc_hopper = _OkcHopperSP()
@@ -104,9 +105,10 @@ def initialize_layernorm_sp(*, model_config) -> None:
         not get_parallel().enable_layernorm_sp and _okc_hopper_sp_wanted(architecture)
     )
     if _okc_hopper.active:
-        from sglang.kernels.ops.muse_spark_v12.okc_patch import SP_SYMM
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import SP_SYMM, SP_SYMM_MIN_TOKENS
 
         _okc_hopper.symm = SP_SYMM and _HAS_TORCH_SYMM_MEM_FUSED
+        _okc_hopper.symm_min_tokens = SP_SYMM_MIN_TOKENS
     get_flags().sp.enabled = bool(
         (get_parallel().enable_layernorm_sp or _okc_hopper.active)
         and architectures
@@ -229,7 +231,15 @@ except Exception:
     _HAS_TORCH_SYMM_MEM_FUSED = False
 
 
-def sp_fused_matmul_eligible(linear) -> bool:
+def _okc_symm_selected(num_tokens: Optional[int]) -> bool:
+    return (
+        _okc_hopper.symm
+        and num_tokens is not None
+        and num_tokens >= _okc_hopper.symm_min_tokens
+    )
+
+
+def sp_fused_matmul_eligible(linear, num_tokens: Optional[int] = None) -> bool:
     """Whether the selected fused matmul+collective path applies.
 
     Muse Spark selects CUTLASS; other models keep the Torch symmetric-memory
@@ -239,7 +249,7 @@ def sp_fused_matmul_eligible(linear) -> bool:
     if (
         not (_HAS_TORCH_SYMM_MEM_FUSED or getattr(linear, "_sp_use_cutlass", False))
         or linear.bias is not None
-        or (_okc_hopper.active and not _okc_hopper.symm)
+        or (_okc_hopper.active and not _okc_symm_selected(num_tokens))
     ):
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -260,7 +270,7 @@ def column_parallel_g_matmul(
     tile-gated all-gather; other models retain their existing implementation.
     """
     num_tokens = sp_num_tokens()
-    if sp_fused_matmul_eligible(linear):
+    if sp_fused_matmul_eligible(linear, num_tokens):
         if getattr(linear, "_sp_use_cutlass", False):
             from sglang.kernels.ops.gemm.sp_collective_gemm import all_gather_matmul
 
@@ -296,7 +306,7 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     padded = ceil_align(num_tokens, tp_size)
     if padded != num_tokens:
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
-    if sp_fused_matmul_eligible(linear):
+    if sp_fused_matmul_eligible(linear, num_tokens):
         if getattr(linear, "_sp_use_cutlass", False):
             from sglang.kernels.ops.gemm.sp_collective_gemm import matmul_reduce_scatter
 
