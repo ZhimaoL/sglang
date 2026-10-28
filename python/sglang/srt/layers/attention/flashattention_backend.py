@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -131,45 +132,51 @@ class FlashAttentionMetadata:
     extend_split: Optional[ExtendAttnSplit] = None
 
 
-# A ride-along EXTEND's full-attention layers run the riders' blocks as their own call
-# on a side stream when the prefill part is at most this many tokens: beside a ~1K-token
-# extend the merged call adds a wave of rider tiles that stream ~80K keys each at
-# prefill tile shape (1xH200, 15 riders: merged +474 us, side stream +136 us per
-# layer), while a 16K chunk keeps every SM busy and the merged call is cheaper.
-_SPLIT_SIDE_STREAM_MAX_TOKENS = 4096
-
-
 class ExtendAttnSplit(msgspec.Struct):
-    """An EXTEND batch whose first ``head_reqs`` requests are prefills and the rest
-    short verify blocks riding along (ForwardBatch.extend_attn_split)."""
+    """A ride-along EXTEND batch (ForwardBatch.extend_attn_split): the first
+    ``head_reqs`` requests are prefills, the rest the running requests' verify blocks."""
 
     head_reqs: int
     head_tokens: int
     tail_tokens: int
     head_max_q: int
     tail_max_q: int
+    # The prefills' longest context: the width of their page-table rows.
+    head_max_k: int
     tail_cu_seqlens_q: torch.Tensor
     tail_cu_seqlens_k: torch.Tensor
-    side_stream: bool
+    # The batch as the prefill-attention hook sees the prefill requests alone.
+    head_forward_batch: ForwardBatch
 
 
 def build_extend_attn_split(
-    n: int,
-    extend_seq_lens_cpu: list,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    forward_batch: ForwardBatch, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor
 ) -> ExtendAttnSplit:
-    head_tokens = sum(extend_seq_lens_cpu[:n])
+    n = forward_batch.extend_attn_split
+    lens = forward_batch.extend_seq_lens_cpu
+    head_seq_lens_cpu = forward_batch.seq_lens_cpu[:n]
+    head_forward_batch = copy.copy(forward_batch)
+    head_forward_batch.batch_size = n
+    head_forward_batch.extend_seq_lens_cpu = lens[:n]
+    head_forward_batch.seq_lens_cpu = head_seq_lens_cpu
     return ExtendAttnSplit(
         head_reqs=n,
-        head_tokens=head_tokens,
-        tail_tokens=sum(extend_seq_lens_cpu[n:]),
-        head_max_q=max(extend_seq_lens_cpu[:n]),
-        tail_max_q=max(extend_seq_lens_cpu[n:]),
+        head_tokens=sum(lens[:n]),
+        tail_tokens=sum(lens[n:]),
+        head_max_q=max(lens[:n]),
+        tail_max_q=max(lens[n:]),
+        head_max_k=int(head_seq_lens_cpu.max()),
         tail_cu_seqlens_q=cu_seqlens_q[n:] - cu_seqlens_q[n],
         tail_cu_seqlens_k=cu_seqlens_k[n:] - cu_seqlens_k[n],
-        side_stream=head_tokens <= _SPLIT_SIDE_STREAM_MAX_TOKENS,
+        head_forward_batch=head_forward_batch,
     )
+
+
+def ride_split_mode(split: ExtendAttnSplit, is_swa_layer: bool, fmha_layer: bool):
+    """How a ride-along layer runs its attention: None = one FA3 call over every row;
+    True / False = the prefills (fmha7 hook, else FA3) and the riders' blocks (FA3,
+    verify-shaped) as two calls, the riders' on a side stream / after the prefills'."""
+    return True
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -1368,10 +1375,7 @@ class FlashAttentionBackend(AttentionBackend):
             and forward_batch.forward_mode == ForwardMode.EXTEND
         ):
             metadata.extend_split = build_extend_attn_split(
-                forward_batch.extend_attn_split,
-                forward_batch.extend_seq_lens_cpu,
-                metadata.cu_seqlens_q,
-                metadata.cu_seqlens_k,
+                forward_batch, metadata.cu_seqlens_q, metadata.cu_seqlens_k
             )
 
         self.forward_metadata = metadata
@@ -1391,9 +1395,13 @@ class FlashAttentionBackend(AttentionBackend):
         window_size,
         kwargs: dict,
         out: Optional[torch.Tensor],
+        *,
+        side_stream: bool,
     ) -> torch.Tensor:
-        """The prefill requests' attention on this stream and the riders' blocks as
-        their own (verify-shaped, split-KV) call on a side stream beside it."""
+        """A ride-along layer as two calls into one output: the prefill requests through
+        the prefill-attention hook (FA3 when it declines), then the riders' blocks as
+        their own verify-shaped FA3 call, on a side stream beside the prefills' or after
+        them."""
         n, t = split.head_reqs, split.head_tokens
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         if out is None:
@@ -1402,17 +1410,21 @@ class FlashAttentionBackend(AttentionBackend):
             out = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim), dtype=out_dtype
             )
+        head_out, tail_out = out[:t], out[t : t + split.tail_tokens]
 
-        def run(rows, tokens, cu_q, cu_k, max_q):
+        def part_kwargs(rows):
             part = dict(kwargs)
             for name in ("k_descale", "v_descale"):
                 if part.get(name) is not None:
                     part[name] = part[name][rows]
+            return part
+
+        def fa3(rows, tokens, cu_q, cu_k, max_q, part_out, rows_page_table):
             flash_attn_with_kvcache(
                 q=q[tokens],
                 k_cache=key_cache,
                 v_cache=value_cache,
-                page_table=page_table[rows],
+                page_table=rows_page_table,
                 cache_seqlens=cache_seqlens[rows],
                 cu_seqlens_q=cu_q,
                 cu_seqlens_k_new=cu_k,
@@ -1422,31 +1434,61 @@ class FlashAttentionBackend(AttentionBackend):
                 window_size=window_size,
                 softcap=layer.logit_cap,
                 num_splits=self.num_splits,
-                out=out[tokens],
+                out=part_out,
                 ver=self.fa_impl_ver,
-                **part,
+                **part_kwargs(rows),
             )
 
+        def head():
+            rows = slice(0, n)
+            head_page_table = page_table[rows, : split.head_max_k]
+            if getattr(layer, "okc_prefill_fmha", False):
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import prefill_fmha
+
+                result = prefill_fmha.try_extend(
+                    self, q[:t], key_cache, value_cache, head_page_table,
+                    cache_seqlens[rows], cu_seqlens_q[: n + 1], split.head_max_q,
+                    layer, split.head_forward_batch, window_size, causal,
+                    part_kwargs(rows), head_out,
+                )
+                if result is not None:
+                    if result.data_ptr() != head_out.data_ptr():
+                        head_out.copy_(result.view_as(head_out))
+                    return
+            fa3(
+                rows,
+                slice(0, t),
+                cu_seqlens_q[: n + 1],
+                cu_seqlens_k[: n + 1],
+                split.head_max_q,
+                head_out,
+                head_page_table,
+            )
+
+        def tail():
+            rows = slice(n, None)
+            fa3(
+                rows,
+                slice(t, t + split.tail_tokens),
+                split.tail_cu_seqlens_q,
+                split.tail_cu_seqlens_k,
+                split.tail_max_q,
+                tail_out,
+                page_table[rows],
+            )
+
+        if not side_stream:
+            head()
+            tail()
+            return out
         main = torch.cuda.current_stream()
         if self._extend_split_stream is None:
             self._extend_split_stream = torch.cuda.Stream()
         side = self._extend_split_stream
         side.wait_stream(main)
-        run(
-            slice(0, n),
-            slice(0, t),
-            cu_seqlens_q[: n + 1],
-            cu_seqlens_k[: n + 1],
-            split.head_max_q,
-        )
+        head()
         with torch.cuda.stream(side):
-            run(
-                slice(n, None),
-                slice(t, t + split.tail_tokens),
-                split.tail_cu_seqlens_q,
-                split.tail_cu_seqlens_k,
-                split.tail_max_q,
-            )
+            tail()
         main.wait_stream(side)
         return out
 
@@ -1805,10 +1847,16 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif (
                 metadata.extend_split is not None
-                and metadata.extend_split.side_stream
-                and not is_swa_layer
                 and not (use_local_attn or use_cascade_attn or return_lse)
                 and not layer.is_cross_attention
+                and (
+                    split_mode := ride_split_mode(
+                        metadata.extend_split,
+                        is_swa_layer,
+                        getattr(layer, "okc_prefill_fmha", False),
+                    )
+                )
+                is not None
             ):
                 result = self._forward_extend_split(
                     q,
@@ -1824,6 +1872,7 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size,
                     kwargs,
                     _fa_out,
+                    side_stream=split_mode,
                 )
             else:
                 result = None
