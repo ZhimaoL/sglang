@@ -34,6 +34,7 @@ from sglang.kernels.ops.muse_spark_v12.gemm_ag import (
     gemm_ag,
     gemm_ag_supported,
     gemm_local,
+    large_m_capable,
     reserve_projection_workspace,
 )
 from sglang.kernels.ops.muse_spark_v12 import okc_patch
@@ -598,7 +599,7 @@ class MuseSpark1xMoE(nn.Module):
             self.pre_expert_proj is not None
             and self.tp_size in (4, 8)
             and torch.cuda.is_available()
-            and torch.cuda.get_device_capability() == (10, 3)
+            and large_m_capable()
         ):
             ca_comm = get_tp_group().ca_comm
             reserve_projection_workspace(
@@ -867,7 +868,7 @@ class MuseSpark1xMoE(nn.Module):
             if (
                 self.tp_size in (4, 8)
                 and not sp_active
-                and torch.cuda.get_device_capability(hidden_states.device) == (10, 3)
+                and large_m_capable(hidden_states.device)
                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
             ):
                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)

@@ -45,6 +45,16 @@ def _jit_module(n: int, world_size: int) -> Module:
     )
 
 
+def large_m_capable(device=None) -> bool:
+    """Column-parallel projections past SMALL_PROJECTION_MAX_TOKENS: B300 upstream, Hopper with OKC_SW_GEMM_AG."""
+    capability = torch.cuda.get_device_capability(device)
+    if capability == (10, 3):
+        return True
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_GEMM_AG
+
+    return SW_GEMM_AG and capability == (9, 0)
+
+
 def gemm_ag_supported(
     comm: Optional[CustomAllReduceV2], x: torch.Tensor, weight: torch.Tensor
 ) -> bool:
@@ -70,7 +80,7 @@ def gemm_ag_supported(
             or (
                 comm.world_size in (4, 8)
                 and n in (4096, 8192)
-                and torch.cuda.get_device_capability(x.device) == (10, 3)
+                and large_m_capable(x.device)
             )
         )
         and weight.shape[1] == k
