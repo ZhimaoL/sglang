@@ -176,10 +176,60 @@ DINL void build_tab(const int* __restrict__ ids, int numel, int nl, const float*
 // Work: slabs = 16 weight rows (one warp's piece of a pg block) x full K of the passes, an equal contiguous range per
 // CTA; inside the CTA the 16 warps split each slab's K; their partials meet in a 4-slot smem ring and one warp per slab
 // (slab % 16) sums them in warp order (deterministic) one slab later and runs the epilogue.
+// Pre-expert RMSNorm fold (KIND 1, gamma != null): xin holds the un-normed rows. At each pass switch one thread bulk-
+// copies the pass's token rows into shared memory (the bytes the B loads read anyway, once per CTA); warps 0..7 take
+// each token's rstd there in torch's vectorized rms_norm order (pg_gather_norm's: per virtual lane l of 128 an fma
+// chain over bf16x4 vectors l + 128 j, shfl_down 16 .. 1, warps (0 + 2) + (1 + 3), / 4096, rsqrtf(. + eps)) and every
+// B word becomes bf16(gamma * (rstd * x)): exactly the values F.rms_norm returns, so the products are the unfused ones.
+DINL float rms_rstd(const __nv_bfloat16* xrow, float eps, int lane) {   // xrow: a staged row in shared memory
+    const uint2* row = reinterpret_cast<const uint2*>(xrow);
+    const int vy = lane >> 3, vi = lane & 7;
+    float sq[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int q = 0; q < 4; q++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const uint2 v = row[128 * j + 32 * vy + vi + 8 * q];
+            const float2 lo = __bfloat1622float2(u32b2(v.x));
+            const float2 hi = __bfloat1622float2(u32b2(v.y));
+            sq[q] = __fmaf_rn(lo.x, lo.x, sq[q]);
+            sq[q] = __fmaf_rn(lo.y, lo.y, sq[q]);
+            sq[q] = __fmaf_rn(hi.x, hi.x, sq[q]);
+            sq[q] = __fmaf_rn(hi.y, hi.y, sq[q]);
+        }
+    float c = __fadd_rn(__fadd_rn(sq[0], sq[2]), __fadd_rn(sq[1], sq[3]));   // steps 16, 8
+    c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 4));
+    c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 2));
+    c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 1));
+    const float w0 = __shfl_sync(0xFFFFFFFFu, c, 0), w1 = __shfl_sync(0xFFFFFFFFu, c, 8);
+    const float w2 = __shfl_sync(0xFFFFFFFFu, c, 16), w3 = __shfl_sync(0xFFFFFFFFu, c, 24);
+    const float m2 = __fdiv_rn(__fadd_rn(__fadd_rn(w0, w2), __fadd_rn(w1, w3)), 4096.f);
+    return rsqrtf(__fadd_rn(m2, eps));
+}
+
+// norm fold staging (dynamic smem): two buffers of a pass's <= 8 token rows (one bulk copy each, row pitch padded by
+// 16 B: conflict-free B reads), the next pass's rows prefetched into the idle buffer two slabs ahead; gamma once.
+constexpr int XROW = H + 8;
+constexpr int XBUF = 8 * XROW;                    // bf16 elements per buffer
+constexpr int XSTAGE_BYTES = (2 * XBUF + H) * 2;
+DINL void bulk_row(unsigned sdst, const void* gsrc, unsigned bytes, unsigned bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(sdst), "l"(gsrc), "r"(bytes), "r"(bar) : "memory");
+}
+DINL void mbar_expect_tx(unsigned bar, unsigned bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(bar), "r"(bytes) : "memory");
+}
+
+DINL unsigned rms_word(unsigned xw, unsigned gw, float rs) {
+    const float2 x2 = __bfloat1622float2(u32b2(xw)), g2 = __bfloat1622float2(u32b2(gw));
+    return b2u32(__floats2bfloat162_rn(__fmul_rn(g2.x, __fmul_rn(rs, x2.x)), __fmul_rn(g2.y, __fmul_rn(rs, x2.y))));
+}
+
 template <int KIND>
 __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restrict__ xin, const char* __restrict__ wsf,
                                                    const float* __restrict__ gs, __nv_bfloat16* __restrict__ out,
-                                                   const int* __restrict__ ids, int numel, int nl, int pdl) {
+                                                   const int* __restrict__ ids, int numel, int nl, int pdl,
+                                                   const __nv_bfloat16* __restrict__ gamma, float eps) {
     constexpr int NWT = KIND == 1 ? 64 : 32;
     constexpr int LSPE = KIND == 1 ? 9 : 8;            // log2 slabs per pass (NWT x 8 slabs)
     __shared__ Tab tb;
@@ -188,6 +238,9 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
     __shared__ __align__(8) unsigned long long bars[2 * R];   // full[R] | empty[R]
     __shared__ unsigned short s_wcnt[NUMEL_MAX / 32][ELOC];
     __shared__ int s_vbase[ELOC];
+    __shared__ float s_rs[2][8];                       // norm fold: rstd of a pass's tokens, per staging buffer
+    __shared__ __align__(8) unsigned long long s_xbar[2];   // norm fold: one staging barrier per buffer
+    extern __shared__ __align__(16) __nv_bfloat16 s_x[];   // norm fold: [2][8][XROW] staged rows, gamma [H]
 
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     if (KIND == 1 && pdl) pdl_trigger();               // KIND 2 CTAs only fit on SMs this kernel has left
@@ -195,6 +248,7 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
         mbar_init(smem_u32(&bars[tid]), NTHR);
         mbar_init(smem_u32(&bars[R + tid]), 32);
     }
+    if (tid == R || tid == R + 1) mbar_init(smem_u32(&s_xbar[tid - R]), 1);
     build_tab(ids, numel, nl, KIND == 1 ? gs : nullptr, tb, s_wcnt, s_vbase);   // ends with __syncthreads
 
     const int U = tb.nva << LSPE;
@@ -234,11 +288,47 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
 
     unsigned b[KPW][4][2];
     int cva = -1;
+    // norm fold: buffer of the next switch, the pass whose rows are in flight to it (-1: none), barrier phases.
+    // A buffer is refilled only for the switch after next, issued after this switch's barriers: its readers are done.
+    unsigned xph0 = 0, xph1 = 0;
+    int nbuf = 0, pva = -1;
+    auto stage = [&](int va, int bi, bool with_gamma) {   // thread 0
+        const int nv = tb.va_n[va];
+        const unsigned xb = smem_u32(&s_xbar[bi]), xs = smem_u32(s_x + bi * XBUF);
+        mbar_expect_tx(xb, (nv + (with_gamma ? 1 : 0)) * H * 2);
+        if (with_gamma) bulk_row(smem_u32(s_x + 2 * XBUF), gamma, H * 2, xb);
+        for (int n = 0; n < nv; n++) bulk_row(xs + n * XROW * 2, xin + (size_t)(tb.va_rt[va][n] >> 3) * H, H * 2, xb);
+    };
+    if (KIND == 1 && gamma != nullptr) {
+        const int va0 = s0 >> LSPE;
+        if (tid == 0) stage(va0, 0, true);
+        pva = va0;
+    }
     auto load_b = [&](int va) {
         const bool live = g < tb.va_n[va];             // padded token columns stay zero (their outputs are dropped)
         const __nv_bfloat16* row = KIND == 1 ? xin + (size_t)(tb.va_rt[va][live ? g : 0] >> 3) * H
                                              : xin + (size_t)(va * 8 + g) * H;
+        const __nv_bfloat16* grow = gamma;
+        float rs = 0.f;
+        if (KIND == 1 && gamma != nullptr) {           // every warp reaches this switch at the same slab
+            const int nv = tb.va_n[va], bi = nbuf;
+            if (pva != va && tid == 0) stage(va, bi, false);   // not prefetched (a pass shorter than 2 slabs)
+            pva = -1;
+            nbuf ^= 1;
+            mbar_wait(smem_u32(&s_xbar[bi]), bi ? xph1 : xph0);
+            if (bi) xph1 ^= 1; else xph0 ^= 1;
+            const __nv_bfloat16* xb = s_x + bi * XBUF;
+            if (w < nv) {
+                const float r = rms_rstd(xb + w * XROW, eps, lane);
+                if (lane == 0) s_rs[bi][w] = r;
+            }
+            __syncthreads();
+            if (live) rs = s_rs[bi][g];
+            row = xb + g * XROW;                       // B words and gamma from shared memory
+            grow = s_x + 2 * XBUF;
+        }
         row += KPW * w * 64 + 2 * t;
+        grow += KPW * w * 64 + 2 * t;
 #pragma unroll
         for (int i = 0; i < KPW; i++)
 #pragma unroll
@@ -246,6 +336,10 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
                 if (KIND == 1) {
                     b[i][q][0] = live ? ldb32(row + i * 64 + 16 * q) : 0u;
                     b[i][q][1] = live ? ldb32(row + i * 64 + 16 * q + 8) : 0u;
+                    if (gamma != nullptr && live) {
+                        b[i][q][0] = rms_word(b[i][q][0], ldb32(grow + i * 64 + 16 * q), rs);
+                        b[i][q][1] = rms_word(b[i][q][1], ldb32(grow + i * 64 + 16 * q + 8), rs);
+                    }
                 } else {
                     b[i][q][0] = live ? ldb32cg(row + i * 64 + 16 * q) : 0u;
                     b[i][q][1] = live ? ldb32cg(row + i * 64 + 16 * q + 8) : 0u;
@@ -300,6 +394,13 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
     for (int jl = 0; jl < nslab; jl++) {
         const int va = (s0 + jl) >> LSPE;
         if (va != cva) { cva = va; load_b(va); }
+        if (KIND == 1 && gamma != nullptr && pva < 0) {   // prefetch the next pass's rows two slabs ahead
+            const int va2 = (s0 + min(jl + 2, nslab - 1)) >> LSPE;
+            if (va2 != cva) {
+                if (tid == 0) stage(va2, nbuf, false);
+                pva = va2;
+            }
+        }
         const char* p = slab_ptr(jl + 1);
         const int so = sofs_of(jl + 1);
 #pragma unroll
@@ -327,8 +428,9 @@ static int st_num_sms() {
 }
 
 // y [numel, 4096] bf16 (local routes written), h scratch [>= (nl + numel / 8) * 8, 4096] bf16, nl = wsf13.size(0)
+// gamma: the pre-expert RMSNorm weight to fold (bf16 [4096], x un-normed) or an empty tensor (x already normed)
 void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tensor gs13, torch::Tensor wsf2,
-            torch::Tensor h, torch::Tensor y, int64_t pdl) {
+            torch::Tensor h, torch::Tensor y, int64_t pdl, torch::Tensor gamma, double eps) {
     const int numel = (int)ids.numel();
     TORCH_CHECK(numel <= stk::NUMEL_MAX && numel == x.size(0) * 8 && x.size(1) == stk::H, "st: T <= 128, top-8, H 4096");
     TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous() && x.is_contiguous(), "st: int32 ids, contiguous x");
@@ -338,14 +440,24 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
     TORCH_CHECK(wsf2.size(0) == nl && wsf2.size(1) == 32 && wsf2.size(2) == stk::NKT && wsf2.size(3) == stk::WSB,
                 "st: wsf2 layout");
     TORCH_CHECK(h.size(0) >= (nl + numel / 8) * 8 && gs13.numel() == nl, "st: h rows / gs13");
+    const bool fold = gamma.numel() > 0;
+    TORCH_CHECK(!fold || (gamma.numel() == stk::H && gamma.scalar_type() == at::kBFloat16 && gamma.is_contiguous()),
+                "st: norm weight bf16 [4096]");
+    const auto* gp = fold ? reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr()) : nullptr;
     const int G = st_num_sms();
     cudaStream_t st = at::cuda::getCurrentCUDAStream();
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
     auto* hp = reinterpret_cast<__nv_bfloat16*>(h.data_ptr());
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y.data_ptr());
     const int* ip = ids.data_ptr<int>();
-    stk::st_gemm<1><<<G, stk::NTHR, 0, st>>>(xp, reinterpret_cast<const char*>(wsf13.data_ptr()),
-                                            gs13.data_ptr<float>(), hp, ip, numel, nl, (int)pdl);
+    static bool attr = false;
+    if (!attr) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(stk::st_gemm<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            stk::XSTAGE_BYTES));
+        attr = true;
+    }
+    stk::st_gemm<1><<<G, stk::NTHR, fold ? stk::XSTAGE_BYTES : 0, st>>>(xp, reinterpret_cast<const char*>(wsf13.data_ptr()),
+                                            gs13.data_ptr<float>(), hp, ip, numel, nl, (int)pdl, gp, (float)eps);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (pdl) {
         cudaLaunchConfig_t cfg = {};
@@ -360,10 +472,10 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
         cfg.numAttrs = 1;
         C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, stk::st_gemm<2>, (const __nv_bfloat16*)hp,
                                           reinterpret_cast<const char*>(wsf2.data_ptr()), (const float*)nullptr, yp, ip,
-                                          numel, nl, 1));
+                                          numel, nl, 1, (const __nv_bfloat16*)nullptr, 0.f));
     } else {
         stk::st_gemm<2><<<G, stk::NTHR, 0, st>>>(hp, reinterpret_cast<const char*>(wsf2.data_ptr()), nullptr, yp, ip,
-                                                numel, nl, 0);
+                                                numel, nl, 0, nullptr, 0.f);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
