@@ -178,13 +178,20 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
     num_tokens, size_k = x.shape
-    local_ids = topk_ids.to(torch.int32)
-    if layer._expert_map is not None:
-        local_ids = layer._expert_map[local_ids]
-    local_ids = local_ids.contiguous()
-    # Marlin's alignment convention: global expert count with -1 for non-local routes.
-    align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
-    sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts)
+    emap = layer._expert_map
+    if (_sw.PG_LOCAL_ALIGN and num_tokens >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS and emap is not None
+            and emap.numel() == 256 and emap.dtype is torch.int32):
+        # Large chunks: the bank's local-expert align (one count over the routes into 32 counters, with the map and
+        # the int32 conversion folded in) instead of the copy + index + 256-expert moe_align / count_and_sort chain.
+        local_ids, sorted_ids, block_experts, n_padded = pg_moe.align_local(topk_ids, emap)
+    else:
+        local_ids = topk_ids.to(torch.int32)
+        if emap is not None:
+            local_ids = emap[local_ids]
+        local_ids = local_ids.contiguous()
+        # Marlin's alignment convention: global expert count with -1 for non-local routes.
+        align_num_experts = layer.global_num_experts if emap is not None else layer.num_local_experts
+        sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts)
     y = pg_moe.grouped_pg(
         x, sorted_ids, block_experts, n_padded,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],

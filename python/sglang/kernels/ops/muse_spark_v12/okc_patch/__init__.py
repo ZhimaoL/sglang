@@ -25,6 +25,10 @@ SW_MOE_PG = _flag("OKC_SW_MOE_PG", "1")
 # Measured on 8x H200: the pg pair beats Marlin on 16K-token chunks; Marlin keeps smaller prefills.
 MOE_PG_MIN_TOKENS = int(os.environ.get("OKC_MOE_PG_MIN_TOKENS", "1536"))
 MOE_PG_ONLY = _flag("OKC_MOE_PG_ONLY", "1")
+# pg calls of >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS tokens align their routes with the prefill bank's local-expert align
+# (pg_moe.align_local) instead of SGLang's 256-expert moe_align_block_size chain.
+PG_LOCAL_ALIGN = _flag("OKC_PG_LOCAL_ALIGN", "1")
+PG_LOCAL_ALIGN_MIN_TOKENS = int(os.environ.get("OKC_PG_LOCAL_ALIGN_MIN_TOKENS", "1024"))
 _pack_layers = os.environ.get("OKC_MOE_PACK_MAX_LAYERS", "all" if MOE_PG_ONLY else "16")
 MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 
@@ -49,6 +53,9 @@ SW_SP = _flag("OKC_SW_SP", "1")
 # SP only above this many tokens (a prefill CUDA-graph bucket boundary, so a batch and its padded bucket agree): tiny
 # extends lost ~100 ms to collective waits under SP (sessions SB / SC), a ~1K-token extend is 75 ms with SP vs 80 without.
 SP_MIN_TOKENS = int(os.environ.get("OKC_SP_MIN_TOKENS", "512"))
+# SP prefill: the pre-expert RMSNorm runs on the rank's shard before the expert all-gather (row-local, so the same
+# values) instead of on the gathered chunk on every rank.
+SP_SHARD_PRENORM = _flag("OKC_SP_SHARD_PRENORM", "1")
 # Replicated pooler / unpooler at decode and verify M (<= 512 tokens) on Hopper: column-parallel slice + the
 # multicast all-gather (muse_spark_v12/gemm_ag.py), which upstream enables above 8 tokens on B300 only. Every
 # rank otherwise streams the full 128 MiB of the pair per layer and step (session SC: ~2 ms of a bs=1 step).
@@ -64,6 +71,7 @@ SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
 
 ANY_ATTN = SW_ATTN or SW_FS
 
-__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
+__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "PG_LOCAL_ALIGN",
+           "PG_LOCAL_ALIGN_MIN_TOKENS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
-           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]
+           "SW_SP", "SP_MIN_TOKENS", "SP_SHARD_PRENORM", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]
