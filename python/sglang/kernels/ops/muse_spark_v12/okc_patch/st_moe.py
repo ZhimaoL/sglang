@@ -20,11 +20,18 @@ def h_rows(numel: int, n_local: int = 32) -> int:
     return (n_local + numel // 8) * 8
 
 
-def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False):
+_NO_NORM = {}
+
+
+def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False, norm_weight=None, norm_eps=0.0):
     """x [T, 4096] bf16 (T <= 128), local_ids [T, 8] int32 (-1 = not local) -> y [T*8, 4096] bf16 per-route expert
     outputs with pg's scaling (rows of non-local routes stay unwritten): the contract of pg_moe.grouped_pg."""
     numel = local_ids.numel()
     h = torch.empty((h_rows(numel, wsf13.shape[0]), 4096), dtype=torch.bfloat16, device=x.device)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
-    st_ext().st_moe(x, local_ids.reshape(-1), wsf13, gs13, wsf2, h, y, 1 if pdl else 0)
+    if norm_weight is None:                            # x already normed
+        norm_weight = _NO_NORM.get(x.device)
+        if norm_weight is None:
+            norm_weight = _NO_NORM[x.device] = torch.empty(0, dtype=torch.bfloat16, device=x.device)
+    st_ext().st_moe(x, local_ids.reshape(-1), wsf13, gs13, wsf2, h, y, 1 if pdl else 0, norm_weight, float(norm_eps))
     return y
