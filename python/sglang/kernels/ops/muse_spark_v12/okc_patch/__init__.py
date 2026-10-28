@@ -16,7 +16,7 @@
                      the less loaded of its two holders; longer ones (OKC_MOE_REP_PREFILL=1) split its routes
                      between the two at a token boundary that levels the ranks' routed tokens.
   OKC_SW_MOE_ST=1    (default) pg-only layers run the st pair (okc_patch/st_moe.py, same packs) at
-                     T <= OKC_MOE_ST_MAX_TOKENS (32): verify steps at bs 1..4.
+                     T <= OKC_MOE_ST_MAX_TOKENS (64): verify steps at bs 1..8.
 
 Switches are read once at import, so dispatch is stable across CUDA-graph capture and replay.
 The judge's launch command is fixed, so the submitted defaults are the ones below.
@@ -47,11 +47,13 @@ MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
 # for every real token; outside the range the shipped build (256-token blocks, widths 64 / 128 / 256) runs.
 PG_NARROW_MIN_T = int(os.environ.get("OKC_PG_NARROW_MIN_T", "1"))
 PG_NARROW_MAX_T = int(os.environ.get("OKC_PG_NARROW_MAX_T", "3072"))
-# st small-T pair (okc_patch/st_moe.py) on pg-only layers at T <= OKC_MOE_ST_MAX_TOKENS (verify bs 1..4): the same
+# st small-T pair (okc_patch/st_moe.py) on pg-only layers at T <= OKC_MOE_ST_MAX_TOKENS (verify bs 1..8): the same
 # packs read by mma.sync n8 tiles instead of pg's 64-token wgmma tiles. OKC_MOE_ST_PDL=1 (default) launches its down
 # kernel with programmatic dependent launch.
 SW_MOE_ST = _flag("OKC_SW_MOE_ST", "1")
-MOE_ST_MAX_TOKENS = min(32, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "32")))
+# 64 (verify bs 1..8): slowest-of-8-rank MoE per forward vs the narrow small front, session-M routing, R = 1
+# (smallt-moe LOG E15): T 40 -12.8 %, 48 -11.4 %, 56 -9.2 %, 64 -7.5 %; st's table holds 512 routes.
+MOE_ST_MAX_TOKENS = min(64, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "64")))
 MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 
 

@@ -1,4 +1,4 @@
-"""OKC st: the small-T MoE pair for verify / decode forwards (T <= OKC_MOE_ST_MAX_TOKENS, default 32) on pg's packs.
+"""OKC st: the small-T MoE pair for verify / decode forwards (T <= OKC_MOE_ST_MAX_TOKENS, default 64) on pg's packs.
 
 pg's gg1 / gg2 tile tokens 64 wide, so at T <= 64 a round of items costs the n64 wgmma time whatever the token
 count (per-call durations 4 + 16 x ceil(64 n_act / 132) us for gg1 on the 8xH200 traces). st reads the same blocks
@@ -19,7 +19,7 @@ import torch
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext
 
-MAX_TOKENS = 32     # the kernels' table holds 256 routes (top-8)
+MAX_TOKENS = 64     # the kernels' table holds 512 routes (top-8)
 
 
 def h_rows(numel: int, n_local: int = 32) -> int:
@@ -28,7 +28,7 @@ def h_rows(numel: int, n_local: int = 32) -> int:
 
 
 def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False):
-    """x [T, 4096] bf16 (T <= 32), local_ids [T, 8] int32 (-1 = not local) -> y [T*8, 4096] bf16 per-route expert
+    """x [T, 4096] bf16 (T <= 64), local_ids [T, 8] int32 (-1 = not local) -> y [T*8, 4096] bf16 per-route expert
     outputs with pg's scaling (rows of non-local routes stay unwritten): the contract of pg_moe.grouped_pg."""
     numel = local_ids.numel()
     h = torch.empty((h_rows(numel, wsf13.shape[0]), 4096), dtype=torch.bfloat16, device=x.device)

@@ -133,7 +133,7 @@ def st_ext():
 
                 # The name carries the scale format and the 64-slot table (the lane's okc_st_moe_c1 reads codes).
                 _ST_EXT = load_inline(
-                    name=f"okc_st_moe_c2_s{16 if _st_src.SCALE_BF16 else 8}_e64",
+                    name=f"okc_st_moe_c3_s{16 if _st_src.SCALE_BF16 else 8}_e64",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, int64_t);",
                     cuda_sources=_st_src._CUDA_SRC,
