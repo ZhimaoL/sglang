@@ -42,9 +42,14 @@ def _launch_config(hidden_size: int, num_tokens: int) -> tuple[int, int, bool]:
     """norm_residual_launch_config, with the Hopper cluster rule of norm_residual.fused_norm_residual (VG4:
     clusters only at M <= 32, capped at OKC_HOPPER_NORM_MAX_CLUSTER)."""
     config = norm_residual_launch_config(hidden_size=hidden_size, num_tokens=num_tokens)
-    if torch.cuda.get_device_capability()[0] != 9 or config[0] == 1:
+    if torch.cuda.get_device_capability()[0] != 9:
         return config
     from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    if okc_patch.SW_AG_NORM_WIDE and 32 < num_tokens <= 128 and hidden_size % 8192 == 0:
+        return 1, 1024, True   # VG17: one pack per thread, the whole row's polls and loads in flight at once
+    if config[0] == 1:
+        return config
 
     cluster_size = config[0] if num_tokens <= 32 else 1
     while cluster_size > okc_patch.HOPPER_NORM_MAX_CLUSTER:
@@ -109,7 +114,8 @@ def all_gather_norm_residual_supported(
 
         # H200 x8 (session SI vg-micro, us per boundary fused vs separate): cap 16 M 8 / 16 / 32 -0.15 / -0.16 /
         # -0.85, M 64 +0.45, M 128 -0.87; with the row kernel (cap 1) M 16 / 32 / 64 lose (+0.4 / +1.0 / +0.3).
-        if not ((num_tokens <= 32 and okc_patch.HOPPER_NORM_MAX_CLUSTER > 1) or num_tokens >= 128):
+        if not ((num_tokens <= 32 and okc_patch.HOPPER_NORM_MAX_CLUSTER > 1) or num_tokens >= 128
+                or (okc_patch.SW_AG_NORM_WIDE and num_tokens <= 128)):
             return False
     try:
         cluster_size, _, _ = _launch_config(hidden_size, num_tokens)
