@@ -1318,6 +1318,8 @@ class Scheduler(
             between_chunk_max_reqs=okc_patch.BETWEEN_CHUNK_MAX_REQS,
         )
         self._okc_between_batch = False
+        self._okc_kv_runs = okc_patch.DIAG_KV_RUNS if get_parallel().tp_rank == 0 else 0
+        self._okc_kv_runs_min_bs = okc_patch.DIAG_KV_RUNS_MIN_BS
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1964,6 +1966,8 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            if self._okc_kv_runs:
+                self._okc_log_kv_runs(batch)
 
             # Launch the current batch
             if batch:
@@ -2010,6 +2014,8 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            if self._okc_kv_runs:
+                self._okc_log_kv_runs(batch)
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
@@ -2055,6 +2061,11 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _okc_log_kv_runs(self, batch):
+        from sglang.kernels.ops.muse_spark_v12.okc_patch.kv_runs_diag import kv_runs
+
+        kv_runs(batch, self.req_to_token_pool.req_to_token, self._okc_kv_runs, self._okc_kv_runs_min_bs)
 
     def _okc_wait_chunk_boundary(self) -> bool:
         """Between-chunk admission: with a middle chunk in flight, wait for its target forward before picking what

@@ -225,6 +225,11 @@ BETWEEN_CHUNK_MAX_REQS = int(os.environ.get("OKC_BETWEEN_CHUNK_MAX_REQS", "8"))
 # "1" one merged forward, "2" diagnostic (same scheduling, the two ordinary forwards back to back).
 RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
 
+# Diagnostic (okc_patch/kv_runs_diag.py): TP rank 0 logs the KV slot run lengths of every N-th decode / verify batch with
+# >= OKC_DIAG_KV_RUNS_MIN_BS requests. "0" (default) off.
+DIAG_KV_RUNS = int(os.environ.get("OKC_DIAG_KV_RUNS", "0"))
+DIAG_KV_RUNS_MIN_BS = int(os.environ.get("OKC_DIAG_KV_RUNS_MIN_BS", "16"))
+
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
@@ -241,4 +246,4 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_TAIL_NORM", "SW_AR_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "RIDE_ALONG",
-           "ANY_ATTN"]
+           "ANY_ATTN", "DIAG_KV_RUNS", "DIAG_KV_RUNS_MIN_BS"]
