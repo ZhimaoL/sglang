@@ -838,9 +838,36 @@ class DFlashDraftModel(nn.Module):
     ) -> torch.Tensor:
         return ctx_hidden
 
+    def okc_project_local(self, target_hidden: torch.Tensor) -> Optional[torch.Tensor]:
+        """OKC (OKC_SW_DFLASH_FC_SP): fc + hidden_norm on this rank's rows only, for the target's SP exit (each rank
+        holds a different shard, so never the column-split gemm_ag). None = keep the taps (quantized fc, Laguna)."""
+        if self.quantizable or type(self).project_target_hidden is not DFlashDraftModel.project_target_hidden:
+            return None
+        if self.num_context_features < 2 or target_hidden.ndim != 2:
+            return None
+        if int(target_hidden.shape[-1]) != int(self.fc.in_features):
+            return None
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        # Every rank holds the same shard row count, so all ranks take the same branch (the gather sizes agree).
+        if int(target_hidden.shape[0]) < okc_patch.DFLASH_FC_SP_MIN_ROWS:
+            return None
+        if not getattr(self, "_okc_logged_local", False):
+            self._okc_logged_local = True
+            logger.info("OKC DFlash fc on the SP shard active (%d shard rows).", int(target_hidden.shape[0]))
+        return self.hidden_norm(self.fc(target_hidden))
+
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
         expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
+        if (
+            target_hidden.ndim == 2
+            and self.num_context_features > 1
+            and int(target_hidden.shape[-1]) == int(self.config.hidden_size)
+            and not self.quantizable
+        ):
+            # Already projected and normed on the SP shards (okc_project_local, before the target's exit gather).
+            return target_hidden
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "

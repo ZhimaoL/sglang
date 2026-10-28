@@ -450,6 +450,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        if okc_patch.SW_DFLASH_FC_SP and hasattr(self.draft_model, "okc_project_local"):
+            # The target projects its SP shard of the taps before the exit gather (models/muse_spark.py); the draft's
+            # project_target_hidden then passes the gathered [N, hidden] rows through.
+            target_model = self.model_runner.model
+            if hasattr(target_model, "set_dflash_layers_to_capture"):
+                target_model._okc_aux_project = self.draft_model.okc_project_local
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
