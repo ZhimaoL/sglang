@@ -19,7 +19,16 @@ _PLACEMENT_PATH = os.path.join(
 @functools.cache
 def _placement() -> dict:
     with open(_PLACEMENT_PATH) as f:
-        return json.load(f)
+        placement = json.load(f)
+    if "owner" in placement:
+        # Compact form: owner[layer][e] is the rank holding expert e, one digit per expert (ep_size <= 10). Expanded to
+        # the list form, each rank's experts ascending, so every reader sees the same table either way.
+        n = placement["ep_size"]
+        placement["layers"] = {
+            k: [[e for e, r in enumerate(s) if int(r) == rank] for rank in range(n)]
+            for k, s in placement.pop("owner").items()
+        }
+    return placement
 
 
 def local_expert_ids(
