@@ -53,6 +53,8 @@ MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 # st folds the pre-expert RMSNorm into its gate/up kernel (bit-identical to F.rms_norm, as pg_gather_norm), saving the
 # separate norm launch on every st layer.
 SW_ST_NORM_FOLD = _flag("OKC_SW_ST_NORM_FOLD", "1")
+# st runs pg_rep_assign's balancer (or the home map) in its own CTAs, saving that launch (bit-identical).
+SW_ST_REP_FOLD = _flag("OKC_SW_ST_REP_FOLD", "1")
 
 
 # Verify-side kernel stack (kernel-track grafts): fused sliding-window / full attention for decode and verify,
@@ -68,6 +70,8 @@ SW_SMALLM = _flag("OKC_SW_SMALLM", "1")
 # per call over F.linear in two runs (serving/kernels/lt/RESULTS.md); dispatched after smallm.
 SW_LT = _flag("OKC_SW_LT", "1")
 SW_ROUTER = _flag("OKC_SW_ROUTER", "1")
+# router split-K reduce + routing in one launch (router.route_small, bit-identical)
+SW_ROUTE_FUSED = _flag("OKC_SW_ROUTE_FUSED", "1")
 # Kill switch of the attn-v3 sliding verify kernels (default on; "0" runs the stock path for the sliding layers).
 SW_ATTN_V3 = _flag("OKC_SW_ATTN_V3", "1")
 # Split-KV partial accumulators of the attn-v3 sliding kernels: "0" (default) keeps them fp32 like FA3; "1" stores
@@ -231,9 +235,9 @@ RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD",
+           "MOE_REP_PREFILL", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS",
-           "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
+           "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",
            "SW_VFG_FULL1",

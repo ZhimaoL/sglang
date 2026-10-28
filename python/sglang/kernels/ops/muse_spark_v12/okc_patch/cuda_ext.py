@@ -15,6 +15,7 @@ _GLUE_EXT = None
 _WST_EXT = None
 _VFG_EXT = None
 _DRAFT_EXT = None
+_ROUTE_EXT = None
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -114,9 +115,10 @@ def st_ext():
 
                 # bf16 scales and the 64-slot table (the lane's okc_st_moe_c1 reads 8-bit codes, 32 slots)
                 _ST_EXT = load_inline(
-                    name="okc_st_moe_c5_s16_e64",
+                    name="okc_st_moe_c7_s16_e64",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "torch::Tensor, torch::Tensor, torch::Tensor, int64_t, torch::Tensor, double);",
+                    "torch::Tensor, torch::Tensor, torch::Tensor, int64_t, torch::Tensor, double, torch::Tensor, "
+                    "int64_t, int64_t, torch::Tensor);",
                     cuda_sources=_st_src._CUDA_SRC,
                     functions=["st_moe"],
                     extra_cuda_cflags=[
@@ -127,6 +129,28 @@ def st_ext():
                     verbose=False,
                 )
     return _ST_EXT
+
+
+def route_ext():
+    global _ROUTE_EXT
+    if _ROUTE_EXT is None:
+        with _lock:
+            if _ROUTE_EXT is None:
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_route import _CUDA_SRC
+
+                # no --use_fast_math, as reduce_k<2> and the routing kernel
+                _ROUTE_EXT = load_inline(
+                    name="okc_route_c8",
+                    cpp_sources="void route(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "int64_t, int64_t, double, double, double, int64_t);",
+                    cuda_sources=_CUDA_SRC,
+                    functions=["route"],
+                    extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+                    verbose=False,
+                )
+    return _ROUTE_EXT
 
 
 def proj_ext():

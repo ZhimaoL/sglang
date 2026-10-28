@@ -207,12 +207,38 @@ def _moe_st(layer, x, topk_scores, topk_ids, state, norm_weight=None, norm_eps=0
     its gate/up kernel (norm_weight, norm_eps from _norm_fold)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import st_moe
 
-    local_ids = local_routes(layer, topk_ids)
+    rep = _st_rep(layer, topk_ids)
+    ids = topk_ids if rep is not None else local_routes(layer, topk_ids)
     y = st_moe.grouped_st(
-        x, local_ids, wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.MOE_ST_PDL,
-        norm_weight=norm_weight, norm_eps=norm_eps,
+        x, ids, wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.MOE_ST_PDL,
+        norm_weight=norm_weight, norm_eps=norm_eps, rep=rep,
     )
+    if rep is not None:
+        y, local_ids = y
+    else:
+        local_ids = ids
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
+
+
+def _st_rep(layer, topk_ids):
+    """(table, rank, passes) for st to take local_routes' decision itself: the balancer's, or a static home-map one;
+    None = local_routes' launch."""
+    if not _sw.SW_ST_REP_FOLD or topk_ids.dtype is not torch.int32 or not topk_ids.is_contiguous():
+        return None
+    mode = _rep_mode(layer, topk_ids.shape[0])
+    if mode == "assign":                               # passes: local_routes' weights on the st chain
+        return layer._okc_rep_table, layer.replica_plan["me"], True
+    if mode is not None or layer._expert_map is None:
+        return None
+    tab = getattr(layer, "_okc_st_home_tab", None)
+    if tab is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        # rank 0's view: held experts (slot) home here, the rest on rank 1
+        emap = layer._expert_map.to(torch.int32)
+        tab = torch.where(emap >= 0, emap, torch.full_like(emap, 255 | (1 << 8)))
+        tab = layer._okc_st_home_tab = tab.contiguous()
+    return tab, 0, False
 
 
 def _norm_fold(hidden_states, pre_expert_norm):

@@ -3,7 +3,7 @@
 pg tiles tokens 64 wide, so at T <= 64 a round of items costs the n64 wgmma time whatever the token count. st reads
 the same blocks (pg_moe.pack_wsf) with mma.sync m16n8k16 (one warp's 16 rows of a pg block are its A fragment), pg's
 decode and the same BF16 x BF16 -> fp32 math: every CTA builds the routing table from local_ids (32 home + replica
-slots; an expert with c routes runs ceil(c / 8) passes), takes an equal range of 16-row slabs and splits K over its
+slots; an expert with c routes runs ceil(c / 8) passes; or global ids + the balancer's table: rep=), takes an equal range of 16-row slabs and splits K over its
 16 warps (partials summed in warp order: deterministic); the epilogues are pg's, so y has pg's per-route scaling and
 the finalize applies unchanged. Graph-capturable; OKC_MOE_ST_PDL launches the down kernel with PDL.
 """
@@ -20,18 +20,28 @@ def h_rows(numel: int, n_local: int = 32) -> int:
     return (n_local + numel // 8) * 8
 
 
-_NO_NORM = {}
+_EMPTY = {}
 
 
-def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False, norm_weight=None, norm_eps=0.0):
+def _empty(dtype, device):
+    key = (dtype, device)
+    t = _EMPTY.get(key)
+    if t is None:
+        t = _EMPTY[key] = torch.empty(0, dtype=dtype, device=device)
+    return t
+
+
+def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False, norm_weight=None, norm_eps=0.0, rep=None):
     """x [T, 4096] bf16 (T <= 128), local_ids [T, 8] int32 (-1 = not local) -> y [T*8, 4096] bf16 per-route expert
-    outputs with pg's scaling (rows of non-local routes stay unwritten): the contract of pg_moe.grouped_pg."""
+    outputs with pg's scaling (rows of non-local routes stay unwritten): the contract of pg_moe.grouped_pg.
+    rep = (table, rank, passes): local_ids are global ids, the kernels run pg_rep_assign -> (y, its slots)."""
     numel = local_ids.numel()
     h = torch.empty((h_rows(numel, wsf13.shape[0]), 4096), dtype=torch.bfloat16, device=x.device)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
     if norm_weight is None:                            # x already normed
-        norm_weight = _NO_NORM.get(x.device)
-        if norm_weight is None:
-            norm_weight = _NO_NORM[x.device] = torch.empty(0, dtype=torch.bfloat16, device=x.device)
-    st_ext().st_moe(x, local_ids.reshape(-1), wsf13, gs13, wsf2, h, y, 1 if pdl else 0, norm_weight, float(norm_eps))
-    return y
+        norm_weight = _empty(torch.bfloat16, x.device)
+    tab, me, passes = rep if rep is not None else (_empty(torch.int32, x.device), 0, 0)
+    lids = torch.empty(local_ids.shape, dtype=torch.int32, device=x.device) if rep is not None else tab
+    st_ext().st_moe(x, local_ids.reshape(-1), wsf13, gs13, wsf2, h, y, 1 if pdl else 0, norm_weight, float(norm_eps),
+                    tab, me, 1 if passes else 0, lids)
+    return y if rep is None else (y, lids)

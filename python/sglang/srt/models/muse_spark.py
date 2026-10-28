@@ -944,11 +944,18 @@ class MuseSpark1xMoE(nn.Module):
             if use_side_stream
             else contextlib.nullcontext()
         ):
-            router_logits = None
+            router_logits = routed_small = None
             # okc router.py covers T <= 256 (its T 9..256 path beats forward_split2 ~2x); larger T declines to it.
-            if okc_patch.SW_ROUTER:
+            # route_small: reduce + routing in one launch (SP keeps the logits for its dispatcher)
+            if okc_patch.SW_ROUTER and okc_patch.SW_ROUTE_FUSED and not sp_active:
+                routed_small = okc_router.route_small(
+                    self.gate, hidden_states, self._routing_op(), self.top_k
+                )
+            if routed_small is not None:
+                topk_scores, topk_ids, packed_topk_ids = routed_small
+            elif okc_patch.SW_ROUTER:
                 router_logits = okc_router.router_logits_small(self.gate, hidden_states)
-            if router_logits is None:
+            if routed_small is None and router_logits is None:
                 if not use_split2 and router_input is None:
                     router_input = (
                         hidden_states.float() if self.router_in_fp32 else hidden_states
@@ -958,9 +965,10 @@ class MuseSpark1xMoE(nn.Module):
                     if use_split2
                     else self.gate(router_input)
                 )
-            topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
-                None, router_logits, self.top_k, True, want_packed=True
-            )
+            if routed_small is None:
+                topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
+                    None, router_logits, self.top_k, True, want_packed=True
+                )
         if ovl_pool:
             routed = torch.cuda.Event()
             routed.record(side_stream)
