@@ -73,7 +73,7 @@ def st_ext():
                 )
 
                 _ST_EXT = load_inline(
-                    name="okc_st_moe_c2",
+                    name="okc_st_moe_c3",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, int64_t);",
                     cuda_sources=_CUDA_SRC,

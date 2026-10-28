@@ -22,8 +22,9 @@ MAX_TOKENS = 32     # the kernels' table holds 256 routes (top-8)
 
 
 def h_rows(numel: int) -> int:
-    # intermediate rows: 8 per pass; passes = sum over experts of ceil(c / 8) <= 32 + numel / 8
-    return (32 + numel // 8) * 8
+    # intermediate rows: P per pass (P = 8, or 16 at T > 8); passes = sum over experts of ceil(c / P) <= 32 + numel / P
+    p = 16 if numel > 64 else 8
+    return (32 + numel // p) * p
 
 
 def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False):
