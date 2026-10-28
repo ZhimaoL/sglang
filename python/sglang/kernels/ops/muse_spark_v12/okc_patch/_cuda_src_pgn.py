@@ -161,8 +161,10 @@ DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, un
     # 128-token blocks
     s = _rep(s, "constexpr int XNT = 256;                 // tokens per tile (wgmma n)",
              "constexpr int XNT = 128;                 // tokens per block (narrow build: the widest item)")
-    s = _rep(s, "constexpr int SB  = 37888;               // stage stride: X 32768 + W|sf 4608 padded to a whole number of 1024 B atoms",
-             "constexpr int SB  = 26624;               // stage stride: PAIR X 2 x 8 KB + W|sf 2 x 4608, whole 1024 B atoms")
+    sb = [ln for ln in s.split("\n") if ln.startswith("constexpr int SB  = ")]
+    if len(sb) != 1:
+        raise RuntimeError("pg narrow build: no unique SB line in the shipped source")
+    s = _rep(s, sb[0], "constexpr int SB  = (16384 + 2 * WSB + 1023) / 1024 * 1024;   // PAIR stage: X 2 x 8 KB + W|sf 2 x WSB")
     s = _rep(s, """            int code = 15;
             if (live_blk && bm == 256) {
                 const int* sid = sorted_ids + (size_t)pm * 256;

@@ -103,11 +103,13 @@ def block_m(num_tokens: int) -> int:
 def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
     """x [T, 4096] bf16 -> y [T*8, 4096] bf16 per-route expert outputs (rows of non-local routes stay
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded
-    come from moe_align_block_size(local_ids, block_m(T), ...) with -1 for non-local routes."""
+    come from moe_align_block_size(local_ids, bm, ...) with -1 for non-local routes; bm = 256 runs the shipped build,
+    bm = 128 the narrow one (block_m(T) is the serving choice)."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
     num_pid_m = block_experts.shape[0]
-    bm = block_m(num_tokens)
+    # the caller's alignment picks the build: moe_align sizes block_experts as cdiv(len(sorted_ids), block size)
+    bm = 128 if -(-sorted_ids.numel() // 128) == num_pid_m else _BLOCK_M
     ext = pg_narrow_ext() if bm != _BLOCK_M else pg_ext()
     live = torch.empty((num_pid_m + 1,), dtype=torch.int32, device=x.device)
     ext.tiles(block_experts, n_padded, sorted_ids, live, num_pid_m, bm, numel, _WMASK)
