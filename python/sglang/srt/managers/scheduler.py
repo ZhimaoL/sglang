@@ -1309,10 +1309,15 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
         self.small_prefill_first = SmallPrefillFirst(
             enabled=bool(get_schedule().small_prefill_first),
             mid_chunk_enabled=bool(get_schedule().mid_chunk_prefill_admission),
+            between_chunk_enabled=okc_patch.SW_BETWEEN_CHUNK,
+            between_chunk_max_reqs=okc_patch.BETWEEN_CHUNK_MAX_REQS,
         )
+        self._okc_between_batch = False
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1995,6 +2000,8 @@ class Scheduler(
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            if self._okc_wait_chunk_boundary():
+                self.ingest_requests()
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -2048,6 +2055,27 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _okc_wait_chunk_boundary(self) -> bool:
+        """Between-chunk admission: with a middle chunk in flight, wait for its target forward before picking what
+        follows it, so a follow-up that arrived meanwhile can go between the chunks. The DFlash draft-KV write of the
+        chunk is still queued behind that event (~15 ms on a 16K chunk), which covers the next launch. Returns True
+        when it waited (the caller polls the queue again)."""
+        if (
+            self.chunked_req is None
+            or not self.result_queue
+            or not self.small_prefill_first.wait_for_chunk_boundary(
+                num_running=self.running_batch.batch_size(),
+                num_waiting=len(self.waiting_queue),
+            )
+        ):
+            return False
+        last_batch, last_result = self.result_queue[-1]
+        done = getattr(last_result, "okc_target_done", None)
+        if done is None or not any(req is self.chunked_req for req in last_batch.reqs):
+            return False
+        done.synchronize()
+        return True
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -3788,6 +3816,7 @@ class Scheduler(
                     batch=new_batch,
                     chunked_req=self.chunked_req,
                     has_waiting=bool(self.waiting_queue),
+                    between_chunk=self._okc_between_batch,
                 )
 
         need_mlp_sync = self.require_mlp_sync
@@ -3958,6 +3987,7 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
+        self._okc_between_batch = False
         small_first = self.small_prefill_first.small_first_order(
             waiting_queue=self.waiting_queue,
             tree_cache=self.tree_cache,
@@ -3970,6 +4000,17 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        # Between-chunk admission: the small waiting requests go alone, the chunked request sits this pass out.
+        between = None
+        if self.chunked_req is not None and self.chunked_prefill_size:
+            between = self.small_prefill_first.between_chunk_order(
+                waiting_queue=self.waiting_queue,
+                tree_cache=self.tree_cache,
+                num_running=running_bs,
+                chunk_size=self.chunked_prefill_size,
+            )
+            if between is not None:
+                between_reqs, chunked_prefill_size = between
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
@@ -4002,7 +4043,7 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
+        if self.chunked_req is not None and between is None:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
@@ -4041,7 +4082,7 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in between_reqs if between is not None else self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4168,8 +4209,9 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
+        if self.chunked_req is not None and between is None:
             self.chunked_req.inflight_middle_chunks += 1
+        self._okc_between_batch = between is not None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4182,11 +4224,11 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_req=self.chunked_req if between is None else None,
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            between is not None or self.chunked_req is None or len(can_run_list) != 1
         )
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:

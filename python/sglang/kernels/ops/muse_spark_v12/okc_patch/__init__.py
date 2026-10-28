@@ -211,6 +211,13 @@ HICACHE_STAGING_PAGES = max(1, int(os.environ.get("OKC_HICACHE_STAGING_PAGES", "
 # ~400 ms per first-turn chunk; the GPU then idles behind each later launch: ~7.4 ms post-extend + ~3 ms in verify
 # step 1 at bs1, serving/score/HOST-OVERHEAD.md). Same values. Default off until measured on 8xH200.
 SW_PREFILL_HANDOFF = _flag("OKC_SW_PREFILL_HANDOFF", "0")
+# Between-chunk admission (srt/managers/small_prefill_first.py): at low load (running + waiting <=
+# OKC_BETWEEN_CHUNK_MAX_REQS) a follow-up that arrives while a first turn is being chunked is prefilled on its own between
+# two full-size chunks, then gets the decode steps that show its first token. The scheduler picks what follows a chunk
+# only once that chunk's target forward is done. A follow-up then waits <= one chunk (~0.45 s) instead of the whole first
+# turn (~2.1 s at c4, which moved the c4 TTFT p90 past the 2x gate in S8). Same work, same chunk size. Default off.
+SW_BETWEEN_CHUNK = _flag("OKC_SW_BETWEEN_CHUNK", "0")
+BETWEEN_CHUNK_MAX_REQS = int(os.environ.get("OKC_BETWEEN_CHUNK_MAX_REQS", "8"))
 
 # The running batch's DFLASH verify rides along in prefill / extend forwards (srt/managers/ride_along.py): its 8-row
 # blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
@@ -232,5 +239,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
-           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "RIDE_ALONG",
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "RIDE_ALONG",
            "ANY_ATTN"]
