@@ -107,6 +107,45 @@ def _seq_pre(ctx: dict, cache_seqlens, q_len: int):
     return seq
 
 
+def _layer_eps(attn) -> Optional[float]:
+    """The layer's norm eps when the kernels' fused contract holds for it, else None."""
+    # The kernels fuse per-head QK RMSNorm, the output RMSNorm and the sigmoid gate;
+    # a layer without any of the three computes something else.
+    if not (attn.use_qk_norm and attn.use_o_norm and attn.use_o_gate):
+        return None
+    # Both norms take the layer's norm_eps (FusedQKNorm and the output RMSNorm are built
+    # with it); the kernels apply that same EPS to q, k and the output.
+    eps = getattr(attn, "norm_eps", None)
+    if eps is None or attn.attn.logit_cap:
+        return None
+    return float(eps)
+
+
+def _pool_contract(attn, qkv, k_cache):
+    """(hq, hkv, d, is_fp8, kv_scale) when qkv and the layer's pool fit the kernels, else None."""
+    hq, hkv, d = attn.num_heads, attn.num_kv_heads, attn.head_dim
+    if hq % hkv or d & (d - 1) or qkv.shape[1] != (2 * hq + 2 * hkv) * d:
+        return None
+    if qkv.dtype is not torch.bfloat16 or not qkv.is_contiguous():
+        return None
+    if k_cache.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        return None
+    if k_cache.dim() != 3 or k_cache.shape[1] != hkv or k_cache.shape[2] != d:
+        return None
+    is_fp8 = k_cache.dtype is torch.float8_e4m3fn
+    k_scale = attn.attn.k_scale_float
+    v_scale = attn.attn.v_scale_float
+    if is_fp8:
+        kv_scale = 1.0 if k_scale is None else float(k_scale)
+        if (1.0 if v_scale is None else float(v_scale)) != kv_scale:
+            return None
+    else:
+        if k_scale is not None and float(k_scale) != 1.0:
+            return None
+        kv_scale = 1.0
+    return hq, hkv, d, is_fp8, kv_scale
+
+
 def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
     """Dispatch gated_attention to an OKC path; None = stock path."""
     if torch.compiler.is_compiling():
@@ -118,19 +157,10 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
         q_len = -1  # resolved from metadata below
     else:
         return None
-    # The kernels fuse per-head QK RMSNorm, the output RMSNorm and the sigmoid gate;
-    # a layer without any of the three computes something else.
-    if not (attn.use_qk_norm and attn.use_o_norm and attn.use_o_gate):
-        return None
-    # Both norms take the layer's norm_eps (FusedQKNorm and the output RMSNorm are built
-    # with it); the kernels apply that same EPS to q, k and the output.
-    eps = getattr(attn, "norm_eps", None)
+    eps = _layer_eps(attn)
     if eps is None:
         return None
-    eps = float(eps)
     radix = attn.attn
-    if radix.logit_cap:
-        return None
     if forward_batch.dcp_kv_mask is not None:
         return None
     from sglang.srt.layers.cp.utils import is_cp_active
@@ -162,30 +192,14 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
             return None
     elif tokens != bs:
         return None
-    hq, hkv, d = attn.num_heads, attn.num_kv_heads, attn.head_dim
-    if hq % hkv or d & (d - 1) or qkv.shape[1] != (2 * hq + 2 * hkv) * d:
-        return None
-    if qkv.dtype is not torch.bfloat16 or not qkv.is_contiguous():
-        return None
 
     pool = get_token_to_kv_pool()
     k_cache = pool.get_key_buffer(attn.layer_idx)
     v_cache = pool.get_value_buffer(attn.layer_idx)
-    if k_cache.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+    contract = _pool_contract(attn, qkv, k_cache)
+    if contract is None:
         return None
-    if k_cache.dim() != 3 or k_cache.shape[1] != hkv or k_cache.shape[2] != d:
-        return None
-    is_fp8 = k_cache.dtype is torch.float8_e4m3fn
-    k_scale = radix.k_scale_float
-    v_scale = radix.v_scale_float
-    if is_fp8:
-        kv_scale = 1.0 if k_scale is None else float(k_scale)
-        if (1.0 if v_scale is None else float(v_scale)) != kv_scale:
-            return None
-    else:
-        if k_scale is not None and float(k_scale) != 1.0:
-            return None
-        kv_scale = 1.0
+    hq, hkv, d, is_fp8, kv_scale = contract
 
     window = radix.sliding_window_size
     is_swa_layer = window is not None and window > -1
@@ -219,6 +233,50 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
         )
     if theta is not None or backend.page_size != 1:
         return None
+    return _full_rows(
+        ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+        bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d, is_fp8=is_fp8,
+        kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
+    )
+
+
+def verify_full_rows(attn, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+                     bs, q_len=8, ctx=None) -> Optional[torch.Tensor]:
+    """A full-attention layer's verify blocks on explicit rows (ride-along riders inside an EXTEND forward): the
+    same eligibility and routing as a TARGET_VERIFY step in try_attention (wst from OKC_WST_MIN_BS, fs below it).
+
+    qkv: the blocks' pre-norm projection rows [bs * q_len, (2 hq + 2 hkv) d] (row slices of the forward's qkv are
+    fine); k_cache / v_cache: the layer's pool [rows, hkv, d] (page size 1); cache_loc: the blocks' reserved slots
+    [bs * q_len] (their new k / v rows are (re)written there); seq_pre: int32 [bs] committed lengths (cache_seqlens -
+    q_len); page_table: int32 rows >= bs (any width, any pitch), positions [0, seq_pre + q_len) of request b in row b;
+    ctx: a per-step dict for the fs route's sort metadata (bs below OKC_WST_MIN_BS). Returns the gated output
+    [bs * q_len, hq * d] bf16, or None when not handled (the caller keeps its own path)."""
+    if torch.compiler.is_compiling() or q_len != 8:
+        return None
+    eps = _layer_eps(attn)
+    if eps is None or attn.rotary_emb is not None:
+        return None
+    window = attn.attn.sliding_window_size
+    if window is not None and window > -1:
+        return None
+    contract = _pool_contract(attn, qkv, k_cache)
+    if contract is None:
+        return None
+    hq, hkv, d, is_fp8, kv_scale = contract
+    if qkv.shape[0] != bs * q_len or cache_loc.numel() != bs * q_len:
+        return None
+    if seq_pre.dtype is not torch.int32 or seq_pre.numel() != bs or page_table.shape[0] < bs:
+        return None
+    return _full_rows(
+        {} if ctx is None else ctx, qkv, k_cache, v_cache, cache_loc, seq_pre.contiguous(), page_table,
+        bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d, is_fp8=is_fp8,
+        kv_scale=kv_scale, sm_scale=d**-0.5, qk_factor=attn.scale_query_by, eps=eps,
+    )
+
+
+def _full_rows(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+               bs, q_len, hq, hkv, d, is_fp8, kv_scale, sm_scale, qk_factor, eps):
+    """Full-layer routing (decode and verify); None = stock path."""
     # The wst kernels hard-code the TP8 head layout (16 q / 2 kv heads of 64) and read e4m3 cache bytes.
     if (q_len == 8 and bs >= max(1, WST_MIN_BS) and SW_WST and is_fp8 and hq == 16 and hkv == 2 and d == 64
             and page_table.dtype is torch.int32 and page_table.stride(1) == 1):
