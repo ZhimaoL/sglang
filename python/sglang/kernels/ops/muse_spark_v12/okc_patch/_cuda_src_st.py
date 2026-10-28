@@ -24,7 +24,8 @@ constexpr int NW = 16;            // warps per CTA; warp w owns k-tiles KPW*w ..
 constexpr int KPW = NKT / NW;     // 4
 constexpr int NTHR = NW * 32;
 constexpr int ELOC = 64;          // local slots at most (32 home + replicas); the call's count nl comes from wsf13
-constexpr int NUMEL_MAX = 512;    // T <= 64, top-8 (one table thread per route)
+constexpr int NUMEL_MAX = 1024;   // T <= 128, top-8 (RPT routes per table thread)
+constexpr int RPT = NUMEL_MAX / NTHR;
 constexpr int VAMAX = ELOC + NUMEL_MAX / 8;   // passes (<= 8 tokens each): <= nl + numel / 8
 constexpr int R = 4;              // partial ring slots
 
@@ -109,29 +110,32 @@ struct Tab {
     int nva;
     int va_e[VAMAX];
     int va_n[VAMAX];
-    int va_rt[VAMAX][8];      // route index (token * 8 + k) of the pass's tokens, route order
+    unsigned short va_rt[VAMAX][8];   // route index (token * 8 + k) of the pass's tokens, route order
     float gs[ELOC];
 };
 
 // Routing table of the call from local_ids (-1 = not local), identical in every CTA of both kernels: an expert's
 // routes in route order, split in passes of 8 (ascending expert, then pass). No atomics.
 DINL void build_tab(const int* __restrict__ ids, int numel, int nl, const float* __restrict__ gs, Tab& tb,
-                    int (*wcnt)[ELOC], int* vbase) {
+                    unsigned short (*wcnt)[ELOC], int* vbase) {
+    // route r = tid + j * NTHR (j < RPT) sits in 32-route group (w + j * NW): per-group, per-expert counts
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     for (int i = tid; i < (NUMEL_MAX / 32) * ELOC; i += NTHR) (&wcnt[0][0])[i] = 0;
-    int id = -1;
-    if (tid < NUMEL_MAX && tid < numel) {
-        id = ids[tid];
-        if ((unsigned)id >= (unsigned)nl) id = -1;
+    int id[RPT], rank[RPT];
+#pragma unroll
+    for (int j = 0; j < RPT; j++) {
+        const int r = tid + j * NTHR;
+        id[j] = r < numel ? ids[r] : -1;
+        if ((unsigned)id[j] >= (unsigned)nl) id[j] = -1;
     }
     if (gs != nullptr && tid >= NTHR - ELOC && tid - (NTHR - ELOC) < nl)
         tb.gs[tid - (NTHR - ELOC)] = gs[tid - (NTHR - ELOC)];
     __syncthreads();
-    int rank = 0;
-    if (w < NUMEL_MAX / 32) {
-        const unsigned m = __match_any_sync(0xFFFFFFFFu, id);
-        rank = __popc(m & ((1u << lane) - 1u));
-        if (id >= 0 && rank == 0) wcnt[w][id] = __popc(m);
+#pragma unroll
+    for (int j = 0; j < RPT; j++) {
+        const unsigned m = __match_any_sync(0xFFFFFFFFu, id[j]);
+        rank[j] = __popc(m & ((1u << lane) - 1u));
+        if (id[j] >= 0 && rank[j] == 0) wcnt[w + j * NW][id[j]] = __popc(m);
     }
     __syncthreads();
     if (w == 0) {                                        // warp 0: per-expert totals, pass counts, scan
@@ -157,9 +161,12 @@ DINL void build_tab(const int* __restrict__ ids, int numel, int nl, const float*
         if (lane == 0) tb.nva = carry;
     }
     __syncthreads();
-    if (id >= 0) {
-        const int k = wcnt[w][id] + rank;
-        tb.va_rt[vbase[id] + (k >> 3)][k & 7] = tid;
+#pragma unroll
+    for (int j = 0; j < RPT; j++) {
+        if (id[j] >= 0) {
+            const int k = wcnt[w + j * NW][id[j]] + rank[j];
+            tb.va_rt[vbase[id[j]] + (k >> 3)][k & 7] = tid + j * NTHR;
+        }
     }
     __syncthreads();
 }
@@ -179,7 +186,7 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
     __shared__ __align__(16) float4 part[R][NW][32];   // per-warp slab partials
     __shared__ __align__(16) unsigned short scr[NW][128];
     __shared__ __align__(8) unsigned long long bars[2 * R];   // full[R] | empty[R]
-    __shared__ int s_wcnt[NUMEL_MAX / 32][ELOC];
+    __shared__ unsigned short s_wcnt[NUMEL_MAX / 32][ELOC];
     __shared__ int s_vbase[ELOC];
 
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -323,7 +330,7 @@ static int st_num_sms() {
 void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tensor gs13, torch::Tensor wsf2,
             torch::Tensor h, torch::Tensor y, int64_t pdl) {
     const int numel = (int)ids.numel();
-    TORCH_CHECK(numel <= stk::NUMEL_MAX && numel == x.size(0) * 8 && x.size(1) == stk::H, "st: T <= 64, top-8, H 4096");
+    TORCH_CHECK(numel <= stk::NUMEL_MAX && numel == x.size(0) * 8 && x.size(1) == stk::H, "st: T <= 128, top-8, H 4096");
     TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous() && x.is_contiguous(), "st: int32 ids, contiguous x");
     const int nl = (int)wsf13.size(0);
     TORCH_CHECK(nl >= 1 && nl <= stk::ELOC && wsf13.size(1) == 64 && wsf13.size(2) == stk::NKT &&
