@@ -23,12 +23,6 @@ DINL void mbar_init(unsigned bar, unsigned count) {
 DINL void mbar_arrive(unsigned bar) {
     asm volatile("mbarrier.arrive.shared.b64 _, [%0];" :: "r"(bar) : "memory");
 }
-DINL void mbar_expect_tx(unsigned bar, unsigned bytes) {
-    asm volatile("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;" :: "r"(bar), "r"(bytes) : "memory");
-}
-DINL void mbar_arrive_expect_tx(unsigned bar, unsigned bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"(bar), "r"(bytes) : "memory");
-}
 DINL void mbar_wait(unsigned bar, unsigned phase) {
     asm volatile(
         "{\n.reg .pred p;\nWAIT_%=:\n"
@@ -37,20 +31,9 @@ DINL void mbar_wait(unsigned bar, unsigned phase) {
 }
 DINL void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
 DINL void fence_barrier_init() { asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory"); }
-DINL void tma_row(unsigned dst, const CUtensorMap* map, int row, unsigned bar) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(map), "r"(0), "r"(row), "r"(bar) : "memory");
-}
-
-DINL void cpa16_zfill(unsigned dst, const void* src, int bytes) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(bytes) : "memory");
-}
 DINL void cpa_mbar_arrive_noinc(unsigned bar) {
     asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" :: "r"(bar) : "memory");
 }
-DINL void pbar() { asm volatile("bar.sync 3, 256;" ::: "memory"); }
-
 DINL void fence_u(unsigned& x) { asm volatile("" : "+r"(x)); }
 DINL void fence_f(float& x)    { asm volatile("" : "+f"(x)); }
 template <int N> DINL void fence_ubank(unsigned (&b)[N]) {
@@ -63,11 +46,6 @@ template <int N> DINL void fence_fbank(float (&b)[N]) {
 }
 
 // no-swizzle (interleaved core matrices) descriptor - the V images
-DINL unsigned long long make_desc(unsigned saddr, unsigned lbo, unsigned sbo) {
-    return (unsigned long long)((saddr >> 4) & 0x3FFF)
-         | ((unsigned long long)((lbo >> 4) & 0x3FFF) << 16)
-         | ((unsigned long long)((sbo >> 4) & 0x3FFF) << 32);
-}
 // 128B-swizzled K-major descriptor (TMA SWIZZLE_128B tiles, 128B rows, 8-row groups 1024B)
 DINL unsigned long long make_desc_sw128(unsigned saddr) {
     return (unsigned long long)((saddr >> 4) & 0x3FFF)
@@ -92,33 +70,8 @@ DINL void wgmma_qk(unsigned* d, unsigned* a, unsigned long long db) {
         : "l"(db), "n"(ACC));
 }
 
-DINL void wgmma_pv(float* d, unsigned* a, unsigned long long db) {
-    asm volatile(
-        "{\n.reg .pred p;\nsetp.ne.b32 p, %37, 0;\n"
-        "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3\n"
-        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
-        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31},"
-        "{%32,%33,%34,%35}, %36, p, 1, 1;\n}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+r"(a[0]), "+r"(a[1]), "+r"(a[2]), "+r"(a[3])
-        : "l"(db), "n"(1));
-}
-
 DINL __half2 u32h2(unsigned v) { return *reinterpret_cast<__half2*>(&v); }
 DINL unsigned h2u32(__half2 v) { return *reinterpret_cast<unsigned*>(&v); }
-DINL unsigned ex2_f16x2(unsigned x) {
-    unsigned r;
-    asm("ex2.approx.f16x2 %0, %1;" : "=r"(r) : "r"(x));
-    return r;
-}
-DINL unsigned short cvt_e4m3x2(unsigned h2) {
-    unsigned short r;
-    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(r) : "r"(h2));
-    return r;
-}
 DINL unsigned prmt(unsigned a, unsigned b, unsigned sel) {
     unsigned r;
     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
