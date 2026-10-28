@@ -7,7 +7,8 @@ call stays stock (QK norm, KV store, output norm and gate); try_extend computes 
 and returns None whenever it does not apply, so the backend calls FA3.
 
 Applies to: Muse target layers (MuseSpark1xAttention marks its RadixAttention), forward mode EXTEND, one
-request (uniform q_len, the 16K chunks of a first turn and single follow-up extends), q / KV e4m3, page size 1,
+request (the 16K chunks of a first turn and single follow-up extends; a ragged co-batch with OKC_PFMHA_RAGGED,
+one call per request), q / KV e4m3, page size 1,
 16 q heads / 2 kv heads / head dim 64 per rank, causal, no softcap / sinks / score mod, not under capture.
 Full layers attend [0, len); sliding layers (OKC_PFMHA_SLIDING) the 2048-key window. Below
 OKC_PFMHA_MIN_TOKENS real tokens FA3 keeps the call.
@@ -26,6 +27,9 @@ import torch
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     PFMHA_MIN_TOKENS,
+    PFMHA_RAGGED,
+    PFMHA_RAGGED_MAX_BS,
+    PFMHA_RAGGED_MIN_TOKENS,
     PFMHA_SLIDING,
     PFMHA_SLIDING_MIN_TOKENS,
 )
@@ -105,9 +109,8 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
         return _decline(tokens, threshold)
     if is_swa and window_size[1] != 0:
         return _decline(tokens, threshold)
-    if forward_batch.batch_size != 1 or cu_seqlens_q is None or cu_seqlens_q.numel() != 2:
-        return _decline(tokens, threshold)
-    if int(max_seqlen_q) != tokens:
+    bs = forward_batch.batch_size
+    if cu_seqlens_q is None or cu_seqlens_q.numel() != bs + 1 or (bs > 1 and not PFMHA_RAGGED):
         return _decline(tokens, threshold)
     if (layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, layer.v_head_dim) != (HQ, HKV, D, D):
         return _decline(tokens, threshold)
@@ -118,10 +121,28 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
         return _decline(tokens, threshold)
     if page_table is None or page_table.dtype is not torch.int32 or page_table.stride(1) != 1:
         return _decline(tokens, threshold)
-    if cache_seqlens is None or cache_seqlens.dtype is not torch.int32 or cache_seqlens.numel() != 1:
+    if page_table.shape[0] != bs or cache_seqlens is None or cache_seqlens.dtype is not torch.int32:
         return _decline(tokens, threshold)
-    max_len = page_table.shape[1]  # = metadata.max_seq_len_k, the request's prefix + chunk (host int)
-    if max_len < tokens:
+    if cache_seqlens.numel() != bs:
+        return _decline(tokens, threshold)
+    if bs == 1:
+        if int(max_seqlen_q) != tokens:
+            return _decline(tokens, threshold)
+        # page_table = req_to_token[req, :max_seq_len_k]: its width is the request's prefix + chunk (host int)
+        reqs = [(0, tokens, page_table.shape[1])]
+    else:
+        # A ragged co-batch (follow-up extends): one call per request, each >= OKC_PFMHA_RAGGED_MIN_TOKENS.
+        q_lens = forward_batch.extend_seq_lens_cpu
+        seq_cpu = forward_batch.seq_lens_cpu
+        if q_lens is None or seq_cpu is None or len(q_lens) != bs or sum(q_lens) != tokens:
+            return _decline(tokens, threshold)
+        if min(q_lens) < PFMHA_RAGGED_MIN_TOKENS or bs > PFMHA_RAGGED_MAX_BS:
+            return _decline(tokens, threshold)
+        reqs, off = [], 0
+        for i, n in enumerate(q_lens):
+            reqs.append((off, int(n), int(seq_cpu[i])))
+            off += int(n)
+    if any(max_len < n or max_len > page_table.shape[1] for _, n, max_len in reqs):
         return _decline(tokens, threshold)
 
     device = q.device
@@ -134,12 +155,30 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     # (expanded [bs, hkv] descale views of the layer's [] scale: data_ptr()[0] is that scale)
 
     ext = fmha_ext()
-    L = tokens
     win = window_size[0] + 1 if is_swa else 0
-    cap = ((min(win - 1 + L, max_len) if win else max_len) + 255) & ~255
-    capblks = cap // 128
+    if out is None or out.dtype is not torch.bfloat16 or not out.is_contiguous() or out.numel() != tokens * HQ * D:
+        out = torch.empty((tokens, HQ, D), dtype=torch.bfloat16, device=device)
+    o = out.view(tokens, HQ, D)
+    smqk = float(layer.scaling) * LOG2E
+    q8 = q.contiguous().view(torch.uint8).view(tokens, HQ * D)
     kc = key_cache.view(torch.uint8)
     vc = value_cache.view(torch.uint8)
+    for i, (off, L, max_len) in enumerate(reqs):
+        nc, split = _one(ext, q8[off:off + L], kc, vc, page_table[i:i + 1], cache_seqlens[i:i + 1], L, max_len,
+                         win, ks, vs, smqk, o[off:off + L], device)
+    HITS["fmha"] += 1
+    HITS["fmha_tokens"] += tokens
+    _log_once("prefill_fmha" + ("_swa" if win else "") + ("_ragged" if bs > 1 else ""),
+              f"(first bs={bs}, tokens={tokens}, len={reqs[-1][2]}, nc={nc}, split={split})")
+    if PATH_STATS and _pow2(HITS["fmha"]):
+        logger.info("OKC prefill_fmha hits: %s (layer %d, bs %d, tokens %d)", HITS, layer.layer_id, bs, tokens)
+    return o
+
+
+def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device):
+    """One request: gather its keys into stage images, then fmha7 (+ combine). Returns (nc, split)."""
+    cap = ((min(win - 1 + L, max_len) if win else max_len) + 255) & ~255
+    capblks = cap // 128
     kvt = torch.empty((2 * capblks, 16384), dtype=torch.uint8, device=device)
     if win:
         seq = cache_seqlens - L  # the request's cached prefix, on device
@@ -152,11 +191,6 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
         ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, none, none, page_table.stride(0), 0, capblks, 1, L, 0)
         ntf = capblks
     nc, split = pick_cfg(L, ntf)
-    if out is None or out.dtype is not torch.bfloat16 or not out.is_contiguous() or out.numel() != L * HQ * D:
-        out = torch.empty((L, HQ, D), dtype=torch.bfloat16, device=device)
-    o = out.view(L, HQ, D)
-    smqk = float(layer.scaling) * LOG2E
-    q8 = q.contiguous().view(torch.uint8)
     if split <= 1:
         ext.fmha4n_split(q8, kvt, o, o, o, lens, ks, vs, smqk, 1, L, capblks, 1, win, nc)
     else:
@@ -165,9 +199,4 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
         pml = torch.empty((split, rows, 2), dtype=torch.float32, device=device)
         ext.fmha4n_split(q8, kvt, o, po, pml, lens, ks, vs, smqk, 1, L, capblks, split, win, nc)
         ext.combine(po, pml, o, rows, split)
-    HITS["fmha"] += 1
-    HITS["fmha_tokens"] += L
-    _log_once("prefill_fmha" + ("_swa" if win else ""), f"(first tokens={L}, len={max_len}, nc={nc}, split={split})")
-    if PATH_STATS and _pow2(HITS["fmha"]):
-        logger.info("OKC prefill_fmha hits: %s (layer %d, tokens %d, len %d)", HITS, layer.layer_id, L, max_len)
-    return o
+    return nc, split
