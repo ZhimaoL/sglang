@@ -80,11 +80,6 @@ SW_LT = _flag("OKC_SW_LT", "1")
 SW_ROUTER = _flag("OKC_SW_ROUTER", "1")
 # router split-K reduce + routing in one launch (router.route_small, bit-identical)
 SW_ROUTE_FUSED = _flag("OKC_SW_ROUTE_FUSED", "1")
-# Kill switch of the attn-v3 sliding verify kernels (default on; "0" runs the stock path for the sliding layers).
-SW_ATTN_V3 = _flag("OKC_SW_ATTN_V3", "1")
-# Split-KV partial accumulators of the attn-v3 sliding kernels: "0" (default) keeps them fp32 like FA3; "1" stores
-# them bf16 (the certified attn-v3 setting: half the last-arriver combine's reads).
-SW_ATTN_ACC16 = _flag("OKC_SW_ATTN_ACC16", "0")
 # Full-layer verify (q_len 8) at bs >= OKC_WST_MIN_BS on the attention lane's wst kernels (_cuda_src_wst.py: QK norm,
 # new KV rows, FP8 attention, merge, output norm and gate in one launch) instead of the stock FA3 chain (stock FA3 below
 # OKC_WST_MIN_BS). From OKC_WST_BAL_MIN_BS up the tiles are balanced over the batch (wst_ct14b, cooperative launch).
@@ -96,8 +91,8 @@ WST_BAL_MIN_BS = int(os.environ.get("OKC_WST_BAL_MIN_BS", "5"))
 # Their split-KV O partials: "0" (default) fp32 like FA3; "1" the attention bank's bf16 partials (a separate build).
 WST_ACC16 = _flag("OKC_WST_ACC16", "0")
 # Verify (q_len 8) on the attention lane's VFG / VP2 kernels (_cuda_src_vfg.py: QK norm + RoPE, new KV rows, FP8 attention,
-# merge, output norm and gate; fp32 split-KV partials): sliding layers at every bs (VP2 at bs 1, VFG + merge kernel at
-# bs >= 2) in place of attn-v3, and full layers at bs 1 in place of wst. "0" keeps attn-v3 / wst.
+# merge, output norm and gate; fp32 split-KV partials): sliding layers at every bs (VP2 up to OKC_VP2_MAX_BS, VFG + merge
+# kernel above), and full layers at bs 1 in place of wst. "0": sliding layers on the stock path, full layers on wst.
 SW_VFG = _flag("OKC_SW_VFG", "1")
 SW_VFG_FULL1 = _flag("OKC_SW_VFG_FULL1", "1")
 # Sliding verify batches up to this bs on VP2 (one 16-CTA cluster pair per request, merged in-cluster: no merge kernel)
@@ -283,7 +278,7 @@ ANY_ATTN = SW_ATTN or SW_WST
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
            "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE",
-           "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED", "SW_ATTN_V3", "SW_ATTN_ACC16",
+           "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
