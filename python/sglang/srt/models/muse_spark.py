@@ -43,6 +43,8 @@ if okc_patch.ANY_ATTN:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import attention as okc_attention
 if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
+if okc_patch.SW_AR_NORM:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import ar_norm as okc_ar_norm
 if okc_patch.SW_MOE_OVL:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
     from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_moe_ovl as okc_sp_moe_ovl
@@ -459,11 +461,13 @@ class MuseSpark1xAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        okc_partial: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
-        output, _ = self.o_proj(self.gated_attention(positions, qkv, forward_batch))
+        # okc_partial: the caller all-reduces the o proj output itself (OKC_SW_AR_NORM)
+        output, _ = self.o_proj(self.gated_attention(positions, qkv, forward_batch), skip_all_reduce=okc_partial)
         return output
 
     def gated_attention(
@@ -1292,19 +1296,30 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
             if result is not None:
                 return result
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
         router_dtype = self._router_dtype
         if router_dtype is not None and (
-            _use_split_bf16_router(attn_output.shape[0])
-            or (okc_patch.SW_ROUTER and attn_output.shape[0] <= okc_router.MAX_TOKENS)
+            _use_split_bf16_router(attn_input.shape[0])
+            or (okc_patch.SW_ROUTER and attn_input.shape[0] <= okc_router.MAX_TOKENS)
         ):
             router_dtype = None
-        ffn_input, stream, router_input = self._fused_attn_boundary(
-            stream,
-            attn_output,
-            branch_dtype=self.operator_dtype,
-            router_dtype=router_dtype,
+        okc_fused = (
+            okc_patch.SW_AR_NORM
+            and self.operator_dtype == torch.bfloat16
+            and okc_ar_norm.attn_boundary_fusable(
+                self._fused_attn_boundary, self.self_attn.o_proj, attn_input, router_dtype
+            )
         )
+        attn_output = self.self_attn(positions, attn_input, forward_batch, okc_partial=okc_fused)
+        if okc_fused:
+            ffn_input, stream = okc_ar_norm.fused_attn_boundary(self._fused_attn_boundary, stream, attn_output)
+            router_input = None
+        else:
+            ffn_input, stream, router_input = self._fused_attn_boundary(
+                stream,
+                attn_output,
+                branch_dtype=self.operator_dtype,
+                router_dtype=router_dtype,
+            )
         if self.is_moe_layer:
             ffn_output = self.mlp(ffn_input, router_input, forward_batch)
         else:
