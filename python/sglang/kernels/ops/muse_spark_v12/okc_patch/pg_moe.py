@@ -89,8 +89,26 @@ def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
     # 2q + h, stored as bf16 * 2^118 (exact: e4m3 needs 4 significant bits; 448 * 2^118 < bf16 max)
     sfp = (sfp.view(E, NWT, NKT, 2, 4, 2, 8, 4).permute(0, 1, 2, 3, 4, 6, 7, 5).contiguous())
     sbf = (sfp.view(torch.float8_e4m3fn).float() * 2.0 ** 118).to(torch.bfloat16)
-    return torch.cat([wm.view(E, NWT, NKT, 4096), sbf.view(torch.uint8).reshape(E, NWT, NKT, 1024)],
-                     dim=-1).contiguous()
+    # One byte per scale: a positive bf16(e4m3 * 2^118) has exponent 109..126 and only 3 mantissa bits, so
+    # code = bits / 16 - 0x360 (8..151) and the kernel rebuilds bits = code * 16 + 0x3600. Code 0 stands for a
+    # zero scale, which decodes to 2^-19; that is exact only because such a block's weight codes are all zero.
+    bits = sbf.view(torch.int16).to(torch.int32)
+    zero = bits == 0
+    if bool(((bits < 0) | ((bits & 15) != 0) | (~zero & ((bits < 0x3680) | (bits > 0x3F70)))).any()):
+        raise ValueError("pg pack: block scale outside the 8-bit code range")
+    code = torch.where(zero, torch.zeros_like(bits), (bits >> 4) - 0x360).to(torch.uint8)
+    if bool(zero.any()):
+        _check_zero_scale_blocks(w_u8, sf_u8)
+    return torch.cat([wm.view(E, NWT, NKT, 4096), code.reshape(E, NWT, NKT, 512)], dim=-1).contiguous()
+
+
+def _check_zero_scale_blocks(w_u8, sf_u8):
+    # A zero e4m3 scale must come with an all-zero 16-weight block (two bytes of codes per 4 weights' worth: 8 bytes).
+    E, R, KB = w_u8.shape
+    blocks = w_u8.view(E, R, KB // 8, 8)
+    nonzero_weights = (blocks != 0).any(-1)
+    if bool(((sf_u8 == 0) & nonzero_weights).any()):
+        raise ValueError("pg pack: zero block scale with nonzero weights")
 
 
 def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):

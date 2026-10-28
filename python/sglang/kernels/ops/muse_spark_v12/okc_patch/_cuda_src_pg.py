@@ -2,7 +2,8 @@
 
 Kernels pg_tiles / pg_gather / pg_gemm (namespace pgk) copied from the pg_kernel module of the prefill
 bank kernels/muse_prefill_layer/plt_c3.py (sha256 2d1fad0d0b7c42f1). Edits: five stale comments that still said
-fp16 / 4608 B (the code is bf16 with WSB = 5120 B blocks) and an unused cuda_fp16.h include dropped.
+fp16 / 4608 B (the bank's code is bf16 with WSB = 5120 B blocks) and an unused cuda_fp16.h include dropped.
+Serving edit: the scales are 8-bit codes (WSB 4608), decoded to the same bf16 values in registers.
 Not carried over: the pgkw P2 kernel, the pg_n4 64-token probe kernel and the probe / split
 configurations (none is on the bank's default cfg 350 path).
 Entry points: tiles (live block list), gather (bf16 x rows -> bf16 swizzled token images), gg1
@@ -114,8 +115,8 @@ constexpr int XNT = 256;                 // tokens per tile (wgmma n)
 constexpr int BK  = 64;                  // k per stage
 constexpr int NKT = 64;                  // k-tiles (K = 4096 for both GEMMs)
 constexpr int XB  = XNT * BK * 2;        // 32768: one k-tile token image [256 t][128 B], 128B-swizzled K-major
-constexpr int WSB = 5120;                // merged W(4096) + bf16 scale pairs (1024) per (wt, kt)
-constexpr int SB  = 37888;               // stage stride: X 32768 + W|sf 5120 (a whole number of 1024 B atoms)
+constexpr int WSB = 4608;                // merged W(4096) + 8-bit scale codes (512) per (wt, kt); pg_moe.pack_wsf
+constexpr int SB  = 37888;               // stage stride: X 32768 + W|sf 4608 padded to a whole number of 1024 B atoms
 constexpr int PREGS = 40, CREGS = 232;   // setmaxnreg targets
 static_assert(128 * PREGS + 256 * CREGS <= 384 * 168, "setmaxnreg budget exceeds the launch allocation");
 constexpr int EPI1 = XB / 2;             // gg1 epilogue per WG: its half of the inter tile [256 t][64 B] (SW64)
@@ -217,14 +218,16 @@ DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
     if (MODE == 0) {
         const char* stp = c.smem + c.sl * SB + (N4 ? c.woff : 0);
         const uint4 w = *reinterpret_cast<const uint4*>(stp + WOFF + c.ctid * 16);
-        const uint4 sfp = *reinterpret_cast<const uint4*>(stp + WOFF + 4096 + c.sfo);   // bf16 (r0, r1) x 4
-        const unsigned* sfq = reinterpret_cast<const unsigned*>(&sfp);
+        // 8-bit codes of the (r0, r1) scale pairs for k16 steps 0..3: bf16(e4m3 * 2^118) has exponent 109..126 and a
+        // 3-bit mantissa, so code = bf16 bits / 16 - 0x360 and each bf16 lane is code * 16 + 0x3600 (exact, pack_wsf).
+        const uint2 sfp = *reinterpret_cast<const uint2*>(stp + WOFF + 4096 + c.sfo);
+        const unsigned sfw[2] = {sfp.x, sfp.y};
         const unsigned* wq = reinterpret_cast<const unsigned*>(&w);
 #pragma unroll
         for (int q = 0; q < 4; q++) {
             __nv_bfloat162 d[4];
             dq8r(wq[q], d);
-            const __nv_bfloat162 sf2 = u32b2(sfq[q]);
+            const __nv_bfloat162 sf2 = u32b2(__byte_perm(sfw[q >> 1], 0u, (q & 1) ? 0x4342u : 0x4140u) * 16u + 0x36003600u);
             const __nv_bfloat162 s0 = __bfloat162bfloat162(__low2bfloat16(sf2));
             const __nv_bfloat162 s1 = __bfloat162bfloat162(__high2bfloat16(sf2));
             ab[4 * q + 0] = b2u32(__hmul2(d[0], s0));
@@ -527,7 +530,7 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
     c.lane = tid & 31;
     c.r0l = c.cw * 64 + c.lw * 16 + (c.lane >> 2);
     c.r1l = c.r0l + 8;
-    c.sfo = 16 * (c.cw * 32 + c.lw * 8 + (c.lane >> 2));   // this thread's (r0, r1) bf16 scale pairs, 16 B per k-tile
+    c.sfo = 8 * (c.cw * 32 + c.lw * 8 + (c.lane >> 2));    // this thread's (r0, r1) scale-code pairs, 8 B per k-tile
     // B descriptor, K-major, LBO unused (1): gg1 = SW128 token rows (SBO 1024 B per 8-row atom, mode 1);
     // gg2 = SW64 half-tiles (SBO 512 B, mode 2)
     c.dhi = GATED ? ((1ull << 16) | ((unsigned long long)(1024 >> 4) << 32) | (1ull << 62))
