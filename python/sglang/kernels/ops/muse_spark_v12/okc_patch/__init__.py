@@ -36,6 +36,8 @@ MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "1"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
 MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
+# on the st chain the verify balancer weighs an expert by its st passes ceil(routes / 8); 0 = every active expert 1
+MOE_REP_PASSES = _flag("OKC_MOE_REP_PASSES", "1")
 # the split from this size up: its kernels cost 9-15 us per layer, which at prefill routing it repays only on 16K
 # chunks (S8 arm C ~1K extends: <= 1 us of straggler saved; 1xH200 bench: +5..+21 us at T 753..5632, -20 at 16384)
 MOE_REP_SPLIT_MIN_TOKENS = int(os.environ.get("OKC_MOE_REP_SPLIT_MIN_TOKENS", "8192"))
@@ -232,7 +234,7 @@ RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD",
+           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
