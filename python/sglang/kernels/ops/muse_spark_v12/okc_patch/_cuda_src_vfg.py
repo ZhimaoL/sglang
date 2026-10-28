@@ -443,19 +443,6 @@ vfg_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
 #define V_PH0() do { } while (0)
   V_STAMP(0);
   __nv_bfloat162 gpre = __float2bfloat162_rn(0.f);
-  if constexpr (CL) {
-    unsigned const qr = cg::this_cluster().block_rank();
-    int const R = 8 * (int)qr + (tid >> 5), tok = R >> 4, hq = R & 15;
-    gpre = *reinterpret_cast<const __nv_bfloat162*>(
-        qkv + ((long long)b * V_L + tok) * V_QKVW + (V_HQ + 2 * V_HKV) * V_D + hq * V_D + 2 * lane);
-    if (tid == 0) {
-      uint32_t const mb = v_u32(&sm.mbm);
-      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(mb) : "memory");
-      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(mb), "r"(V_CL4 ? 16 * (8 * 128 + 8 * 4 + 8 * 4) : V_CL3 ? 16 * V_CLB : 16 * 8 * V_PO * 4) : "memory");
-    }
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-  }
   int const seq = seq_lens[b];
   int const lo = SLIDE ? max(0, seq - window + 1) : 0;
   int const n = seq - lo;
@@ -491,18 +478,6 @@ vfg_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
   long long nk_crow = 0;
   float nk_ifr = 0.f;
   __nv_bfloat162 nk_kraw = __float2bfloat162_rn(0.f), nk_vraw = nk_kraw, nk_qraw = nk_kraw;
-  if constexpr (CL) {
-    unsigned const qr = cg::this_cluster().block_rank();
-    int const ktok = (int)qr >> 1, kkh = (int)qr & 1;
-    {
-      int const wj = tid >> 5;
-      nk_kraw = *reinterpret_cast<const __nv_bfloat162*>(qkv + ((long long)b * V_L + wj) * V_QKVW + (V_HQ + kkh) * V_D + 2 * lane);
-      nk_vraw = *reinterpret_cast<const __nv_bfloat162*>(qkv + ((long long)b * V_L + wj) * V_QKVW + (V_HQ + V_HKV + kkh) * V_D + 2 * lane);
-      nk_qraw = *reinterpret_cast<const __nv_bfloat162*>(qkv + ((long long)b * V_L + ktok) * V_QKVW + (8 * kkh + wj) * V_D + 2 * lane);
-    }
-    nk_crow = cache_loc[(long long)b * V_L + ktok];
-    nk_ifr = inv_freq[lane];
-  }
   uint32_t qf[2][4];
 
   int const gch = tid & 7, grs = tid >> 3;
@@ -643,38 +618,6 @@ vfg_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
     *reinterpret_cast<uint2*>((isv ? v_cache : k_cache) + ncrow * 128 + kh * 64 + d0) = q8;
     int const cb = kh * 64 + d0;
     *reinterpret_cast<uint2*>((isv ? sm.nv : sm.nk) + tok * 128 + ((((cb >> 4) ^ (tok & 7))) << 4) + (cb & 15)) = q8;
-  }
-
-  if constexpr (CL) {
-    unsigned const qr = cg::this_cluster().block_rank();
-    int const ktok = (int)qr >> 1, kkh = (int)qr & 1, wj = tid >> 5;
-    float* kdec = reinterpret_cast<float*>(sm.nk);
-    float* qdec = kdec + 8 * 65;
-    float* vdec = qdec + 8 * 65;
-    float2 kv = __bfloat1622float2(nk_kraw), qv = __bfloat1622float2(nk_qraw);
-    float2 const vv = __bfloat1622float2(nk_vraw);
-    float ks = kv.x * kv.x + kv.y * kv.y, qs = qv.x * qv.x + qv.y * qv.y;
-#pragma unroll
-    for (int o2 = 16; o2 > 0; o2 >>= 1) {
-      ks += __shfl_xor_sync(0xffffffffu, ks, o2);
-      qs += __shfl_xor_sync(0xffffffffu, qs, o2);
-    }
-    float const krn = rsqrtf(ks * (1.0f / V_D) + eps), qrn = rsqrtf(qs * (1.0f / V_D) + eps);
-    float sk, ck, sq, cq;
-    v_sincos((float)(seq + wj) * nk_ifr, &sk, &ck);
-    v_sincos((float)(seq + ktok) * nk_ifr, &sq, &cq);
-    kv.x *= krn; kv.y *= krn; qv.x *= qrn; qv.y *= qrn;
-    uint32_t const k8 = v_e4m3x2((kv.x * ck - kv.y * sk) * k_rscale, (kv.x * sk + kv.y * ck) * k_rscale);
-    uint32_t const q8 = v_e4m3x2(qv.x * cq - qv.y * sq, qv.x * sq + qv.y * cq);
-    uint32_t const v8 = v_e4m3x2(vv.x * v_rscale, vv.y * v_rscale);
-    if (wj == ktok) {
-      *reinterpret_cast<uint16_t*>(k_cache + nk_crow * 128 + kkh * 64 + 2 * lane) = (uint16_t)k8;
-      *reinterpret_cast<uint16_t*>(v_cache + nk_crow * 128 + kkh * 64 + 2 * lane) = (uint16_t)v8;
-    }
-    float2 const kd = v_e4m3x2_dec(k8), qd = v_e4m3x2_dec(q8), vd = v_e4m3x2_dec(v8);
-    kdec[wj * 65 + 2 * lane] = kd.x; kdec[wj * 65 + 2 * lane + 1] = kd.y;
-    qdec[wj * 65 + 2 * lane] = qd.x; qdec[wj * 65 + 2 * lane + 1] = qd.y;
-    *reinterpret_cast<float2*>(vdec + wj * 64 + 2 * lane) = vd;
   }
 
   float o[32], la[32];
@@ -1023,135 +966,6 @@ vfg_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
   V_STAMP(3);
 #define V_P2S(i) do { } while (0)
   asm volatile("cp.async.wait_all;" ::: "memory");
-  if constexpr (CL) {
-    cg::cluster_group cluster = cg::this_cluster();
-    unsigned const q = cluster.block_rank();
-    static_assert(V_ST >= 4, "cluster merge buffers live in ring stages 0..3");
-    float (*mrg)[8][V_PO] = reinterpret_cast<float (*)[8][V_PO]>(&sm.kt[1][0]);
-    __syncthreads();
-    V_P2S(1);
-    int const rlw_ = tid >> 5;
-    float nk_m = V_MINIT, nk_l = 0.f, nk_o0 = 0.f, nk_o1 = 0.f;
-    auto nk_run = [&]() {
-    {
-      int const ktok = (int)q >> 1, kkh = (int)q & 1, wj = tid >> 5;
-      float* kdec = reinterpret_cast<float*>(sm.nk);
-      float* qdec = kdec + 8 * 65;
-      float* vdec = qdec + 8 * 65;
-      float* pp = vdec + 8 * 64;
-      if (!(V_ABL & 64)) {
-        int const j = lane & 7, d0 = 16 * (lane >> 3);
-        float d = 0.f;
-#pragma unroll
-        for (int i = 0; i < 16; i++) d += qdec[rlw_ * 65 + d0 + i] * kdec[j * 65 + d0 + i];
-        d += __shfl_xor_sync(0xffffffffu, d, 8);
-        d += __shfl_xor_sync(0xffffffffu, d, 16);
-        float const sj = j <= ktok ? c2 * d : V_MINIT;
-        float mx = sj;
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
-        float const pj = j <= ktok ? v_ex2(sj - mx) : 0.f;
-        float sl = pj;
-        sl += __shfl_xor_sync(0xffffffffu, sl, 1);
-        sl += __shfl_xor_sync(0xffffffffu, sl, 2);
-        sl += __shfl_xor_sync(0xffffffffu, sl, 4);
-        nk_m = mx; nk_l = sl;
-        if (lane < 8) pp[rlw_ * 8 + lane] = pj;
-        __syncwarp();
-        V_P2S(10);
-#pragma unroll
-        for (int jj = 0; jj < V_L; jj++) {
-          float const p = pp[rlw_ * 8 + jj];
-          float2 const v = *reinterpret_cast<const float2*>(vdec + jj * 64 + 2 * lane);
-          nk_o0 += p * v.x; nk_o1 += p * v.y;
-        }
-        V_P2S(11);
-      }
-    }
-    };
-    float* po = reinterpret_cast<float*>(&sm.vt[0][0]);
-    uint8_t* const pob = &sm.vt[0][0];
-    uint8_t* const mrb = &sm.kt[1][0];
-    if (!(V_ABL & 32) && !V_CL4) {
-    if (t == 0) {
-      int const rA = 16 * w + g, rB = rA + 8;
-      int const RA = (rA >> 3) * V_HQ + 8 * h + (rA & 7), RB = (rB >> 3) * V_HQ + 8 * h + (rB & 7);
-      *reinterpret_cast<float*>(pob + (RA >> 3) * V_CLB + 1152 + (RA & 7) * 4) = mref[0];
-      *reinterpret_cast<float*>(pob + (RB >> 3) * V_CLB + 1152 + (RB & 7) * 4) = mref[1];
-    }
-#pragma unroll
-    for (int jj = 0; jj < 8; jj++)
-#pragma unroll
-      for (int e = 0; e < 2; e++) {
-        int const nq = 8 * jj + 2 * t + e;
-        int const R = (nq >> 3) * V_HQ + 8 * h + (nq & 7);
-        *reinterpret_cast<__nv_bfloat162*>(pob + (R >> 3) * V_CLB + (R & 7) * 144 + (16 * w + 2 * g) * 2) =
-            __floats2bfloat162_rn(o[4 * jj + e], o[4 * jj + 2 + e]);
-        if (w == 0 && g == 0) *reinterpret_cast<float*>(pob + (R >> 3) * V_CLB + 1184 + (R & 7) * 4) = la[4 * jj + e];
-      }
-    }
-    V_P2S(2);
-    v_fence_async();
-    __syncthreads();
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    V_P2S(3);
-    if (lane < 2 && !V_CL4) {
-      int const r = 2 * (tid >> 5) + lane;
-      uint32_t dst, mbr;
-      asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(dst) : "r"(v_u32(mrb + q * V_CLB)), "r"(r));
-      asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mbr) : "r"(v_u32(&sm.mbm)), "r"(r));
-      asm volatile("cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                   :: "r"(dst), "r"(v_u32(pob + r * V_CLB)), "r"(V_CLB), "r"(mbr) : "memory");
-      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-    }
-    V_P2S(7);
-    nk_run();
-    if (dbgp && tid == 0) dbgp[((long long)b * NS + s) * 8 + 5] = v_now();
-    V_P2S(4);
-    asm volatile("{\n.reg .pred p;\nCLW_%=:\nmbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n@!p bra CLW_%=;\n}\n"
-                 :: "r"(v_u32(&sm.mbm)) : "memory");
-    V_P2S(5);
-    if (dbgp && tid == 0) dbgp[((long long)b * NS + s) * 8 + 6] = v_now();
-    int const rl = tid >> 5, R = 8 * (int)q + rl, tok = R >> 4, hq = R & 15;
-    __nv_bfloat162 const g2 = gpre;
-    float M = V_MINIT;
-    if (V_ABL & 128) {
-      *reinterpret_cast<__nv_bfloat162*>(out + ((long long)b * V_L + tok) * (V_HQ * V_D) + hq * V_D + 2 * lane) =
-          __floats2bfloat162_rn(0.f, 0.f);
-      if (lane < 2) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
-      return;
-    }
-#pragma unroll
-    for (int src = 0; src < 16; src++) M = fmaxf(M, *reinterpret_cast<const float*>(mrb + src * V_CLB + 1152 + rl * 4));
-    float L2 = 0.f, b0 = 0.f, b1 = 0.f;
-    M = fmaxf(M, nk_m);
-    {
-      float const wt = v_ex2(nk_m - M);
-      L2 = nk_l * wt; b0 = nk_o0 * wt; b1 = nk_o1 * wt;
-    }
-#pragma unroll
-    for (int src = 0; src < 16; src++) {
-      uint8_t const* blk = mrb + src * V_CLB;
-      float const wt = v_ex2(*reinterpret_cast<const float*>(blk + 1152 + rl * 4) - M);
-      float2 const ov = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(blk + rl * 144 + 4 * lane));
-      L2 += *reinterpret_cast<const float*>(blk + 1184 + rl * 4) * wt; b0 += ov.x * wt; b1 += ov.y * wt;
-    }
-    float const inv = v_scale / L2;
-    b0 *= inv; b1 *= inv;
-    float ss = b0 * b0 + b1 * b1;
-#pragma unroll
-    for (int o2 = 16; o2 > 0; o2 >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o2);
-    float const rn = rsqrtf(ss * (1.0f / V_D) + eps);
-    float const s0 = 1.f / (1.f + __expf(-__bfloat162float(g2.x)));
-    float const s1 = 1.f / (1.f + __expf(-__bfloat162float(g2.y)));
-    *reinterpret_cast<__nv_bfloat162*>(out + ((long long)b * V_L + tok) * (V_HQ * V_D) + hq * V_D + 2 * lane) =
-        __floats2bfloat162_rn(b0 * rn * s0, b1 * rn * s1);
-    V_P2S(6);
-    V_STAMP(4);
-    if (lane < 2 && !V_CL4) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
-    return;
-  }
   V_P2S(1);
 
   float* wsb = ws + ((long long)b * NS + s) * (V_L * V_HQ) * V_PREC;
