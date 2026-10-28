@@ -24,7 +24,7 @@ constexpr int NW = 16;            // warps per CTA; warp w owns k-tiles KPW*w ..
 constexpr int KPW = NKT / NW;     // 4
 constexpr int NTHR = NW * 32;
 constexpr int ELOC = 64;          // local slots at most (32 home + replicas); the call's count nl comes from wsf13
-constexpr int NUMEL_MAX = 256;    // T <= 32, top-8
+constexpr int NUMEL_MAX = 512;    // T <= 64, top-8 (one table thread per route)
 constexpr int VAMAX = ELOC + NUMEL_MAX / 8;   // passes (<= 8 tokens each): <= nl + numel / 8
 constexpr int R = 4;              // partial ring slots
 
@@ -118,7 +118,7 @@ struct Tab {
 DINL void build_tab(const int* __restrict__ ids, int numel, int nl, const float* __restrict__ gs, Tab& tb,
                     int (*wcnt)[ELOC], int* vbase) {
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-    for (int i = tid; i < 8 * ELOC; i += NTHR) (&wcnt[0][0])[i] = 0;
+    for (int i = tid; i < (NUMEL_MAX / 32) * ELOC; i += NTHR) (&wcnt[0][0])[i] = 0;
     int id = -1;
     if (tid < NUMEL_MAX && tid < numel) {
         id = ids[tid];
@@ -141,7 +141,7 @@ DINL void build_tab(const int* __restrict__ ids, int numel, int nl, const float*
             const int e = 32 * hf + lane;
             int s = 0;
 #pragma unroll
-            for (int ww = 0; ww < 8; ww++) { const int c = wcnt[ww][e]; wcnt[ww][e] = s; s += c; }
+            for (int ww = 0; ww < NUMEL_MAX / 32; ww++) { const int c = wcnt[ww][e]; wcnt[ww][e] = s; s += c; }
             const int v = (s + 7) >> 3;
             int inc = v;
 #pragma unroll
@@ -179,7 +179,7 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
     __shared__ __align__(16) float4 part[R][NW][32];   // per-warp slab partials
     __shared__ __align__(16) unsigned short scr[NW][128];
     __shared__ __align__(8) unsigned long long bars[2 * R];   // full[R] | empty[R]
-    __shared__ int s_wcnt[8][ELOC];
+    __shared__ int s_wcnt[NUMEL_MAX / 32][ELOC];
     __shared__ int s_vbase[ELOC];
 
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -323,7 +323,7 @@ static int st_num_sms() {
 void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tensor gs13, torch::Tensor wsf2,
             torch::Tensor h, torch::Tensor y, int64_t pdl) {
     const int numel = (int)ids.numel();
-    TORCH_CHECK(numel <= stk::NUMEL_MAX && numel == x.size(0) * 8 && x.size(1) == stk::H, "st: T <= 32, top-8, H 4096");
+    TORCH_CHECK(numel <= stk::NUMEL_MAX && numel == x.size(0) * 8 && x.size(1) == stk::H, "st: T <= 64, top-8, H 4096");
     TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous() && x.is_contiguous(), "st: int32 ids, contiguous x");
     const int nl = (int)wsf13.size(0);
     TORCH_CHECK(nl >= 1 && nl <= stk::ELOC && wsf13.size(1) == 64 && wsf13.size(2) == stk::NKT &&
