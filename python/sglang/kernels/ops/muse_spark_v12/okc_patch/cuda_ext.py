@@ -83,6 +83,10 @@ _PG_CPP = (   # the narrow build's exported subset of pg's host functions (same 
     "int64_t, int64_t, int64_t);\n"
     "void gg2(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, "
     "int64_t, int64_t, int64_t);\n"
+    "void route(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, "
+    "int64_t, int64_t, int64_t);\n"
+    "void gather_norm(torch::Tensor, torch::Tensor, double, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, "
+    "int64_t);\n"
     "void set_snake_max_t(int64_t);"
 )
 
@@ -102,7 +106,7 @@ def pg_narrow_ext():
                     name="okc_pg_moe_n17x128s7_int",
                     cpp_sources=_PG_CPP,
                     cuda_sources=narrow_source(),
-                    functions=["tiles", "gather", "gg1", "gg2", "set_snake_max_t"],
+                    functions=["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
                     extra_cuda_cflags=[
                         "-O3",
                         "--use_fast_math",

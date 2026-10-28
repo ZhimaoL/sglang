@@ -187,7 +187,18 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
 // finalize's slot ids). No serial loops: a route's rank among same-expert routes of its warp comes from
 // __match_any_sync, the per-expert bases over the 64 warp groups from one warp-wide scan per expert (warp w: experts w
 // and w + 32), the block / live lists from one warp's ballots over two 32-expert halves.
-constexpr int RT_MAX = 2048, RT_E = 64, RT_NB = RT_E + RT_MAX / 256;
+constexpr int RT_MAX = 2048, RT_E = 64, RT_NB = RT_E + RT_MAX / XNT;
+// a block's width code from its valid routes v (pg_tiles' rule: the smallest listed width covering v) and the live
+// list's classes, widest first; the narrow build (_cuda_src_pgn) swaps both for its 16-token codes
+constexpr int RT_NCLS = 4, RT_FULL = 3;
+DINL int route_code(int v, int wmask) {
+    int code = RT_FULL;
+    if ((wmask & 4) && v <= 192) code = 2;
+    if ((wmask & 2) && v <= 128) code = 1;
+    if ((wmask & 1) && v <= 64) code = 0;
+    return code;
+}
+DINL int route_cls(int i) { return RT_FULL - i; }
 __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_ids, const int* __restrict__ emap,
                                                  int n_global, int numel, int wmask, int nl,
                                                  int* __restrict__ local_ids, int* __restrict__ sorted_ids,
@@ -241,7 +252,7 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         for (int hf = 0; hf < 2; hf++) {
             const int x = 32 * hf + lane;
             const int c = cnt[x];
-            nbx[hf] = (c + 255) >> 8;
+            nbx[hf] = (c + XNT - 1) / XNT;
             int bs = nbx[hf];
 #pragma unroll
             for (int o = 1; o < 32; o <<= 1) {
@@ -252,21 +263,19 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
             carry += __shfl_sync(0xFFFFFFFFu, bs, 31);
             bstart[x] = b0[hf];
             for (int j = 0; j < nbx[hf]; j++) { bexp[b0[hf] + j] = x; block_experts[b0[hf] + j] = x; }
-            // the expert's last block holds v = c - 256 (nbx - 1) routes, the others 256 (class 3)
-            const int vl = nbx[hf] > 0 ? c - ((nbx[hf] - 1) << 8) : 0;
-            code[hf] = 3;
-            if ((wmask & 4) && vl <= 192) code[hf] = 2;
-            if ((wmask & 2) && vl <= 128) code[hf] = 1;
-            if ((wmask & 1) && vl <= 64) code[hf] = 0;
+            // the expert's last block holds v = c - XNT (nbx - 1) routes, the others XNT (the full class)
+            const int vl = nbx[hf] > 0 ? c - (nbx[hf] - 1) * XNT : 0;
+            code[hf] = route_code(vl, wmask);
         }
         const int nb = carry;
         int base = 0;
-        for (int cls = 3; cls >= 0; cls--) {
+        for (int ci = 0; ci < RT_NCLS; ci++) {
+            const int cls = route_cls(ci);
 #pragma unroll
             for (int hf = 0; hf < 2; hf++) {
-                // blocks of class cls this expert contributes: its full blocks (cls 3) and / or its last block
+                // blocks of class cls this expert contributes: its full blocks (RT_FULL) and / or its last block
                 const int n = nbx[hf];
-                const int k_c = n == 0 ? 0 : (cls == 3 ? n - 1 : 0) + (code[hf] == cls ? 1 : 0);
+                const int k_c = n == 0 ? 0 : (cls == RT_FULL ? n - 1 : 0) + (code[hf] == cls ? 1 : 0);
                 int inc = k_c;
 #pragma unroll
                 for (int o = 1; o < 32; o <<= 1) {
@@ -274,7 +283,7 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
                     if (lane >= o) inc += v;
                 }
                 int pos = base + inc - k_c;
-                if (cls == 3) for (int j = 0; j < n - 1; j++) live[1 + pos++] = (b0[hf] + j) | (3 << 20);
+                if (cls == RT_FULL) for (int j = 0; j < n - 1; j++) live[1 + pos++] = (b0[hf] + j) | (RT_FULL << 20);
                 if (n > 0 && code[hf] == cls) live[1 + pos] = (b0[hf] + n - 1) | (code[hf] << 20);
                 base += __shfl_sync(0xFFFFFFFFu, inc, 31);
             }
@@ -285,12 +294,12 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
 #pragma unroll
     for (int k = 0; k < 2; k++) {
         const int e = er[k];
-        if (e >= 0) sorted_ids[(bstart[e] << 8) + wc[k * 32 + w][e] + rk[k]] = k * 1024 + tid;
+        if (e >= 0) sorted_ids[bstart[e] * XNT + wc[k * 32 + w][e] + rk[k]] = k * 1024 + tid;
     }
     const int nb = nblk;
-    for (int i = tid; i < nb * 256; i += 1024) {          // sentinel slots (disjoint from the route slots)
-        const int x = bexp[i >> 8];
-        if (i - (bstart[x] << 8) >= cnt[x]) sorted_ids[i] = numel;
+    for (int i = tid; i < nb * XNT; i += 1024) {          // sentinel slots (disjoint from the route slots)
+        const int x = bexp[i / XNT];
+        if (i - bstart[x] * XNT >= cnt[x]) sorted_ids[i] = numel;
     }
 }
 
@@ -1117,11 +1126,11 @@ void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, 
            torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global, int64_t nl, int64_t pdl) {
     TORCH_CHECK(numel <= pgk::RT_MAX && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() &&
                 nl >= 1 && nl <= pgk::RT_E, "pg route: int32 ids, at most 2048 routes, 1..64 local slots");
-    TORCH_CHECK(sorted_ids.numel() >= (nl + (numel + 255) / 256) * 256 &&
-                live.numel() >= nl + (numel + 255) / 256 + 1, "pg route: output sizes");
+    TORCH_CHECK(sorted_ids.numel() >= (nl + (numel + pgk::XNT - 1) / pgk::XNT) * pgk::XNT &&
+                live.numel() >= nl + (numel + pgk::XNT - 1) / pgk::XNT + 1, "pg route: output sizes");
     const int* em = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
     pg_launch(pgk::pg_route, dim3(1), dim3(1024), 0, pdl != 0, topk_ids.data_ptr<int>(), em, (int)n_global,
-              (int)numel, 3, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
+              (int)numel, 3 /* = _WMASK */, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
               block_experts.data_ptr<int>(), live.data_ptr<int>());
 }
 

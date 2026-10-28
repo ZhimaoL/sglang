@@ -156,6 +156,26 @@ DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, un
     s = _rep(s, "        (int)num_pid_m, (int)bm, (int)wmask, (int)nle, live.data_ptr<int>());",
              "        (int)num_pid_m, (int)bm, (int)PGN_WSET, (int)nle, live.data_ptr<int>());")
     s = _rep(s, "    pg_launch(pgk::pg_gather<3, 8>,", "    pg_launch(pgk::pg_gather<PGN_WSET, 8>,")
+    # small-T front end (pg_route / pg_gather_norm) on this build: 16-token width codes, the build's width set
+    s = _rep(s, """constexpr int RT_NCLS = 4, RT_FULL = 3;
+DINL int route_code(int v, int wmask) {
+    int code = RT_FULL;
+    if ((wmask & 4) && v <= 192) code = 2;
+    if ((wmask & 2) && v <= 128) code = 1;
+    if ((wmask & 1) && v <= 64) code = 0;
+    return code;
+}
+DINL int route_cls(int i) { return RT_FULL - i; }""", """constexpr int RT_NCLS = 6, RT_FULL = XNT / 16 - 1;
+DINL int route_code(int v, int wmask) {
+    int code = RT_FULL;
+    if ((wmask & 1) && v <= 64) code = 3;
+    if ((wmask & 8) && v <= 32) code = 1;
+    if ((wmask & 16) && v <= 16) code = 0;
+    return code;
+}
+DINL int route_cls(int i) { return i == 0 ? 15 : i == 1 ? 11 : i == 2 ? 7 : i == 3 ? 3 : i == 4 ? 1 : 0; }""")
+    s = _rep(s, "(int)numel, 3 /* = _WMASK */, (int)nl,", "(int)numel, (int)PGN_WSET, (int)nl,")
+    s = _rep(s, "    pg_launch(pgk::pg_gather_norm<3>,", "    pg_launch(pgk::pg_gather_norm<PGN_WSET>,")
     s = _rep(s, "    launch<1, 5, 0, 3>(", "    launch<1, PGN_NST, 0, PGN_WSET>(")
     s = _rep(s, "    launch<0, 5, 0, 3>(", "    launch<0, PGN_NST, 0, PGN_WSET>(")
     # 128-token blocks

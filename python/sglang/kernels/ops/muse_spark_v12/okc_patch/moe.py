@@ -235,6 +235,7 @@ def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps)
         x, topk_ids, route_map(layer, topk_ids),
         norm_weight=norm_weight, norm_eps=norm_eps,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.SW_PDL,
+        bm=pg_moe.block_m(x.shape[0]),
     )
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
 
