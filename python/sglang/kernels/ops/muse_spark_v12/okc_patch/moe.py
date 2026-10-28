@@ -1,7 +1,9 @@
 """The pg chain for the NVFP4 Marlin experts of Muse Spark (prefill chunks only).
 
 At T >= OKC_MOE_PG_MIN_TOKENS a captured layer runs pg_moe.grouped_pg and then the same finalize as
-_forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin.
+_forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin. A pg-only layer (the
+default) runs the chain dispatch_path picks from T (st / pg's small-T front end / align / align_local, pg's narrow or
+shipped build, the replica balancers).
 The pg packs are re-encodings of the raw NVFP4 expert tensors, so maybe_capture_nvfp4_packs must run
 right before prepare_moe_nvfp4_layer_for_marlin repacks them in place.
 """
@@ -69,6 +71,12 @@ def _build_packs(layer) -> dict | None:
         # A pg-only layer takes pg on every forward, CUDA-graph capture included, so its
         # extension has to be built here rather than lazily inside the first captured forward.
         pg_moe.pg_ext()
+        if _sw.PG_NARROW_MIN_T <= _sw.PG_NARROW_MAX_T:
+            pg_moe.pg_narrow_ext()
+        if _sw.SW_MOE_ST:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext
+
+            st_ext()
 
     # pack_wsf wants the raw stacked [gate; up] rows and raw e4m3 scale bytes; gs13 is the
     # per-expert scale Marlin also uses (its constant gain is cancelled by the post-expert norm).
@@ -111,7 +119,7 @@ def maybe_capture_nvfp4_packs(layer) -> bool:
     if state is None:
         logger.warning("OKC pg pack capture declined (shape/dtype mismatch); layer stays on Marlin.")
         return False
-    state["pg_only"] = _sw.MOE_PG_ONLY and layer.num_local_experts == 32 and layer.top_k == 8
+    state["pg_only"] = _sw.MOE_PG_ONLY and layer.num_local_experts < 255 and layer.top_k == 8
     layer._okc_moe_state = state
     _captured_layers += 1
     if state["pg_only"]:
@@ -148,12 +156,57 @@ def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm,
     if not _logged_first_call:
         _logged_first_call = True
         logger.info("OKC pg MoE active (first T=%d).", tokens)
-    small = _small_front(hidden_states, topk_ids, pre_expert_norm)
-    if small is not None:
-        return _moe_pg_small(layer, hidden_states, topk_scores, topk_ids, state, *small)
+    path = dispatch_path(layer, tokens, pre_expert_norm)
+    if path.startswith("small"):
+        small = _small_front(hidden_states, topk_ids, pre_expert_norm)
+        if small is not None:
+            return _moe_pg_small(layer, hidden_states, topk_scores, topk_ids, state, *small)
     if pre_expert_norm is not None:
         hidden_states = pre_expert_norm(hidden_states)
+    if path.startswith("st"):
+        return _moe_st(layer, hidden_states.contiguous(), topk_scores, topk_ids, state)
     return _moe_pg(layer, hidden_states.contiguous(), topk_scores, topk_ids, state)
+
+
+def dispatch_path(layer, tokens, pre_expert_norm=None):
+    """The chain a pg-only layer runs for a T-token forward, from host-side sizes only (one path per graph bucket):
+    "st" (T <= OKC_MOE_ST_MAX_TOKENS), "small" (pg_route / pg_gather_norm, <= 2048 routes; it may still decline at
+    run time), "local" (align_local, >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS) or "align" (moe_align_block_size); "-narrow"
+    for pg's narrow build; "+rep" (assign_replicas) / "+split" (split_replicas) with replicas."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+    from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm
+
+    state = layer._okc_moe_state
+    if _sw.SW_MOE_ST and state["pg_only"] and tokens <= _sw.MOE_ST_MAX_TOKENS:
+        name = "st"
+    else:
+        small = tokens * layer.top_k <= pg_moe.SMALL_MAX_ROUTES and type(pre_expert_norm) is MuseSpark1xRMSNorm
+        if _sw.SW_PG_SMALL and small:
+            name = "small"
+        elif _sw.PG_LOCAL_ALIGN and tokens >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS and layer.num_local_experts <= 64:
+            name = "local"
+        else:
+            name = "align"
+        if pg_moe.block_m(tokens) != pg_moe._BLOCK_M:
+            name += "-narrow"
+    if getattr(layer, "_okc_rep_table", None) is not None:
+        # split_replicas is per route: the small front end's per-expert map (route_map) is static above the limit
+        if tokens <= _sw.MOE_REP_MAX_TOKENS:
+            name += "+rep"
+        elif _sw.MOE_REP_PREFILL and not name.startswith("small"):
+            name += "+split"
+    return name
+
+
+def _moe_st(layer, x, topk_scores, topk_ids, state):
+    """The st pair (okc_patch/st_moe.py) on pre-normed x."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import st_moe
+
+    local_ids = local_routes(layer, topk_ids)
+    y = st_moe.grouped_st(
+        x, local_ids, wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.MOE_ST_PDL,
+    )
+    return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
 
 
 def _small_front(hidden_states, topk_ids, pre_expert_norm):
@@ -181,8 +234,8 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
         return "inside torch.compile"
     if hidden_states.shape[1] != state["H"] or hidden_states.dtype is not torch.bfloat16:
         return f"hidden {tuple(hidden_states.shape)} {hidden_states.dtype}"
-    # The pg kernels hard-code topk 8 and 32 local experts (the TP8/EP8 shape).
-    if topk_ids.shape[1] != 8 or layer.num_local_experts != 32:
+    # The pg kernels hard-code topk 8; local slots are 8-bit in the replica table (255 = not held).
+    if topk_ids.shape[1] != 8 or layer.num_local_experts >= 255:
         return f"topk {topk_ids.shape[1]}, {layer.num_local_experts} local experts"
     if post_expert_norm is None:
         return "no post-expert norm"
@@ -193,27 +246,45 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
     return None
 
 
-def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps):
-    from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
-        fused_post_expert_norm_weighted_sum,
-    )
+def local_routes(layer, topk_ids):
+    """[T, 8] global top-k ids -> [T, 8] int32 local expert slots on this rank, -1 where another rank computes the
+    route: the static home map, or with hot-expert replicas a per-forward balancer that every rank computes alike from
+    the same ids (T and the ids are the same on every rank: a TP batch, or the SP gathered chunk)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
-    num_tokens, size_k = x.shape
+    rep_table = getattr(layer, "_okc_rep_table", None)
+    if rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
+        # verify-sized: each active replicated expert to the holder with fewer active experts
+        return pg_moe.assign_replicas(topk_ids, rep_table, layer.replica_plan["me"])
+    if rep_table is not None and _sw.MOE_REP_PREFILL:
+        # prefill-sized: every expert is active; each replicated expert's routes split to level routed tokens
+        return pg_moe.split_replicas(topk_ids, rep_table, layer.replica_plan["me"])
+    local_ids = topk_ids.to(torch.int32)
+    if layer._expert_map is not None:
+        local_ids = layer._expert_map[local_ids]
+    return local_ids.contiguous()
+
+
+def route_map(layer, topk_ids):
+    """local_routes' decision as a [256] global -> slot map, for pg_route: the static map or the balancer's."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
+    rep_table = getattr(layer, "_okc_rep_table", None)
+    if rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
+        return pg_moe.assign_replicas(topk_ids, rep_table, layer.replica_plan["me"], as_map=True)
+    return layer._expert_map
+
+
+def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps):
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
     y, local_ids = pg_moe.grouped_pg_small(
-        x, topk_ids, layer._expert_map,
+        x, topk_ids, route_map(layer, topk_ids),
         norm_weight=norm_weight, norm_eps=norm_eps,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.SW_PDL,
+        bm=pg_moe.block_m(x.shape[0]),
     )
-    return fused_post_expert_norm_weighted_sum(
-        y.view(num_tokens, 8, size_k),
-        topk_scores,
-        norm_weight=layer._post_expert_norm_weight,
-        eps=layer._post_expert_norm_eps,
-        weight_first=layer._post_expert_norm_weight_first,
-        slot_expert_ids=local_ids,
-        min_tokens_for_fused=1,
-    )
+    return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
 
 
 def pg_prep(layer, topk_ids):
@@ -223,13 +294,19 @@ def pg_prep(layer, topk_ids):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-    local_ids = topk_ids.to(torch.int32)
-    if layer._expert_map is not None:
-        local_ids = layer._expert_map[local_ids]
-    local_ids = local_ids.contiguous()
+    emap = layer._expert_map
+    bm = pg_moe.block_m(topk_ids.shape[0])
+    if (_sw.PG_LOCAL_ALIGN and topk_ids.shape[0] >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS
+            and (emap is None or emap.dtype is torch.int32) and layer.num_local_experts <= 64):
+        # Large chunks: one count of the routes into the local-slot counters (map and int32 cast folded in)
+        # instead of the cast + map gather + 256-expert moe_align / count_and_sort chain; same values downstream.
+        if getattr(layer, "_okc_rep_table", None) is not None:
+            return pg_moe.align_local(local_routes(layer, topk_ids), None, layer.num_local_experts, bm)
+        return pg_moe.align_local(topk_ids, emap, layer.num_local_experts, bm)
+    local_ids = local_routes(layer, topk_ids)
     # Marlin's alignment convention: global expert count with -1 for non-local routes.
     align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
-    return (local_ids, *moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts))
+    return (local_ids, *moe_align_block_size(local_ids, bm, align_num_experts))
 
 
 def pg_run(layer, x, prep, post_expert_norm):
@@ -244,7 +321,7 @@ def pg_run(layer, x, prep, post_expert_norm):
         raise RuntimeError(f"OKC pg-only MoE layer cannot run this batch: {decline}")
     y = pg_moe.grouped_pg(
         x.contiguous(), sorted_ids, block_experts, n_padded,
-        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], bm=pg_moe.block_m(x.shape[0]),
     )
     return y.view(x.shape[0], 8, x.shape[1])
 
@@ -274,6 +351,6 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
     prep = pg_prep(layer, topk_ids)
     y = pg_moe.grouped_pg(
         x, *prep[1:],
-        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], bm=pg_moe.block_m(x.shape[0]),
     )
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, prep[0])

@@ -9,6 +9,7 @@
   OKC_MOE_PG_ONLY=1  (default) packed layers drop their Marlin copy and run pg at every token count
                      (verify steps included), so every layer fits: +0.1 GiB per layer over Marlin.
                      0 keeps Marlin and uses pg on the prefill chunks of the first N layers only.
+  OKC_MOE_REPLICAS=1 hot-expert replicas per rank per pg-only layer (0, 1 or 2), 1.8 GiB per rank per replica.
 
 Switches are read once at import, so dispatch is stable across CUDA-graph capture and replay.
 The judge's launch command is fixed, so the submitted defaults are the ones below.
@@ -27,6 +28,23 @@ MOE_PG_MIN_TOKENS = int(os.environ.get("OKC_MOE_PG_MIN_TOKENS", "1536"))
 MOE_PG_ONLY = _flag("OKC_MOE_PG_ONLY", "1")
 _pack_layers = os.environ.get("OKC_MOE_PACK_MAX_LAYERS", "all" if MOE_PG_ONLY else "16")
 MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
+# Hot-expert replicas against the verify EP straggler (every rank waits at the MoE all-reduce for the one with the
+# most active experts): forwards of <= OKC_MOE_REP_MAX_TOKENS tokens give each active replicated expert to the holder
+# with fewer active experts (pg_moe.assign_replicas), longer ones (OKC_MOE_REP_PREFILL) split its routes between the
+# two holders at a token boundary that levels routed tokens (pg_moe.split_replicas).
+MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "1"))
+MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
+MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
+# pg's narrow build (_cuda_src_pgn: 128-token blocks, widths 16 / 64 / 128) for calls of OKC_PG_NARROW_MIN_T..MAX_T
+# tokens (serving/kernels/extend E5-E7: 0.77-0.80x at verify T 8..256, 0.86-0.97x at extends of 753..3072); the
+# shipped build (256-token blocks) outside. Same outputs for every real token.
+PG_NARROW_MIN_T = int(os.environ.get("OKC_PG_NARROW_MIN_T", "1"))
+PG_NARROW_MAX_T = int(os.environ.get("OKC_PG_NARROW_MAX_T", "3072"))
+# st pair (okc_patch/st_moe.py: the same packs read by mma.sync n8 tiles) on pg-only layers at T <=
+# OKC_MOE_ST_MAX_TOKENS (verify bs 1..4); OKC_MOE_ST_PDL launches its down kernel with PDL.
+SW_MOE_ST = _flag("OKC_SW_MOE_ST", "1")
+MOE_ST_MAX_TOKENS = min(32, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "32")))
+MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 
 
 # Verify-side kernel stack (kernel-track grafts): fused sliding-window / full attention for decode and verify,
@@ -83,6 +101,11 @@ SP_CE_TP = _flag("OKC_SP_CE_TP", "1")
 SW_MOE_OVL = _flag("OKC_SW_MOE_OVL", "0")
 # NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
 SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
+# pg calls of >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS tokens align their routes with the prefill bank's local-slot align
+# (pg_moe.align_local: one count into the local-slot counters) instead of the cast + map gather + 256-expert
+# moe_align_block_size chain (1xH200: 16K-token call 127.7 -> 19.7 us GPU, bit-identical pg rows).
+PG_LOCAL_ALIGN = _flag("OKC_PG_LOCAL_ALIGN", "1")
+PG_LOCAL_ALIGN_MIN_TOKENS = int(os.environ.get("OKC_PG_LOCAL_ALIGN_MIN_TOKENS", "1024"))
 
 # Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call. Per request:
 # full layers from OKC_PFMHA_MIN_TOKENS new tokens, sliding layers from OKC_PFMHA_SLIDING_MIN_TOKENS (1xH200 over a 75K
@@ -149,7 +172,9 @@ RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
 
 ANY_ATTN = SW_ATTN or SW_WST
 
-__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
+__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
+           "MOE_REP_PREFILL", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL",
+           "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS",
            "SW_ATTN", "SW_PROJ", "SW_PROJ_MMA", "SW_SMALLM", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16",
