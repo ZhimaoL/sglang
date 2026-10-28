@@ -86,8 +86,9 @@ WST_ACC16 = _flag("OKC_WST_ACC16", "0")
 SW_VFG = _flag("OKC_SW_VFG", "1")
 SW_VFG_FULL1 = _flag("OKC_SW_VFG_FULL1", "1")
 # Sliding verify batches up to this bs on VP2 (one 16-CTA cluster pair per request, merged in-cluster: no merge kernel)
-# instead of VFG + vfgm / vfgm2. "1" = the bank's routing (VP2 at bs 1 only).
-VP2_MAX_BS = int(os.environ.get("OKC_VP2_MAX_BS", "1"))
+# instead of VFG + vfgm / vfgm2: dev2 us / call VP2 vs VFG 5.7 / 9.6 (bs 2), 7.5 / 9.2 (4), 8.1 / 10.4 (7), 11.7 / 11.0
+# (8; 7 clusters of 16 fit at 1 CTA / SM, the rest share SMs). "1" = the bank's routing (VP2 at bs 1 only).
+VP2_MAX_BS = int(os.environ.get("OKC_VP2_MAX_BS", "7"))
 # Sequence-parallel prefill on Hopper (layers/layernorm_sp.py okc_hopper_sp): the residual stream, norms, router,
 # pooler and unpooler run on 1/tp of the tokens; the experts see every token through an all-gather and return a
 # reduce-scatter, so the bytes on the wire match the two all-reduces they replace.
