@@ -93,6 +93,25 @@ def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
                      dim=-1).contiguous()
 
 
+def align_local(topk_ids, expert_map):
+    """The prefill bank's local-expert align (sk_route.align) with the expert map folded in: topk_ids [T, 8] global
+    ids (int32 / int64), expert_map [256] int32 (-1 = remote) -> (local_ids [T, 8] int32, sorted_ids, block_experts,
+    n_padded) in moe_align_block_size(local_ids, 256, ...)'s layout, sized for the 32 local experts."""
+    numel = topk_ids.numel()
+    device = topk_ids.device
+    nblocks = (numel + 32 * (_BLOCK_M - 1) + _BLOCK_M - 1) // _BLOCK_M
+    local_ids = torch.empty(topk_ids.shape, dtype=torch.int32, device=device)
+    sorted_ids = torch.empty((nblocks * _BLOCK_M,), dtype=torch.int32, device=device)
+    block_experts = torch.empty((nblocks,), dtype=torch.int32, device=device)
+    n_padded = torch.empty((1,), dtype=torch.int32, device=device)
+    cnt = torch.zeros((32,), dtype=torch.int32, device=device)
+    off = torch.empty((32,), dtype=torch.int32, device=device)
+    cur = torch.empty((32,), dtype=torch.int32, device=device)
+    pg_ext().align(topk_ids.contiguous(), expert_map, local_ids, cnt, off, cur, sorted_ids, block_experts, n_padded,
+                   numel, _BLOCK_M)
+    return local_ids, sorted_ids, block_experts, n_padded
+
+
 def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
     """x [T, 4096] bf16 -> y [T*8, 4096] bf16 per-route expert outputs (rows of non-local routes stay
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded

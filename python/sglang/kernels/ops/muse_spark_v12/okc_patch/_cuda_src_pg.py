@@ -5,7 +5,8 @@ bank kernels/muse_prefill_layer/plt_c3.py (sha256 2d1fad0d0b7c42f1). Edits: five
 fp16 / 4608 B (the code is bf16 with WSB = 5120 B blocks) and an unused cuda_fp16.h include dropped.
 Not carried over: the pgkw P2 kernel, the pg_n4 64-token probe kernel and the probe / split
 configurations (none is on the bank's default cfg 350 path).
-Entry points: tiles (live block list), gather (bf16 x rows -> bf16 swizzled token images), gg1
+Added for serving: align (the bank's sk_route local-expert align with the expert map folded in).
+Entry points: align (local-expert sorted ids), tiles (live block list), gather (bf16 x rows -> bf16 swizzled token images), gg1
 (gate+up GEMM, silu*mul fused, bf16 intermediate), gg2 (down GEMM, scatter by sorted_ids, bf16 rows).
 Weights stay packed NVFP4 (pack_wsf in pg_moe.py: e2m1 codes reordered, e4m3 block scales stored
 exactly as bf16) and are decoded in registers.
@@ -564,6 +565,86 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
 }
 
+
+// Local-expert align (the prefill bank's sk_route align, plt_c3 / plt_c4b skr::align_count / align_scan /
+// align_scatter) for the 32 local experts, with the global -> local expert map and the int32 conversion folded into
+// the count pass: count -> one-CTA scan (ranges padded to BM, block -> expert map, padding sentinels = numel) ->
+// CTA-aggregated scatter. Same layout as moe_align_block_size over the local experts; the order of routes inside an
+// expert's range is free (pg computes every route's rows independently).
+constexpr int NL = 32;
+constexpr int NE = 256;
+
+template <typename IT>
+__global__ void __launch_bounds__(256) align_count(const IT* __restrict__ ids, const int* __restrict__ map,
+                                                   int* __restrict__ lids, int numel, int* __restrict__ cnt) {
+    __shared__ int h[NL];
+    if (threadIdx.x < NL) h[threadIdx.x] = 0;
+    __syncthreads();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += gridDim.x * blockDim.x) {
+        const long long g = (long long)ids[i];
+        const int e = (g >= 0 && g < NE) ? map[g] : -1;
+        lids[i] = e;
+        if (e >= 0) atomicAdd(&h[e], 1);
+    }
+    __syncthreads();
+    if (threadIdx.x < NL && h[threadIdx.x]) atomicAdd(&cnt[threadIdx.x], h[threadIdx.x]);
+}
+
+__global__ void __launch_bounds__(256) align_scan(const int* __restrict__ cnt, int* __restrict__ off,
+                                                  int* __restrict__ cur, int* __restrict__ sorted_ids,
+                                                  int* __restrict__ block_experts, int* __restrict__ n_padded,
+                                                  int numel, int nblocks, int BM) {
+    __shared__ int so[NL + 1], sc[NL];
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        for (int e = 0; e < NL; e++) {
+            const int c = cnt[e];
+            sc[e] = c;
+            so[e] = acc;
+            acc += (c + BM - 1) / BM * BM;
+        }
+        so[NL] = acc;
+        *n_padded = acc;
+    }
+    __syncthreads();
+    for (int b = threadIdx.x; b < nblocks; b += blockDim.x) {
+        const int pos = b * BM;
+        int ex = -1;
+        for (int e = 0; e < NL; e++)
+            if (pos >= so[e] && pos < so[e + 1]) ex = e;
+        block_experts[b] = ex;
+    }
+    for (int e = 0; e < NL; e++)
+        for (int p = so[e] + sc[e] + threadIdx.x; p < so[e + 1]; p += blockDim.x) sorted_ids[p] = numel;
+    if (threadIdx.x < NL) {
+        off[threadIdx.x] = so[threadIdx.x];
+        cur[threadIdx.x] = 0;
+    }
+}
+
+__global__ void __launch_bounds__(256) align_scatter(const int* __restrict__ lids, int numel,
+                                                     const int* __restrict__ off, int* __restrict__ cur,
+                                                     int* __restrict__ sorted_ids, int chunk) {
+    __shared__ int h[NL], base[NL];
+    if (threadIdx.x < NL) h[threadIdx.x] = 0;
+    __syncthreads();
+    const int lo = blockIdx.x * chunk, hi = min(numel, lo + chunk);
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const int e = lids[i];
+        if (e >= 0) atomicAdd(&h[e], 1);
+    }
+    __syncthreads();
+    if (threadIdx.x < NL) {
+        base[threadIdx.x] = h[threadIdx.x] ? off[threadIdx.x] + atomicAdd(&cur[threadIdx.x], h[threadIdx.x]) : 0;
+        h[threadIdx.x] = 0;
+    }
+    __syncthreads();
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const int e = lids[i];
+        if (e >= 0) sorted_ids[base[e] + atomicAdd(&h[e], 1)] = i;
+    }
+}
+
 }  // namespace pgk
 
 // ------------------------------------------------------------------ host
@@ -604,6 +685,31 @@ static void launch(const torch::Tensor& xg, const torch::Tensor& wsf, const floa
     fn<<<grid > 0 ? grid : pg_num_sms(), 384, smem, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const char*>(xg.data_ptr()), reinterpret_cast<const char*>(wsf.data_ptr()),
         gs, out, sorted_ids, block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, numel, snake);
+}
+
+// ids: the global top-k ids (int32 or int64, any shape, numel entries); map: [256] int32 global -> local expert
+// (-1 = remote); writes lids (int32 local ids, -1 = remote) and the align outputs; cnt must be zero on entry.
+void align(torch::Tensor ids, torch::Tensor map, torch::Tensor lids, torch::Tensor cnt, torch::Tensor off,
+           torch::Tensor cur, torch::Tensor sorted_ids, torch::Tensor block_experts, torch::Tensor n_padded,
+           int64_t numel, int64_t BM) {
+    TORCH_CHECK(map.numel() == pgk::NE && map.scalar_type() == at::kInt, "pg align: map must be int32 [256]");
+    auto st = at::cuda::getCurrentCUDAStream();
+    const int nblocks = (int)block_experts.numel();
+    const int chunk = 4096;
+    const int nscat = (int)((numel + chunk - 1) / chunk);
+    if (ids.scalar_type() == at::kLong)
+        pgk::align_count<long long><<<nscat, 256, 0, st>>>(reinterpret_cast<const long long*>(ids.data_ptr()),
+            map.data_ptr<int>(), lids.data_ptr<int>(), (int)numel, cnt.data_ptr<int>());
+    else {
+        TORCH_CHECK(ids.scalar_type() == at::kInt, "pg align: ids must be int32 or int64");
+        pgk::align_count<int><<<nscat, 256, 0, st>>>(ids.data_ptr<int>(), map.data_ptr<int>(), lids.data_ptr<int>(),
+            (int)numel, cnt.data_ptr<int>());
+    }
+    pgk::align_scan<<<1, 256, 0, st>>>(cnt.data_ptr<int>(), off.data_ptr<int>(), cur.data_ptr<int>(),
+                                      sorted_ids.data_ptr<int>(), block_experts.data_ptr<int>(),
+                                      n_padded.data_ptr<int>(), (int)numel, nblocks, (int)BM);
+    pgk::align_scatter<<<nscat, 256, 0, st>>>(lids.data_ptr<int>(), (int)numel, off.data_ptr<int>(),
+                                             cur.data_ptr<int>(), sorted_ids.data_ptr<int>(), chunk);
 }
 
 // snake item order for small calls (few items per CTA): tokens = numel / 8 <= pgk_snake_max_t

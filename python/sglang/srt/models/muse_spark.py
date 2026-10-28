@@ -1013,6 +1013,12 @@ class MuseSpark1xMoE(nn.Module):
             tp_group.all_gather_into_tensor(full, shard)
             return full
 
+        pre_norm = self.pre_expert_norm
+        if okc_patch.SP_SHARD_PRENORM and pre_norm is not None:
+            # The pre-expert RMSNorm is row-local: run it on this rank's shard before the gather (1/tp of the
+            # rows, the same bf16 bytes on the wire) instead of on every rank's copy of the gathered chunk.
+            expert_input = pre_norm(expert_input)
+            pre_norm = None
         full_input = gather(expert_input)
         full_scores = gather(topk_scores)
         full_ids = gather(topk_ids)
@@ -1022,11 +1028,11 @@ class MuseSpark1xMoE(nn.Module):
                 full_scores,
                 full_ids,
                 self.experts.post_expert_norm,
-                pre_expert_norm=self.pre_expert_norm,
+                pre_expert_norm=pre_norm,
             )
         else:
-            if self.pre_expert_norm is not None:
-                full_input = self.pre_expert_norm(full_input)
+            if pre_norm is not None:
+                full_input = pre_norm(full_input)
             output = self.experts(
                 full_input, full_scores, full_ids, self.experts.post_expert_norm
             )
