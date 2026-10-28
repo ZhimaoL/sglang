@@ -72,6 +72,8 @@ def _build_packs(layer) -> dict | None:
         # A pg-only layer takes pg on every forward, CUDA-graph capture included, so its
         # extension has to be built here rather than lazily inside the first captured forward.
         pg_moe.pg_ext()
+        if _sw.PG_NARROW_MIN_T <= _sw.PG_NARROW_MAX_T:
+            pg_moe.pg_narrow_ext()
 
     # pack_wsf wants the raw stacked [gate; up] rows and raw e4m3 scale bytes; gs13 is the
     # per-expert scale Marlin also uses (its constant gain is cancelled by the post-expert norm).
@@ -245,17 +247,18 @@ def pg_prep(layer, topk_ids):
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
     emap = layer._expert_map
+    bm = pg_moe.block_m(topk_ids.shape[0])   # the build pg runs: narrow (128-token blocks) or shipped (256)
     if (_sw.PG_LOCAL_ALIGN and topk_ids.shape[0] >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS
             and (emap is None or emap.dtype is torch.int32) and layer.num_local_experts <= 64):
         # Large chunks: one count of the routes into the local-slot counters (map and int32 cast folded in)
         # instead of the cast + map gather + 256-expert moe_align / count_and_sort chain; same values downstream.
         if getattr(layer, "_okc_rep_table", None) is not None:
-            return pg_moe.align_local(local_routes(layer, topk_ids), None, layer.num_local_experts)
-        return pg_moe.align_local(topk_ids, emap, layer.num_local_experts)
+            return pg_moe.align_local(local_routes(layer, topk_ids), None, layer.num_local_experts, bm)
+        return pg_moe.align_local(topk_ids, emap, layer.num_local_experts, bm)
     local_ids = local_routes(layer, topk_ids)
     # Marlin's alignment convention: global expert count with -1 for non-local routes.
     align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
-    return (local_ids, *moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts))
+    return (local_ids, *moe_align_block_size(local_ids, bm, align_num_experts))
 
 
 def pg_run(layer, x, prep, post_expert_norm):
@@ -270,7 +273,7 @@ def pg_run(layer, x, prep, post_expert_norm):
         raise RuntimeError(f"OKC pg-only MoE layer cannot run this batch: {decline}")
     y = pg_moe.grouped_pg(
         x.contiguous(), sorted_ids, block_experts, n_padded,
-        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], bm=pg_moe.block_m(x.shape[0]),
     )
     return y.view(x.shape[0], 8, x.shape[1])
 
@@ -300,6 +303,6 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
     prep = pg_prep(layer, topk_ids)
     y = pg_moe.grouped_pg(
         x, *prep[1:],
-        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], bm=pg_moe.block_m(x.shape[0]),
     )
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, prep[0])

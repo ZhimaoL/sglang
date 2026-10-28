@@ -16,7 +16,8 @@ expert); a layer with replicas packs 32 + R experts (moe.py, rep_table / assign_
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext
+from sglang.kernels.ops.muse_spark_v12.okc_patch import PG_NARROW_MAX_T, PG_NARROW_MIN_T
+from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow_ext
 
 _BLOCK_M = 256
 _CFG = 350        # the bank's shipped pg configuration (widths 64 / 128 / 256, 5 stages)
@@ -94,6 +95,12 @@ def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
                      dim=-1).contiguous()
 
 
+def block_m(num_tokens: int) -> int:
+    """moe_align block size for a call of num_tokens tokens: 128 on the narrow build's range, else 256. A host-side
+    size only, so a captured graph's dispatch is fixed per token bucket."""
+    return 128 if PG_NARROW_MIN_T <= num_tokens <= PG_NARROW_MAX_T else _BLOCK_M
+
+
 def align_local(ids, expert_map=None, n_local=32, block_m=_BLOCK_M):
     """Large-T front end (the prefill bank's local-slot align): ids [T, 8] global expert ids (int32 / int64) mapped by
     expert_map ([E] int32, global -> local slot, -1 remote), or with expert_map None already local slot ids (-1 = not
@@ -162,26 +169,31 @@ def split_replicas(topk_ids, tab, rank):
     return out
 
 
-def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
+def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=None):
     """x [T, 4096] bf16 -> y [T*8, 4096] bf16 per-route expert outputs (rows of non-local routes stay
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded
-    come from moe_align_block_size(local_ids, 256, ...) with -1 for non-local routes; the local expert count is
-    wsf13's first dimension."""
+    come from moe_align_block_size(local_ids, bm, ...) or align_local with -1 for non-local routes; bm = 256 runs the
+    shipped build, bm = 128 the narrow one (block_m(T) is the serving choice; None infers it from the sizes). The local
+    expert count (32 home + replica slots) is wsf13's first dimension."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
     num_pid_m = block_experts.shape[0]
-    ext = pg_ext()
+    if bm is None:
+        # the caller's alignment picks the build: moe_align / align_local size block_experts as cdiv(len(sorted_ids),
+        # block size)
+        bm = 128 if -(-sorted_ids.numel() // 128) == num_pid_m else _BLOCK_M
+    ext = pg_narrow_ext() if bm != _BLOCK_M else pg_ext()
     live = torch.empty((num_pid_m + 1,), dtype=torch.int32, device=x.device)
-    ext.tiles(block_experts, n_padded, sorted_ids, live, num_pid_m, _BLOCK_M, numel, _WMASK, wsf13.shape[0])
+    ext.tiles(block_experts, n_padded, sorted_ids, live, num_pid_m, bm, numel, _WMASK, wsf13.shape[0])
     # Persistent grid: 0 = one CTA per SM (the bank's default). Capping the CTAs trades cross-item
     # pipelining for less per-CTA setup; the bound must come from host-side sizes only (a device read
     # here would be a sync inside the forward and break graph capture).
     grid = 0
     if _CTA_ITEMS:
         grid = min(4096, max(1, -(-(num_pid_m * (2 * 4096 // 128)) // _CTA_ITEMS)))
-    xg_t = torch.empty((num_pid_m * 64 * 256 * 64,), dtype=torch.bfloat16, device=x.device)
+    xg_t = torch.empty((num_pid_m * 64 * bm * 64,), dtype=torch.bfloat16, device=x.device)
     ext.gather(x, xg_t, sorted_ids, live, numel, 0)
-    inter_t = torch.empty((num_pid_m * 64 * 256 * 64,), dtype=torch.bfloat16, device=x.device)
+    inter_t = torch.empty((num_pid_m * 64 * bm * 64,), dtype=torch.bfloat16, device=x.device)
     ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, grid, 0)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
     ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid, 0)
