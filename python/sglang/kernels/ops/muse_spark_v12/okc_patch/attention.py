@@ -51,7 +51,6 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
 )
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
-RMS_EPS = 1e-5
 LOG2E = 1.4426950408889634
 # Below this sorted-path batch size, decode-full stays on FA3 (court: d16 sort tax ==
 # stream win; d32 wins). Arbitrary between the two measured points; retune on-box.
@@ -120,6 +119,12 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
     # a layer without any of the three computes something else.
     if not (attn.use_qk_norm and attn.use_o_norm and attn.use_o_gate):
         return None
+    # Both norms take the layer's norm_eps (FusedQKNorm and the output RMSNorm are built
+    # with it); the kernels apply that same EPS to q, k and the output.
+    eps = getattr(attn, "norm_eps", None)
+    if eps is None:
+        return None
+    eps = float(eps)
     radix = attn.attn
     if radix.logit_cap:
         return None
@@ -207,7 +212,7 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
             qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
             bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
             window=window + 1, page_size=backend.page_size,
-            kv_scale=kv_scale, theta=theta, sm_scale=sm_scale, qk_factor=qk_factor,
+            kv_scale=kv_scale, theta=theta, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
         )
     if not SW_FS or theta is not None or backend.page_size != 1:
         return None
@@ -220,7 +225,7 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
     return _fs_full(
         ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
         bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
-        kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, fp8_pool=is_fp8,
+        kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, fp8_pool=is_fp8, eps=eps,
     )
 
 
@@ -255,7 +260,7 @@ _V3_TUNE_BY = {
 
 def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
              bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
-             sm_scale, qk_factor):
+             sm_scale, qk_factor, eps):
     """Sliding dispatch: the attn-v3 fused kernels on the TP8 shape (judge-checked
     sliding decode 1.73-1.92x, verify above the v1 3-launch chain), v1 otherwise."""
     if SW_ATTN_V3 and hq == 16 and hkv == 2 and d == 64 and q_len in (1, 8):
@@ -264,20 +269,20 @@ def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
             bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
             window=window, page_size=page_size, kv_scale=kv_scale, theta=theta,
-            sm_scale=sm_scale, qk_factor=qk_factor,
+            sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
         )
     log_once(f"sliding_v1[q_len={q_len}]", f"(first bs={bs})")
     return _sliding_v1(
         qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
         bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
         window=window, page_size=page_size, kv_scale=kv_scale, theta=theta,
-        sm_scale=sm_scale, qk_factor=qk_factor,
+        sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
     )
 
 
 def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
                 bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
-                sm_scale, qk_factor):
+                sm_scale, qk_factor, eps):
     """attn-v3 fused sliding: single-launch decode (_sl_decode_f) or prep +
     split-with-tail verify (_sl_verify_f2); the last-arriver program folds the
     combine, output RMSNorm and sigmoid gate into the same launch."""
@@ -306,7 +311,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             qkv.stride(0), page_table.stride(0), hq * d, gate_col0,
             page_table.shape[1] * page_size,
             alpha, 1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef, kv_scale,
-            EPS=RMS_EPS,
+            EPS=eps,
             GROUP=group, HQ=hq, HKV=hkv,
             WINDOW=window, PAGE=page_size, HAS_ROPE=bool(theta),
             S=S, CHUNK=chunk, SC=sc, ACC16=True,
@@ -335,7 +340,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         cache_loc, seq_pre,
         qkv.stride(0),
         1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef,
-        EPS=RMS_EPS,
+        EPS=eps,
         L=L, GROUP=group, HQ=hq, HKV=hkv,
         GROUP_Q=group, HKV_Q=hkv,
         HAS_ROPE=bool(theta), D=d, BLOCK_R=br,
@@ -348,7 +353,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         page_table.stride(0), qkv.stride(0), hq * d, gate_col0,
         page_table.shape[1] * page_size - L,
         alpha, kv_scale,
-        EPS=RMS_EPS,
+        EPS=eps,
         L=L, GROUP=group, HKV=hkv,
         WINDOW=window, PAGE=page_size,
         S=S, CHUNK=chunk, SC=sc, ACC16=True,
@@ -362,7 +367,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
 
 def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
                 bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
-                sm_scale, qk_factor):
+                sm_scale, qk_factor, eps):
     """muse_attention_decode v1 sliding path (lane TUNE_BY winners: BN 128, 4 warps)."""
     device = qkv.device
     B, L = bs, q_len
@@ -391,7 +396,7 @@ def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             qkv.stride(0), page_table.stride(0),
             page_table.shape[1] * page_size,
             alpha, 1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef,
-            EPS=RMS_EPS,
+            EPS=eps,
             GROUP=group, HQ=hq, HKV=hkv,
             WINDOW=window, PAGE=page_size, HAS_ROPE=bool(theta),
             S=S, CHUNK=chunk,
@@ -409,7 +414,7 @@ def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             cache_loc, seq_pre,
             qkv.stride(0),
             1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef,
-            EPS=RMS_EPS,
+            EPS=eps,
             L=L, GROUP=group, HQ=hq, HKV=hkv,
             GROUP_Q=group_l, HKV_Q=hkv_l,
             HAS_ROPE=bool(theta), D=d, BLOCK_R=br,
@@ -435,7 +440,7 @@ def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     ak._sliding_combine[(B * hkv_l * tiles,)](
         ws_acc, ws_m, ws_l, qkv, out,
         qkv.stride(0), hq * d, (hq + 2 * hkv) * d, kv_scale,
-        EPS=RMS_EPS, L=L, GROUP=group_l, HKV=hkv_l,
+        EPS=eps, L=L, GROUP=group_l, HKV=hkv_l,
         S=S, BLOCK_S=triton.next_power_of_2(S), TILES=tiles,
         D=d, BLOCK_M=cm,
         num_warps=4, num_stages=1,
@@ -477,7 +482,7 @@ def _fs_sorted_rows(ctx, page_table, seq_pre, bs, total):
 
 
 def _fs_full(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
-             bs, q_len, hq, hkv, d, kv_scale, sm_scale, qk_factor, fp8_pool):
+             bs, q_len, hq, hkv, d, kv_scale, sm_scale, qk_factor, fp8_pool, eps):
     """v2 full-attention streamer over the sorted rows (always SORTED: the court's
     B == 1 bitmap walk reads dead pool rows, which a serving pool cannot guarantee
     are NaN-free)."""
@@ -504,14 +509,14 @@ def _fs_full(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             ws_acc, ws_m, ws_l,
             qkv.stride(0), total, maxP,
             alpha, 1.0 / kv_scale, 1.0 / kv_scale, qk_factor,
-            EPS=RMS_EPS, GROUP=group, HQ=hq, HKV=hkv,
+            EPS=eps, GROUP=group, HQ=hq, HKV=hkv,
             S=S, SORTED=True,
             D=d, BLOCK_M=max(16, triton.next_power_of_2(hq)), BLOCK_N=BN,
             BLOCK_H=triton.next_power_of_2(hkv),
             num_warps=4, num_stages=3,
         )
         _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, 1, hq, 1, S, d,
-                  gate_col0, kv_scale, device)
+                  gate_col0, kv_scale, eps, device)
         return out
     # L == 8, B == 1 verify: prep (q norm -> ws, own k/v -> cache), streamer, merge.
     LG = L * group
@@ -527,7 +532,7 @@ def _fs_full(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         cache_loc, seq_pre,
         qkv.stride(0),
         1.0 / kv_scale, 1.0 / kv_scale, qk_factor, 0.0,
-        EPS=RMS_EPS,
+        EPS=eps,
         L=L, GROUP=group, HQ=hq, HKV=hkv,
         GROUP_Q=group, HKV_Q=hkv,
         HAS_ROPE=False, D=d, BLOCK_R=br,
@@ -546,12 +551,12 @@ def _fs_full(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         num_warps=4, num_stages=3,
     )
     _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, hkv, group, L, S, d,
-              gate_col0, kv_scale, device)
+              gate_col0, kv_scale, eps, device)
     return out
 
 
 def _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, hkv_l, group_l, L, S, D,
-              gate_col0, kv_scale, device):
+              gate_col0, kv_scale, eps, device):
     """Partials -> gated output: _fs_reduce + _fs_combine when S is large."""
     LG = L * group_l
     cm = min(16, max(16, triton.next_power_of_2(LG)))
@@ -575,7 +580,7 @@ def _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, hkv_l, group_l, L, S, D,
     ak._fs_combine[(bh * tiles,)](
         ws_acc, ws_m, ws_l, qkv, out,
         qkv.stride(0), out_stride, gate_col0, kv_scale,
-        EPS=RMS_EPS, L=L, GROUP=group_l, HKV=hkv_l, S=S,
+        EPS=eps, L=L, GROUP=group_l, HKV=hkv_l, S=S,
         BLOCK_S=triton.next_power_of_2(S), SC=SC, TILES=tiles,
         D=D, BLOCK_M=cm,
         num_warps=4, num_stages=3,
