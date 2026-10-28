@@ -259,8 +259,8 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
                                                  int n_global, int numel, int wmask, int nl,
                                                  int* __restrict__ local_ids, int* __restrict__ sorted_ids,
                                                  int* __restrict__ block_experts, int* __restrict__ live) {
-    __shared__ int wc[32][RT_E];   // per (warp, slot): count -> base
-    __shared__ int cnt[RT_E], bstart[RT_E], bexp[RT_NB], nblk;
+    __shared__ int wc[32][RT_E + 1];   // per (warp, slot): count -> base (row pad: the scan reads columns)
+    __shared__ int cnt[RT_E], bstart[RT_E], bexp[RT_NB], ltot[2 * RT_NCLS], nblk;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const unsigned lt = (1u << lane) - 1u;
     wc[w][lane] = 0;
@@ -305,8 +305,11 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         if (lane == 31) cnt[x] = inc;
     }
     __syncthreads();
-    if (w == 0) {   // lane l = experts l (half 0) and 32 + l (half 1): blocks, block list, live list
-        int nbx[2], code[2], b0[2], carry = 0;
+    // lane l = slots l (half 0) and 32 + l (half 1). Every list warp derives the blocks from cnt; warp 0 writes the
+    // block lists, warp w < 2 RT_NCLS counts class route_cls(w / 2)'s live blocks of half w % 2, and after the barrier
+    // each one writes its own run of the live list (the old one-warp order: classes widest first, halves, slots).
+    int nbx[2], code[2], b0[2], carry = 0, pos = 0;
+    if (w < 2 * RT_NCLS) {
 #pragma unroll
         for (int hf = 0; hf < 2; hf++) {
             const int x = 32 * hf + lane;
@@ -320,34 +323,33 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
             }
             b0[hf] = carry + bs - nbx[hf];
             carry += __shfl_sync(0xFFFFFFFFu, bs, 31);
-            bstart[x] = b0[hf];
-            for (int j = 0; j < nbx[hf]; j++) { bexp[b0[hf] + j] = x; block_experts[b0[hf] + j] = x; }
-            // the expert's last block holds v = c - XNT (nbx - 1) routes, the others XNT (the full class)
+            if (w == 0) {
+                bstart[x] = b0[hf];
+                for (int j = 0; j < nbx[hf]; j++) { bexp[b0[hf] + j] = x; block_experts[b0[hf] + j] = x; }
+            }
+            // the slot's last block holds v = c - XNT (nbx - 1) routes, the others XNT (the full class)
             const int vl = nbx[hf] > 0 ? c - (nbx[hf] - 1) * XNT : 0;
             code[hf] = route_code(vl, wmask);
         }
-        const int nb = carry;
-        int base = 0;
-        for (int ci = 0; ci < RT_NCLS; ci++) {
-            const int cls = route_cls(ci);
+        const int cls = route_cls(w >> 1), n = nbx[w & 1], cd = code[w & 1];
+        // blocks of class cls a slot contributes: its full blocks (RT_FULL) and / or its last block
+        const int k_c = n == 0 ? 0 : (cls == RT_FULL ? n - 1 : 0) + (cd == cls ? 1 : 0);
+        int inc = k_c;
 #pragma unroll
-            for (int hf = 0; hf < 2; hf++) {
-                // blocks of class cls this expert contributes: its full blocks (RT_FULL) and / or its last block
-                const int n = nbx[hf];
-                const int k_c = n == 0 ? 0 : (cls == RT_FULL ? n - 1 : 0) + (code[hf] == cls ? 1 : 0);
-                int inc = k_c;
-#pragma unroll
-                for (int o = 1; o < 32; o <<= 1) {
-                    const int v = __shfl_up_sync(0xFFFFFFFFu, inc, o);
-                    if (lane >= o) inc += v;
-                }
-                int pos = base + inc - k_c;
-                if (cls == RT_FULL) for (int j = 0; j < n - 1; j++) live[1 + pos++] = (b0[hf] + j) | (RT_FULL << 20);
-                if (n > 0 && code[hf] == cls) live[1 + pos] = (b0[hf] + n - 1) | (code[hf] << 20);
-                base += __shfl_sync(0xFFFFFFFFu, inc, 31);
-            }
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xFFFFFFFFu, inc, o);
+            if (lane >= o) inc += v;
         }
-        if (lane == 0) { live[0] = nb; nblk = nb; }
+        pos = inc - k_c;
+        if (lane == 31) ltot[w] = inc;
+        if (w == 0 && lane == 0) { live[0] = carry; nblk = carry; }
+    }
+    __syncthreads();
+    if (w < 2 * RT_NCLS) {
+        for (int j = 0; j < w; j++) pos += ltot[j];
+        const int hf = w & 1, cls = route_cls(w >> 1), n = nbx[hf];
+        if (cls == RT_FULL) for (int j = 0; j < n - 1; j++) live[1 + pos++] = (b0[hf] + j) | (RT_FULL << 20);
+        if (n > 0 && code[hf] == cls) live[1 + pos] = (b0[hf] + n - 1) | (code[hf] << 20);
     }
     __syncthreads();
 #pragma unroll
