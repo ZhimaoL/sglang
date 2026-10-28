@@ -68,13 +68,14 @@ def fused_post_expert_norm_weighted_sum(
     weight_first: bool = True,
     apply_norm: bool = True,
     slot_expert_ids: Optional[torch.Tensor] = None,
+    min_tokens_for_fused: int = _MIN_TOKENS_FOR_FUSED,
 ) -> torch.Tensor:
     x = expert_output.contiguous()
     tokens, topk, hidden = x.shape
     out = torch.empty((tokens, hidden), dtype=x.dtype, device=x.device)
     if tokens == 0:
         return out
-    if tokens < _MIN_TOKENS_FOR_FUSED:
+    if tokens < min_tokens_for_fused:
         y = x
         if slot_expert_ids is not None:
             y = torch.where(

@@ -178,4 +178,7 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
         eps=layer._post_expert_norm_eps,
         weight_first=layer._post_expert_norm_weight_first,
         slot_expert_ids=local_ids,
+        # Below 32 tokens the wrapper's torch chain is 14 launches, ~36 us per layer at T = 8 (verify bs 1) against
+        # ~4 us for the kernel (session SC); the kernel's math is the same fp32 norm and weighted sum.
+        min_tokens_for_fused=1,
     )
