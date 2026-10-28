@@ -225,7 +225,7 @@ SMALL_MAX_ROUTES = 2048
 ROUTE_MAX_ROUTES = 24576
 
 
-def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, gs13, wsf2, pdl, bm=_BLOCK_M):
+def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, gs13, wsf2, pdl, bm=_BLOCK_M, rep=None):
     """Verify / decode front end of grouped_pg: x [T, 4096] bf16 BEFORE the pre-expert RMSNorm, topk_ids
     [T, 8] int32 global ids, expert_map [E] int32 global -> local slot (-1 remote; the static home map or this
     forward's balancer map) or None. One pg_route launch replaces the int32 cast, the expert-map gather,
@@ -233,7 +233,8 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     expert count, instead of moe_align's ~257 for 256 global experts), and
     pg_gather_norm applies the norm (F.rms_norm's exact fp32 sequence) while it builds the token images.
     bm = 128 runs the narrow build's front end and kernels (block_m(T)). norm_weight None: x is already normed
-    (pg_gather; extends up to ROUTE_MAX_ROUTES).
+    (pg_gather; extends up to ROUTE_MAX_ROUTES). rep = (replica table, rank): pg_route runs the replica balancer itself
+    (pg_rep_assign's decision) and expert_map is not read.
     -> (y [T*8, 4096] bf16 as grouped_pg, local_ids [T, 8] int32: the finalize's slot expert ids)."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
@@ -248,7 +249,8 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     live = torch.empty((nb + 1,), dtype=torch.int32, device=dev)
     emap = expert_map if expert_map is not None else topk_ids.new_empty((0,))
     n_global = expert_map.shape[0] if expert_map is not None else nl
-    ext.route(topk_ids, emap, local_ids, sorted_ids, block_experts, live, numel, n_global, nl, p)
+    rtab, me = rep if rep is not None else (topk_ids.new_empty((0,)), 0)
+    ext.route(topk_ids, emap, rtab, local_ids, sorted_ids, block_experts, live, numel, n_global, nl, p, me)
     xg_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
     if norm_weight is None:
         ext.gather(x, xg_t, sorted_ids, live, numel, p)

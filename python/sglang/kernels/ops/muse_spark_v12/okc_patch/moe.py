@@ -350,6 +350,15 @@ def local_routes(layer, topk_ids):
     return local_ids.contiguous()
 
 
+def _small_map(layer, topk_ids):
+    """(expert map, rep) for grouped_pg_small: with replicas at verify size and OKC_PG_ROUTE_REP_FOLD, pg_route runs the
+    balancer itself (rep = (table, rank); no pg_rep_assign launch), else route_map's map."""
+    rep_table = getattr(layer, "_okc_rep_table", None)
+    if _sw.PG_ROUTE_REP_FOLD and rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
+        return None, (rep_table, layer.replica_plan["me"])
+    return route_map(layer, topk_ids), None
+
+
 def route_map(layer, topk_ids):
     """local_routes' decision as a [256] global -> slot map, for pg_route: the static map or the balancer's."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
@@ -363,8 +372,9 @@ def route_map(layer, topk_ids):
 def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps, pdl=True):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
+    emap, rep = _small_map(layer, topk_ids)
     y, local_ids = pg_moe.grouped_pg_small(
-        x, topk_ids, route_map(layer, topk_ids),
+        x, topk_ids, emap, rep=rep,
         norm_weight=norm_weight, norm_eps=norm_eps,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=pdl and _sw.SW_PDL,
         bm=pg_moe.block_m(x.shape[0]),
