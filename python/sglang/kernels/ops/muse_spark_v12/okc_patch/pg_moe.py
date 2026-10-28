@@ -205,6 +205,8 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=
 
 # Routes per call up to which grouped_pg_small runs (one CTA routes them all; verify bs 32 = 256 tokens = 2048).
 SMALL_MAX_ROUTES = 2048
+# ... and to which pg_route routes a pre-normed call (extends up to 3072 tokens).
+ROUTE_MAX_ROUTES = 24576
 
 
 def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, gs13, wsf2, pdl, bm=_BLOCK_M):
@@ -214,7 +216,8 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     moe_align_block_size and pg_tiles (blocks only for local slots: nl + ceil(T * 8 / 256) at most, nl = wsf13's
     expert count, instead of moe_align's ~257 for 256 global experts), and
     pg_gather_norm applies the norm (F.rms_norm's exact fp32 sequence) while it builds the token images.
-    bm = 128 runs the narrow build's front end and kernels (block_m(T)).
+    bm = 128 runs the narrow build's front end and kernels (block_m(T)). norm_weight None: x is already normed
+    (pg_gather; extends up to ROUTE_MAX_ROUTES).
     -> (y [T*8, 4096] bf16 as grouped_pg, local_ids [T, 8] int32: the finalize's slot expert ids)."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
@@ -231,7 +234,10 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     n_global = expert_map.shape[0] if expert_map is not None else nl
     ext.route(topk_ids, emap, local_ids, sorted_ids, block_experts, live, numel, n_global, nl, p)
     xg_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
-    ext.gather_norm(x, norm_weight, norm_eps, xg_t, sorted_ids, live, numel, p, PG_GN_SPLIT)
+    if norm_weight is None:
+        ext.gather(x, xg_t, sorted_ids, live, numel, p)
+    else:
+        ext.gather_norm(x, norm_weight, norm_eps, xg_t, sorted_ids, live, numel, p, PG_GN_SPLIT)
     inter_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
     ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, 0, p)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=dev)

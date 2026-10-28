@@ -227,15 +227,16 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
     if (tid == 0) live[0] = total_s;
 }
 
-// ------------------------------------------------------------------ small-T routing front end
+// ------------------------------------------------------------------ routing front end (verify / decode / extends)
 // One CTA in place of topk_ids -> local ids (expert map), moe_align_block_size and pg_tiles, for numel <= RT_MAX
-// routes (verify / decode): local slot e < nl <= RT_E (32 home + replicas) gets ceil(count_e / XNT) consecutive
-// blocks, slots ascending, none for non-local routes; a block's sorted_ids hold its routes in route order, then the
-// numel sentinel. block_experts / live are what pg_tiles writes for the same counts (widest class first, blocks
-// ascending), so gather / gg1 / gg2 run unchanged and every route's row is the moe_align path's. local_ids[r] = e or
-// -1. Ranks among a warp's same-slot routes by __match_any_sync, per-slot bases by one warp scan per slot (warp w:
-// slots w, w + 32), block / live lists by one warp over two 32-slot halves.
-constexpr int RT_MAX = 2048, RT_E = 64, RT_NB = RT_E + RT_MAX / XNT;
+// routes (up to 3072-token extends): local slot e < nl <= RT_E (32 home + replicas) gets ceil(count_e / XNT)
+// consecutive blocks, slots ascending, none for non-local routes; a block's sorted_ids hold its routes in route order,
+// then the numel sentinel. block_experts / live are what pg_tiles writes for the same counts (widest class first,
+// blocks ascending), so gather / gg1 / gg2 run unchanged and every route's row is the moe_align path's. local_ids[r] =
+// e or -1. Warp w takes a contiguous run of whole 32-route groups and counts it into its own row of per-slot counts
+// (__match_any_sync leaders, no atomics), one warp scan per slot (warp w: slots w, w + 32) turns the 32 rows into
+// bases, one warp builds the block / live lists over two 32-slot halves, and every warp places its routes from its row.
+constexpr int RT_MAX = 24576, RT_G = RT_MAX / 1024, RT_E = 64, RT_NB = RT_E + RT_MAX / XNT;
 // width code of a block with v routes (pg_tiles' rule) and the live classes, widest first; the narrow build
 // (_cuda_src_pgn, the XNT 128 one) codes widths in 16-token steps
 constexpr bool RT_N16 = XNT <= 128;
@@ -258,46 +259,49 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
                                                  int n_global, int numel, int wmask, int nl,
                                                  int* __restrict__ local_ids, int* __restrict__ sorted_ids,
                                                  int* __restrict__ block_experts, int* __restrict__ live) {
-    __shared__ int wc[RT_MAX / 32][RT_E];   // per (32-route group g = k * 32 + warp, expert): count -> base
+    __shared__ int wc[32][RT_E];   // per (warp, slot): count -> base
     __shared__ int cnt[RT_E], bstart[RT_E], bexp[RT_NB], nblk;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const unsigned lt = (1u << lane) - 1u;
-    wc[w][lane] = 0;                         // rows w and 32 + w are written by this warp only
+    wc[w][lane] = 0;
     wc[w][32 + lane] = 0;
-    wc[32 + w][lane] = 0;
-    wc[32 + w][32 + lane] = 0;
     __syncwarp();
     pdl_wait();
     pdl_trigger();
-    int er[2], rk[2];
+    const int ng = (numel + 1023) / 1024;   // 32-route groups per warp
+    const int r0 = w * ng * 32;
+    int er[RT_G];
 #pragma unroll
-    for (int k = 0; k < 2; k++) {
-        const int r = k * 1024 + tid;
+    for (int k = 0; k < RT_G; k++) {
+        const int r = r0 + k * 32 + lane;
         int e = -1;
-        if (r < numel) {
+        if (k < ng && r < numel) {
             const int g = topk_ids[r];
             if ((unsigned)g < (unsigned)n_global) e = emap ? emap[g] : g;
             if ((unsigned)e >= (unsigned)nl) e = -1;
             local_ids[r] = e;
         }
-        const unsigned peers = __match_any_sync(0xFFFFFFFFu, e);
         er[k] = e;
-        rk[k] = __popc(peers & lt);
-        if (e >= 0 && rk[k] == 0) wc[k * 32 + w][e] = __popc(peers);
+    }
+#pragma unroll
+    for (int k = 0; k < RT_G; k++) {
+        if (k < ng) {
+            const unsigned peers = __match_any_sync(0xFFFFFFFFu, er[k]);
+            if (er[k] >= 0 && (peers & lt) == 0) wc[w][er[k]] += __popc(peers);
+            __syncwarp();
+        }
     }
     __syncthreads();
 #pragma unroll
-    for (int x = w; x < RT_E; x += 32) {   // warp w = experts w, w + 32: exclusive scan of the 64 group counts
-        const int c0 = wc[2 * lane][x], c1 = wc[2 * lane + 1][x];
-        int inc = c0 + c1;
+    for (int x = w; x < RT_E; x += 32) {   // warp w = slots w, w + 32: exclusive scan of the 32 warp counts
+        const int c = wc[lane][x];
+        int inc = c;
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
             const int v = __shfl_up_sync(0xFFFFFFFFu, inc, o);
             if (lane >= o) inc += v;
         }
-        const int ex = inc - c0 - c1;
-        wc[2 * lane][x] = ex;
-        wc[2 * lane + 1][x] = ex + c0;
+        wc[lane][x] = inc - c;
         if (lane == 31) cnt[x] = inc;
     }
     __syncthreads();
@@ -347,9 +351,15 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
     }
     __syncthreads();
 #pragma unroll
-    for (int k = 0; k < 2; k++) {
-        const int e = er[k];
-        if (e >= 0) sorted_ids[bstart[e] * XNT + wc[k * 32 + w][e] + rk[k]] = k * 1024 + tid;
+    for (int k = 0; k < RT_G; k++) {
+        if (k < ng) {
+            const int e = er[k];
+            const unsigned peers = __match_any_sync(0xFFFFFFFFu, e);
+            if (e >= 0) sorted_ids[bstart[e] * XNT + wc[w][e] + __popc(peers & lt)] = r0 + k * 32 + lane;
+            __syncwarp();
+            if (e >= 0 && (peers & lt) == 0) wc[w][e] += __popc(peers);
+            __syncwarp();
+        }
     }
     const int nb = nblk;
     for (int i = tid; i < nb * XNT; i += 1024) {          // sentinel slots (disjoint from the route slots)
@@ -1234,7 +1244,7 @@ void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::
 void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, torch::Tensor sorted_ids,
            torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global, int64_t nl, int64_t pdl) {
     TORCH_CHECK(numel <= pgk::RT_MAX && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() &&
-                nl >= 1 && nl <= pgk::RT_E, "pg route: int32 ids, at most 2048 routes, 1..64 local slots");
+                nl >= 1 && nl <= pgk::RT_E, "pg route: int32 ids, at most 24576 routes, 1..64 local slots");
     TORCH_CHECK(sorted_ids.numel() >= (nl + (numel + pgk::XNT - 1) / pgk::XNT) * pgk::XNT &&
                 live.numel() >= nl + (numel + pgk::XNT - 1) / pgk::XNT + 1, "pg route: output sizes");
     const int* em = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;

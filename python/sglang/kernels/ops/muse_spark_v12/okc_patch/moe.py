@@ -169,6 +169,9 @@ def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm,
             return _moe_st(layer, hidden_states, topk_scores, topk_ids, state, *fold)
     if pre_expert_norm is not None:
         hidden_states = pre_expert_norm(hidden_states)
+    if path.startswith("route") and topk_ids.dtype is torch.int32 and topk_ids.is_contiguous() and (
+            layer._expert_map is None or layer._expert_map.dtype is torch.int32):
+        return _moe_pg_small(layer, hidden_states.contiguous(), topk_scores, topk_ids, state, None, 0.0, False)
     if path.startswith("st"):
         return _moe_st(layer, hidden_states.contiguous(), topk_scores, topk_ids, state)
     return _moe_pg(layer, hidden_states.contiguous(), topk_scores, topk_ids, state)
@@ -177,8 +180,9 @@ def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm,
 def dispatch_path(layer, tokens, pre_expert_norm=None):
     """The chain a pg-only layer runs for a T-token forward, from host-side sizes only (one path per graph bucket):
     "st" (T <= OKC_MOE_ST_MAX_TOKENS), "small" (pg_route / pg_gather_norm, <= 2048 routes; it may still decline at
-    run time), "local" (align_local, >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS) or "align" (moe_align_block_size); "-narrow"
-    for pg's narrow build; "+rep" (assign_replicas) / "+split" (split_replicas) with replicas."""
+    run time), "route" (pg_route / pg_gather, <= 24576 routes, static map), "local" (align_local, >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS)
+    or "align" (moe_align_block_size); "-narrow" for pg's narrow build; "+rep" (assign_replicas) / "+split"
+    (split_replicas) with replicas."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
     from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm
 
@@ -189,6 +193,9 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
         small = tokens * layer.top_k <= pg_moe.SMALL_MAX_ROUTES and type(pre_expert_norm) is MuseSpark1xRMSNorm
         if _sw.SW_PG_SMALL and small:
             name = "small"
+        elif (_sw.PG_ROUTE and tokens * layer.top_k <= pg_moe.ROUTE_MAX_ROUTES and layer.num_local_experts <= 64
+              and _rep_mode(layer, tokens) is None):
+            name = "route"
         elif _sw.PG_LOCAL_ALIGN and tokens >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS and layer.num_local_experts <= 64:
             name = "local"
         else:
@@ -337,13 +344,13 @@ def route_map(layer, topk_ids):
     return layer._expert_map
 
 
-def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps):
+def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps, pdl=True):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
     y, local_ids = pg_moe.grouped_pg_small(
         x, topk_ids, route_map(layer, topk_ids),
         norm_weight=norm_weight, norm_eps=norm_eps,
-        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.SW_PDL,
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=pdl and _sw.SW_PDL,
         bm=pg_moe.block_m(x.shape[0]),
     )
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
