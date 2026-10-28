@@ -1,8 +1,9 @@
-"""OKC fused hi/lo router logits at T <= 8 (layer_s2 S2 router boundary graft).
+"""OKC fused hi/lo router logits at T <= 256 (layer_s2 S2 router boundary graft + verify / small-extend T).
 
 The fp32 router weight is split once per gate into a bf16 hi/lo pair (the same
 decomposition the pin itself uses above 8 tokens); T == 1 runs both dots in one CUDA
-GEMV over interleaved hi/lo rows, T = 2..8 runs the fused Triton split-K. Output is
+GEMV over interleaved hi/lo rows, T = 2..256 runs the fused Triton split-K (T > 8: a token-tile grid dimension and
+the per-bucket tiles in _MID; stock runs forward_split2 there, ~2x slower). Output is
 fp32 logits [T, E], bit-compatible with what FusedMuseSparkRouting consumes.
 
 Both split-K kernels store one fp32 partial per K slice and reduce_launch(FOLD=2) sums
@@ -18,40 +19,56 @@ outside any graph capture); a gate without them declines to the stock router.
 
 from typing import Optional
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import proj_ext
 
-MAX_TOKENS = 8
-_SPLIT_K = 16  # K slices of both kernels (= fp32 partial planes reduced in order)
+MAX_TOKENS = 256
+_SPLIT_K = 16  # K slices of the T <= 8 kernels (= fp32 partial planes reduced in order)
+# T 9..256 (OKC_SW_ROUTER_MID=0 declines them to forward_split2): T upper edge -> (BLOCK_M, BLOCK_N, BLOCK_K,
+# SPLIT_K, SWAP, warps, stages); best of serving/kernels/router/LOG.md E1-E2 per bucket, H200, cold L2.
+_SW_MID = os.environ.get("OKC_SW_ROUTER_MID", "1") == "1"
+_MID = ((16, (16, 64, 64, 32, 1, 4, 4)), (32, (32, 64, 64, 32, 1, 4, 4)), (64, (64, 32, 128, 16, 0, 4, 4)),
+        (128, (64, 64, 128, 16, 1, 4, 3)), (256, (128, 64, 64, 16, 0, 8, 4)))
 
 
 @triton.jit
 def _router_fused(x_ptr, hi_ptr, lo_ptr, part_ptr, M,
                   N: tl.constexpr, K: tl.constexpr,
                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                  SPLIT_K: tl.constexpr):
+                  SPLIT_K: tl.constexpr, SWAP: tl.constexpr):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     k_per = K // SPLIT_K
     k_start = pid_k * k_per
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_m = tl.arange(0, BLOCK_M)
+    offs_m = tl.program_id(2) * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = offs_m < M
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # SWAP: experts are the dot's M (wgmma M = 64 while the token tile is small)
+    acc = tl.zeros((BLOCK_N, BLOCK_M) if SWAP else (BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k0 in range(k_start, k_start + k_per, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         x_t = tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :],
                       mask=m_mask[:, None], other=0.0)
         wh = tl.load(hi_ptr + offs_n[:, None] * K + offs_k[None, :])
         wl = tl.load(lo_ptr + offs_n[:, None] * K + offs_k[None, :])
-        acc += tl.dot(x_t, tl.trans(wh), out_dtype=tl.float32)
-        acc += tl.dot(x_t, tl.trans(wl), out_dtype=tl.float32)
+        if SWAP:
+            acc += tl.dot(wh, tl.trans(x_t), out_dtype=tl.float32)
+            acc += tl.dot(wl, tl.trans(x_t), out_dtype=tl.float32)
+        else:
+            acc += tl.dot(x_t, tl.trans(wh), out_dtype=tl.float32)
+            acc += tl.dot(x_t, tl.trans(wl), out_dtype=tl.float32)
     # this K slice's partial -> part[pid_k, m, n]; reduce_launch sums the slices in order
-    tl.store(part_ptr + (pid_k * M + offs_m[:, None]) * N + offs_n[None, :], acc,
-             mask=m_mask[:, None])
+    if SWAP:
+        tl.store(part_ptr + (pid_k * M + offs_m[None, :]) * N + offs_n[:, None], acc,
+                 mask=m_mask[None, :])
+    else:
+        tl.store(part_ptr + (pid_k * M + offs_m[:, None]) * N + offs_n[None, :], acc,
+                 mask=m_mask[:, None])
 
 
 # gate weight (data_ptr, shape) -> (hi [N,K], lo [N,K], pairs [2N,K]) bf16 row-major.
@@ -88,7 +105,7 @@ def prepare_gate(gate) -> None:
 
 
 def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
-    """fp32 logits for T <= 8 from the bf16 hidden states; None = declined."""
+    """fp32 logits for T <= 256 from the bf16 hidden states; None = declined."""
     if torch.compiler.is_compiling():
         return None
     weight = gate.weight
@@ -114,15 +131,21 @@ def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
         logits = torch.empty((tokens, ne), dtype=torch.float32, device=x.device)
         ext.reduce_launch(part, logits, tokens, ne, _SPLIT_K, 2)
         return logits
-    if ne % 32 == 0 and hidden % (_SPLIT_K * 256) == 0:
-        part = torch.empty((_SPLIT_K, tokens, ne), dtype=torch.float32, device=x.device)
-        _router_fused[(ne // 32, _SPLIT_K)](
-            x, hi, lo, part,
-            tokens, N=ne, K=hidden,
-            BLOCK_M=max(16, triton.next_power_of_2(tokens)),
-            BLOCK_N=32, BLOCK_K=256, SPLIT_K=_SPLIT_K,
-            num_warps=4, num_stages=3)
-        logits = torch.empty((tokens, ne), dtype=torch.float32, device=x.device)
-        proj_ext().reduce_launch(part, logits, tokens, ne, _SPLIT_K, 2)
-        return logits
-    return None
+    if tokens <= 8:
+        cfg = (max(16, triton.next_power_of_2(tokens)), 32, 256, _SPLIT_K, 0, 4, 3)
+    elif _SW_MID:
+        cfg = next(c for edge, c in _MID if tokens <= edge)
+    else:
+        return None
+    bm, bn, bk, sk, swap, warps, stages = cfg
+    if ne % bn or hidden % (sk * bk):
+        return None
+    part = torch.empty((sk, tokens, ne), dtype=torch.float32, device=x.device)
+    _router_fused[(ne // bn, sk, triton.cdiv(tokens, bm))](
+        x, hi, lo, part,
+        tokens, N=ne, K=hidden,
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, SWAP=swap,
+        num_warps=warps, num_stages=stages)
+    logits = torch.empty((tokens, ne), dtype=torch.float32, device=x.device)
+    proj_ext().reduce_launch(part, logits, tokens, ne, sk, 2)
+    return logits

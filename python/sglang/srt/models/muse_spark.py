@@ -910,7 +910,8 @@ class MuseSpark1xMoE(nn.Module):
             else contextlib.nullcontext()
         ):
             router_logits = None
-            if okc_patch.SW_ROUTER and not use_split2:
+            # okc router.py covers T <= 256 (its T 9..256 path beats forward_split2 ~2x); larger T declines to it.
+            if okc_patch.SW_ROUTER:
                 router_logits = okc_router.router_logits_small(self.gate, hidden_states)
             if router_logits is None:
                 if not use_split2 and router_input is None:
