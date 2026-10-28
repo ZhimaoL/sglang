@@ -6,6 +6,7 @@ import threading
 
 _lock = threading.Lock()
 _PG_EXT = None
+_ST_EXT = None
 _PROJ_EXT = None
 
 _PROJ_CPP = """
@@ -56,6 +57,35 @@ def pg_ext():
                     verbose=False,
                 )
     return _PG_EXT
+
+
+def st_ext():
+    """The st small-T MoE pair (okc_patch/st_moe.py): reads pg's packs, hand mma.sync PTX + griddepcontrol (sm_90a)."""
+    global _ST_EXT
+    if _ST_EXT is None:
+        with _lock:
+            if _ST_EXT is None:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_st import (
+                    _CUDA_SRC,
+                )
+
+                _ST_EXT = load_inline(
+                    name="okc_st_moe_c1",
+                    cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, torch::Tensor, torch::Tensor, int64_t);",
+                    cuda_sources=_CUDA_SRC,
+                    functions=["st_moe"],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        "--use_fast_math",
+                        "-gencode=arch=compute_90a,code=sm_90a",
+                    ],
+                    verbose=False,
+                )
+    return _ST_EXT
 
 
 def proj_ext():

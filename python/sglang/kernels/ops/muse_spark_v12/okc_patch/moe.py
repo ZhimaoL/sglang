@@ -1,7 +1,8 @@
 """The pg chain for the NVFP4 Marlin experts of Muse Spark (prefill chunks only).
 
 At T >= OKC_MOE_PG_MIN_TOKENS a captured layer runs pg_moe.grouped_pg and then the same finalize as
-_forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin.
+_forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin. A pg-only layer runs pg at
+every T, except T <= OKC_MOE_ST_MAX_TOKENS (verify bs 1..4), where st_moe.grouped_st reads the same packs.
 The pg packs are re-encodings of the raw NVFP4 expert tensors, so maybe_capture_nvfp4_packs must run
 right before prepare_moe_nvfp4_layer_for_marlin repacks them in place.
 """
@@ -69,6 +70,10 @@ def _build_packs(layer) -> dict | None:
         # A pg-only layer takes pg on every forward, CUDA-graph capture included, so its
         # extension has to be built here rather than lazily inside the first captured forward.
         pg_moe.pg_ext()
+        if _sw.SW_MOE_ST:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext
+
+            st_ext()
 
     # pack_wsf wants the raw stacked [gate; up] rows and raw e4m3 scale bytes; gs13 is the
     # per-expert scale Marlin also uses (its constant gain is cancelled by the post-expert norm).
@@ -182,13 +187,21 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
     if layer._expert_map is not None:
         local_ids = layer._expert_map[local_ids]
     local_ids = local_ids.contiguous()
-    # Marlin's alignment convention: global expert count with -1 for non-local routes.
-    align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
-    sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts)
-    y = pg_moe.grouped_pg(
-        x, sorted_ids, block_experts, n_padded,
-        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
-    )
+    if _sw.SW_MOE_ST and state["pg_only"] and num_tokens <= _sw.MOE_ST_MAX_TOKENS:
+        # verify / decode sizes: the st pair reads the same packs with 8-token tiles (no align / tiles / gather)
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import st_moe
+
+        y = st_moe.grouped_st(
+            x, local_ids, wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.MOE_ST_PDL,
+        )
+    else:
+        # Marlin's alignment convention: global expert count with -1 for non-local routes.
+        align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
+        sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts)
+        y = pg_moe.grouped_pg(
+            x, sorted_ids, block_experts, n_padded,
+            wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
+        )
     return fused_post_expert_norm_weighted_sum(
         y.view(num_tokens, 8, size_k),
         topk_scores,

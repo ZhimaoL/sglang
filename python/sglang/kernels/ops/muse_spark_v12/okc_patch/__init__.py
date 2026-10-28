@@ -9,6 +9,8 @@
   OKC_MOE_PG_ONLY=1  (default) packed layers drop their Marlin copy and run pg at every token count
                      (verify steps included), so every layer fits: +0.1 GiB per layer over Marlin.
                      0 keeps Marlin and uses pg on the prefill chunks of the first N layers only.
+  OKC_SW_MOE_ST=1    (default) pg-only layers run the st pair (okc_patch/st_moe.py, same packs) at
+                     T <= OKC_MOE_ST_MAX_TOKENS (32): verify steps at bs 1..4.
 
 Switches are read once at import, so dispatch is stable across CUDA-graph capture and replay.
 The judge's launch command is fixed, so the submitted defaults are the ones below.
@@ -27,6 +29,12 @@ MOE_PG_MIN_TOKENS = int(os.environ.get("OKC_MOE_PG_MIN_TOKENS", "1536"))
 MOE_PG_ONLY = _flag("OKC_MOE_PG_ONLY", "1")
 _pack_layers = os.environ.get("OKC_MOE_PACK_MAX_LAYERS", "all" if MOE_PG_ONLY else "16")
 MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
+# st small-T pair (okc_patch/st_moe.py) on pg-only layers at T <= OKC_MOE_ST_MAX_TOKENS (verify bs 1..4): the same
+# packs read by mma.sync n8 tiles instead of pg's 64-token wgmma tiles. OKC_MOE_ST_PDL=1 (default) launches its down
+# kernel with programmatic dependent launch.
+SW_MOE_ST = _flag("OKC_SW_MOE_ST", "1")
+MOE_ST_MAX_TOKENS = min(32, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "32")))
+MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 
 
 # Verify-side kernel stack (kernel-track grafts): fused sliding-window / full attention for decode and verify,
@@ -64,6 +72,7 @@ SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
 
 ANY_ATTN = SW_ATTN or SW_FS
 
-__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
+__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "SW_MOE_ST", "MOE_ST_MAX_TOKENS",
+           "MOE_ST_PDL",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]
