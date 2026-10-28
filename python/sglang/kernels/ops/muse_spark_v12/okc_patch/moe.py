@@ -2,11 +2,8 @@
 
 At T >= OKC_MOE_PG_MIN_TOKENS a captured layer runs pg_moe.grouped_pg and then the same finalize as
 _forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin. A pg-only layer (the
-default) runs a chain picked by dispatch_path from T: the st pair (st_moe.grouped_st, same packs) at T <=
-OKC_MOE_ST_MAX_TOKENS, pg's small-T front end up to 2048 routes, then moe_align / align_local; pg's narrow build over
-OKC_PG_NARROW_MIN_T..MAX_T. With hot-expert replicas its forwards of <= OKC_MOE_REP_MAX_TOKENS tokens map the routes
-through pg_moe.assign_replicas instead of the static home map, longer ones (OKC_MOE_REP_PREFILL) through
-pg_moe.split_replicas.
+default) runs the chain dispatch_path picks from T (st / pg's small-T front end / align / align_local, pg's narrow or
+shipped build, the replica balancers).
 The pg packs are re-encodings of the raw NVFP4 expert tensors, so maybe_capture_nvfp4_packs must run
 right before prepare_moe_nvfp4_layer_for_marlin repacks them in place.
 """
@@ -172,17 +169,15 @@ def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm,
 
 
 def dispatch_path(layer, tokens, pre_expert_norm=None):
-    """Which chain a pg-only layer runs for a T-token forward (host-side sizes only, so one captured graph bucket has
-    one path): "st" (st_moe pair, T <= OKC_MOE_ST_MAX_TOKENS), "small" (pg_route / pg_gather_norm front end, <= 2048
-    routes), "align" (moe_align_block_size) or "local" (align_local, >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS); "-narrow" when
-    pg runs its narrow build (OKC_PG_NARROW_MIN_T..MAX_T); "+rep" / "+split" with hot-expert replicas (rep_assign at
-    <= OKC_MOE_REP_MAX_TOKENS, split_replicas above). The small front end still declines at run time on a dtype /
-    layout / norm it cannot fold (then the align chain runs)."""
+    """The chain a pg-only layer runs for a T-token forward, from host-side sizes only (one path per graph bucket):
+    "st" (T <= OKC_MOE_ST_MAX_TOKENS), "small" (pg_route / pg_gather_norm, <= 2048 routes; it may still decline at
+    run time), "local" (align_local, >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS) or "align" (moe_align_block_size); "-narrow"
+    for pg's narrow build; "+rep" (assign_replicas) / "+split" (split_replicas) with replicas."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
     from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm
 
     state = layer._okc_moe_state
-    if getattr(_sw, "SW_MOE_ST", False) and state["pg_only"] and tokens <= _sw.MOE_ST_MAX_TOKENS:
+    if _sw.SW_MOE_ST and state["pg_only"] and tokens <= _sw.MOE_ST_MAX_TOKENS:
         name = "st"
     else:
         small = tokens * layer.top_k <= pg_moe.SMALL_MAX_ROUTES and type(pre_expert_norm) is MuseSpark1xRMSNorm
@@ -195,8 +190,7 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
         if pg_moe.block_m(tokens) != pg_moe._BLOCK_M:
             name += "-narrow"
     if getattr(layer, "_okc_rep_table", None) is not None:
-        # the small front end maps through a per-expert map (route_map): the balancer's at <= MOE_REP_MAX_TOKENS, else
-        # the static one (split_replicas is per route, so it runs on the st / align / local chains only)
+        # split_replicas is per route: the small front end's per-expert map (route_map) is static above the limit
         if tokens <= _sw.MOE_REP_MAX_TOKENS:
             name += "+rep"
         elif _sw.MOE_REP_PREFILL and not name.startswith("small"):
@@ -205,8 +199,7 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
 
 
 def _moe_st(layer, x, topk_scores, topk_ids, state):
-    """The st pair (okc_patch/st_moe.py) on pre-normed x: the same packs read by 8-token mma.sync tiles (no align /
-    tiles / gather)."""
+    """The st pair (okc_patch/st_moe.py) on pre-normed x."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import st_moe
 
     local_ids = local_routes(layer, topk_ids)
@@ -273,13 +266,12 @@ def local_routes(layer, topk_ids):
 
 
 def route_map(layer, topk_ids):
-    """local_routes' decision as a [256] global -> local slot map, for pg_route (which maps the ids itself): the static
-    home map, or at verify sizes with replicas this forward's balancer map."""
+    """local_routes' decision as a [256] global -> slot map, for pg_route: the static map or the balancer's."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
     rep_table = getattr(layer, "_okc_rep_table", None)
     if rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
-        return pg_moe.replica_map(topk_ids, rep_table, layer.replica_plan["me"])
+        return pg_moe.assign_replicas(topk_ids, rep_table, layer.replica_plan["me"], as_map=True)
     return layer._expert_map
 
 
@@ -303,7 +295,7 @@ def pg_prep(layer, topk_ids):
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
     emap = layer._expert_map
-    bm = pg_moe.block_m(topk_ids.shape[0])   # the build pg runs: narrow (128-token blocks) or shipped (256)
+    bm = pg_moe.block_m(topk_ids.shape[0])
     if (_sw.PG_LOCAL_ALIGN and topk_ids.shape[0] >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS
             and (emap is None or emap.dtype is torch.int32) and layer.num_local_experts <= 64):
         # Large chunks: one count of the routes into the local-slot counters (map and int32 cast folded in)

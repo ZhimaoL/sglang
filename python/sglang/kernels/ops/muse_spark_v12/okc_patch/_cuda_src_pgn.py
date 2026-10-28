@@ -1,18 +1,12 @@
-"""Narrow-width build of the pg MoE kernels for follow-up extends (generated from _cuda_src_pg at import).
+"""Narrow-width build of the pg MoE kernels for verify steps and follow-up extends (generated from _cuda_src_pg).
 
-A follow-up extend (~1K tokens) gives each rank ~25 active local experts with a long tail of tiny ones (session M
-routing, rank 0 at T 1024: tokens per expert p10 / p50 / p90 = 2 / 16 / 96), and a pg item costs about the same
-whatever share of its 64 token columns is real. This build adds wgmma widths 16 and 32 to the item widths, so a
-<= 16-token expert runs m64n16 items. Same weights, same accumulation per output element: the real tokens' outputs are
-bit-identical to the 64-wide build (serving/kernels/extend/pg_mid_bench.py --check); only padded columns are skipped.
-
-The text edits below apply to the shipped source and each must match exactly once; the shipped extension
-(cuda_ext.pg_ext) is untouched and keeps every other T. Width codes become nv / 16 - 1 in the live list, wmask bits
-are 0 = 64, 1 = 128, 2 = 192, 3 = 32, 4 = 16, and every item of <= 64 tokens stages two k-tiles per ring slot.
-ptxas keeps the wgmmas unserialized for at most three width loops (C7512 beyond), so this build also halves the
-block: moe_align blocks of 128 tokens (XNT 128), widths 16 / 64 / 128 (PGN_WSET = 17: bits 16 and 64, the block width
-always). A > 128-token expert gets several 128-token blocks instead of one 256-wide item, and the 16 KB X stage
-leaves room for PGN_NST = 7 ring slots (5 at XNT 256) in the same shared memory.
+At mid T most local experts get few tokens (rank 0 at T 1024: p10 / p50 / p90 = 2 / 16 / 96) and a pg item costs about
+the same whatever share of its token columns is real, so this build runs 128-token blocks (XNT 128) with item widths
+16 / 64 / 128 (PGN_WSET 17; ptxas serializes the wgmmas beyond three width loops, C7512) and PGN_NST = 7 ring slots
+(the 16 KB X stage). Same weights and accumulation per output element: real tokens' outputs are bit-identical to the
+shipped build; only padded columns are skipped. The text edits below must each match the shipped source once; width
+codes become nv / 16 - 1 (wmask bits 0 = 64, 1 = 128, 2 = 192, 3 = 32, 4 = 16); items of <= 64 tokens stage two
+k-tiles per ring slot.
 """
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import _cuda_src_pg as _pg
@@ -156,24 +150,7 @@ DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, un
     s = _rep(s, "        (int)num_pid_m, (int)bm, (int)wmask, (int)nle, live.data_ptr<int>());",
              "        (int)num_pid_m, (int)bm, (int)PGN_WSET, (int)nle, live.data_ptr<int>());")
     s = _rep(s, "    pg_launch(pgk::pg_gather<3, 8>,", "    pg_launch(pgk::pg_gather<PGN_WSET, 8>,")
-    # small-T front end (pg_route / pg_gather_norm) on this build: 16-token width codes, the build's width set
-    s = _rep(s, """constexpr int RT_NCLS = 4, RT_FULL = 3;
-DINL int route_code(int v, int wmask) {
-    int code = RT_FULL;
-    if ((wmask & 4) && v <= 192) code = 2;
-    if ((wmask & 2) && v <= 128) code = 1;
-    if ((wmask & 1) && v <= 64) code = 0;
-    return code;
-}
-DINL int route_cls(int i) { return RT_FULL - i; }""", """constexpr int RT_NCLS = 6, RT_FULL = XNT / 16 - 1;
-DINL int route_code(int v, int wmask) {
-    int code = RT_FULL;
-    if ((wmask & 1) && v <= 64) code = 3;
-    if ((wmask & 8) && v <= 32) code = 1;
-    if ((wmask & 16) && v <= 16) code = 0;
-    return code;
-}
-DINL int route_cls(int i) { return i == 0 ? 15 : i == 1 ? 11 : i == 2 ? 7 : i == 3 ? 3 : i == 4 ? 1 : 0; }""")
+    # small-T front end (pg_route / pg_gather_norm; route_code follows XNT) with this build's width set
     s = _rep(s, "(int)numel, 3 /* = _WMASK */, (int)nl,", "(int)numel, (int)PGN_WSET, (int)nl,")
     s = _rep(s, "    pg_launch(pgk::pg_gather_norm<3>,", "    pg_launch(pgk::pg_gather_norm<PGN_WSET>,")
     s = _rep(s, "    launch<1, 5, 0, 3>(", "    launch<1, PGN_NST, 0, PGN_WSET>(")

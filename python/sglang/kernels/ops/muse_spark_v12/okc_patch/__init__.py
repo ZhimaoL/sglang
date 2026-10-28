@@ -9,14 +9,7 @@
   OKC_MOE_PG_ONLY=1  (default) packed layers drop their Marlin copy and run pg at every token count
                      (verify steps included), so every layer fits: +0.1 GiB per layer over Marlin.
                      0 keeps Marlin and uses pg on the prefill chunks of the first N layers only.
-  OKC_MOE_REPLICAS=1 hot-expert replicas per rank per pg-only layer (0, 1, 2 or 4; the choice per layer is
-                     layers/muse_spark_expert_replicas.json): 30 MiB each, 1.8 GiB per rank per replica over 62
-                     layers (R = 2 leaves the c32 KV pool ~2.85M tokens: tight). Forwards of at most
-                     OKC_MOE_REP_MAX_TOKENS tokens (256: every verify graph) give each active replicated expert to
-                     the less loaded of its two holders; longer ones (OKC_MOE_REP_PREFILL=1) split its routes
-                     between the two at a token boundary that levels the ranks' routed tokens.
-  OKC_SW_MOE_ST=1    (default) pg-only layers run the st pair (okc_patch/st_moe.py, same packs) at
-                     T <= OKC_MOE_ST_MAX_TOKENS (32): verify steps at bs 1..4.
+  OKC_MOE_REPLICAS=1 hot-expert replicas per rank per pg-only layer (0, 1 or 2), 1.8 GiB per rank per replica.
 
 Switches are read once at import, so dispatch is stable across CUDA-graph capture and replay.
 The judge's launch command is fixed, so the submitted defaults are the ones below.
@@ -35,21 +28,20 @@ MOE_PG_MIN_TOKENS = int(os.environ.get("OKC_MOE_PG_MIN_TOKENS", "1536"))
 MOE_PG_ONLY = _flag("OKC_MOE_PG_ONLY", "1")
 _pack_layers = os.environ.get("OKC_MOE_PACK_MAX_LAYERS", "all" if MOE_PG_ONLY else "16")
 MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
-# EP straggler at verify: every rank waits at the MoE all-reduce for the one with the most active experts.
+# Hot-expert replicas against the verify EP straggler (every rank waits at the MoE all-reduce for the one with the
+# most active experts): forwards of <= OKC_MOE_REP_MAX_TOKENS tokens give each active replicated expert to the holder
+# with fewer active experts (pg_moe.assign_replicas), longer ones (OKC_MOE_REP_PREFILL) split its routes between the
+# two holders at a token boundary that levels routed tokens (pg_moe.split_replicas).
 MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "1"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
-# Longer forwards (prefill chunks: every expert active, cost = routed tokens) split each replicated expert's routes
-# between its two holders at a token boundary that levels the ranks' routed tokens (pg_moe.split_replicas).
 MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
-# pg's narrow build (_cuda_src_pgn: 128-token blocks, item widths 16 / 64 / 128) for calls of
-# OKC_PG_NARROW_MIN_T..OKC_PG_NARROW_MAX_T tokens (verify steps and follow-up extends; serving/kernels/extend LOG E5 / E6:
-# 0.78-0.81x at verify T 8..256, 0.86-0.92x at extends of 753..2048, 0.97x at 3072, even at 4096). Same outputs
-# for every real token; outside the range the shipped build (256-token blocks, widths 64 / 128 / 256) runs.
+# pg's narrow build (_cuda_src_pgn: 128-token blocks, widths 16 / 64 / 128) for calls of OKC_PG_NARROW_MIN_T..MAX_T
+# tokens (serving/kernels/extend E5-E7: 0.77-0.80x at verify T 8..256, 0.86-0.97x at extends of 753..3072); the
+# shipped build (256-token blocks) outside. Same outputs for every real token.
 PG_NARROW_MIN_T = int(os.environ.get("OKC_PG_NARROW_MIN_T", "1"))
 PG_NARROW_MAX_T = int(os.environ.get("OKC_PG_NARROW_MAX_T", "3072"))
-# st small-T pair (okc_patch/st_moe.py) on pg-only layers at T <= OKC_MOE_ST_MAX_TOKENS (verify bs 1..4): the same
-# packs read by mma.sync n8 tiles instead of pg's 64-token wgmma tiles. OKC_MOE_ST_PDL=1 (default) launches its down
-# kernel with programmatic dependent launch.
+# st pair (okc_patch/st_moe.py: the same packs read by mma.sync n8 tiles) on pg-only layers at T <=
+# OKC_MOE_ST_MAX_TOKENS (verify bs 1..4); OKC_MOE_ST_PDL launches its down kernel with PDL.
 SW_MOE_ST = _flag("OKC_SW_MOE_ST", "1")
 MOE_ST_MAX_TOKENS = min(32, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "32")))
 MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")

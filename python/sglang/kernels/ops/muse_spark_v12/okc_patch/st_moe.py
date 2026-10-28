@@ -1,18 +1,11 @@
 """OKC st: the small-T MoE pair for verify / decode forwards (T <= OKC_MOE_ST_MAX_TOKENS, default 32) on pg's packs.
 
-pg's gg1 / gg2 tile tokens 64 wide, so at T <= 64 a round of items costs the n64 wgmma time whatever the token
-count (per-call durations 4 + 16 x ceil(64 n_act / 132) us for gg1 on the 8xH200 traces). st reads the same blocks
-(pg_moe.pack_wsf, no other copy of the weights) with mma.sync m16n8k16, whose A fragment is the layout of one warp's
-16 rows of a pg block, so the decode is pg's (dq8r + the pack's scales, _cuda_src_st.SCALE_BF16) and the math is
-the same BF16 x BF16 -> fp32 (local_ids may address 32 home + replica slots; the count is wsf13's):
-  * no moe_align / pg_tiles / pg_gather: every CTA builds the call's routing table from local_ids (deterministic, route
-    order inside each expert); an expert with c routes runs as ceil(c / 8) passes of <= 8 tokens;
-  * each CTA takes an equal contiguous range of 16-row slabs of the active experts; its 16 warps split each slab's K
-    and stream their 576 B pieces straight into registers; the 16 partials are summed in warp order (no atomics);
-  * epilogues are pg's (gg1: silu(g) u with the expert's global scale and the 2^8 decode compensation; gg2: x 2^8),
-    so y has pg's per-route scaling and the caller's finalize applies unchanged.
-CUDA-graph capturable (no host sync; buffer sizes come from T only). OKC_MOE_ST_PDL launches the down kernel with
-programmatic dependent launch (its first W2 k-tiles are in flight before it waits for the intermediate).
+pg tiles tokens 64 wide, so at T <= 64 a round of items costs the n64 wgmma time whatever the token count. st reads
+the same blocks (pg_moe.pack_wsf) with mma.sync m16n8k16 (one warp's 16 rows of a pg block are its A fragment), pg's
+decode and the same BF16 x BF16 -> fp32 math: every CTA builds the routing table from local_ids (32 home + replica
+slots; an expert with c routes runs ceil(c / 8) passes), takes an equal range of 16-row slabs and splits K over its
+16 warps (partials summed in warp order: deterministic); the epilogues are pg's, so y has pg's per-route scaling and
+the finalize applies unchanged. Graph-capturable; OKC_MOE_ST_PDL launches the down kernel with PDL.
 """
 
 import torch

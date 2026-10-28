@@ -10,8 +10,8 @@ This replaces the v10 wg pair (wg_moe.py), which stages the token rows and the i
 Scale handling (as in the bank): gg1 applies the expert's w13 global scale (and the 2^8 decode
 compensation) before silu; the intermediate carries 2^-6 and gg2's rows keep a per-route positive constant
 (2^-6 / the expert's w2 global scale) that the caller's post-expert RMSNorm cancels, as for the wg pair.
-Memory per captured layer per rank (32 local experts, I = H = 4096): 640 + 320 MiB of W|sf blocks (30 MiB per
-expert); a layer with replicas packs 32 + R experts (moe.py, rep_table / assign_replicas below).
+Memory per captured layer per rank (32 local experts, I = H = 4096): 640 + 320 MiB of W|sf blocks (+30 MiB per
+replica).
 """
 
 import torch
@@ -135,20 +135,14 @@ def rep_table(home_rank, local_slot, rep_order, rep_rank):
     return torch.tensor(tab + list(rep_order), dtype=torch.int32)
 
 
-def assign_replicas(topk_ids, tab, rank):
+def assign_replicas(topk_ids, tab, rank, as_map=False):
     """[T, 8] global top-k ids -> [T, 8] int32 local slots on this rank (-1: another rank computes the route), with
-    each active replicated expert on the less loaded of its two holders. One CTA; same decision on every rank."""
-    out = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
-    pg_ext().rep_assign(topk_ids.contiguous(), tab, out, out.new_empty((0,)), rank)
+    each active replicated expert on the less loaded of its two holders; as_map: the same decision as this forward's
+    [256] global -> slot map (for pg_route). One CTA; same decision on every rank."""
+    out = torch.empty((256,) if as_map else topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
+    none = out.new_empty((0,))
+    pg_ext().rep_assign(topk_ids.contiguous(), tab, none if as_map else out, out if as_map else none, rank)
     return out
-
-
-def replica_map(topk_ids, tab, rank):
-    """The decision of assign_replicas as this forward's [256] int32 global -> local slot map (-1 remote), for front
-    ends that map the ids themselves (grouped_pg_small's pg_route)."""
-    emap = torch.empty((256,), dtype=torch.int32, device=topk_ids.device)
-    pg_ext().rep_assign(topk_ids.contiguous(), tab, emap.new_empty((0,)), emap, rank)
-    return emap
 
 
 def split_replicas(topk_ids, tab, rank):
@@ -169,19 +163,14 @@ def split_replicas(topk_ids, tab, rank):
     return out
 
 
-def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=None):
+def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=_BLOCK_M):
     """x [T, 4096] bf16 -> y [T*8, 4096] bf16 per-route expert outputs (rows of non-local routes stay
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded
-    come from moe_align_block_size(local_ids, bm, ...) or align_local with -1 for non-local routes; bm = 256 runs the
-    shipped build, bm = 128 the narrow one (block_m(T) is the serving choice; None infers it from the sizes). The local
-    expert count (32 home + replica slots) is wsf13's first dimension."""
+    come from moe_align_block_size(local_ids, bm, ...) or align_local with -1 for non-local routes; bm 256 runs the
+    shipped build, 128 the narrow one (block_m(T)). The local slot count (32 home + replicas) is wsf13's."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
     num_pid_m = block_experts.shape[0]
-    if bm is None:
-        # the caller's alignment picks the build: moe_align / align_local size block_experts as cdiv(len(sorted_ids),
-        # block size)
-        bm = 128 if -(-sorted_ids.numel() // 128) == num_pid_m else _BLOCK_M
     ext = pg_narrow_ext() if bm != _BLOCK_M else pg_ext()
     live = torch.empty((num_pid_m + 1,), dtype=torch.int32, device=x.device)
     ext.tiles(block_experts, n_padded, sorted_ids, live, num_pid_m, bm, numel, _WMASK, wsf13.shape[0])
@@ -207,7 +196,7 @@ SMALL_MAX_ROUTES = 2048
 def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, gs13, wsf2, pdl, bm=_BLOCK_M):
     """Verify / decode front end of grouped_pg: x [T, 4096] bf16 BEFORE the pre-expert RMSNorm, topk_ids
     [T, 8] int32 global ids, expert_map [E] int32 global -> local slot (-1 remote; the static home map or this
-    forward's replica_map) or None. One pg_route launch replaces the int32 cast, the expert-map gather,
+    forward's balancer map) or None. One pg_route launch replaces the int32 cast, the expert-map gather,
     moe_align_block_size and pg_tiles (blocks only for local slots: nl + ceil(T * 8 / 256) at most, nl = wsf13's
     expert count, instead of moe_align's ~257 for 256 global experts), and
     pg_gather_norm applies the norm (F.rms_norm's exact fp32 sequence) while it builds the token images.

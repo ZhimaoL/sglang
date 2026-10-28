@@ -100,8 +100,7 @@ class MuseSpark1xFp4Experts(nn.Module):
     ) -> None:
         super().__init__()
         intermediate_size, self.expert_tp = expert_tp.partition(intermediate_size)
-        # Hot-expert replicas (muse_spark_expert_placement.replica_plan; Marlin / pg path with a placement table only):
-        # extra local experts after the home ones, so every expert-count below includes them.
+        # Hot-expert replicas (Marlin / pg path with a placement table only): local slots after the home experts.
         if replica_plan is not None and (
             local_expert_ids is None or self.expert_tp or not _resolve_moe_runner_backend().is_marlin()
         ):

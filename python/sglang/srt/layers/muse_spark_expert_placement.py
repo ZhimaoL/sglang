@@ -5,9 +5,8 @@ than others in a layer, and every rank waits for the slowest one at the MoE all-
 per MoE layer, the experts each rank holds instead; it was fitted to routed-token counts measured on agentic
 coding traffic, and any expert set per rank is exact (only which rank computes an expert changes).
 
-The replica file adds, per layer and replica count R, R extra experts per rank (hot experts of other ranks, chosen
-from verify routing histograms): such an expert has two holders and a per-forward balancer, computed identically on
-every rank from the top-k ids, picks which one computes it. Again only which rank computes an expert changes.
+The replica file adds R hot experts of other ranks per rank and layer; a per-forward balancer that every rank computes
+alike from the top-k ids picks which of the two holders computes each (again only the computing rank changes).
 """
 
 import functools
@@ -65,7 +64,8 @@ def replica_plan(
     for r, ids in enumerate(ranks):
         for e in ids:
             home[e] = r
-    order, holder = list(layer["order"]), list(layer["rank"])
+    pairs = [tuple(map(int, x.split(":"))) for x in layer.split()]
+    order, holder = [e for e, _ in pairs], [r for _, r in pairs]
     if (
         min(home) < 0
         or len(set(order)) != len(order)

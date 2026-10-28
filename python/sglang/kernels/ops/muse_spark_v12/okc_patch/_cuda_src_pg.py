@@ -179,26 +179,31 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
 
 // ------------------------------------------------------------------ small-T routing front end
 // One CTA in place of topk_ids -> local ids (expert map), moe_align_block_size and pg_tiles, for numel <= RT_MAX
-// routes (verify / decode): local expert e (e < nl <= RT_E: 32 home slots + replica slots) gets ceil(count_e / 256)
-// consecutive blocks, experts ascending, and no block exists for non-local routes; a block's 256 sorted_ids slots hold
-// its routes in route order, then the numel sentinel. block_experts / live are what pg_tiles writes for the same counts
-// (live: widest class first, block ascending inside a class), so gather / gg1 / gg2 run unchanged; every route's row
-// is computed by the same code as on the moe_align path, only the block numbering differs. local_ids[r] = e or -1 (the
-// finalize's slot ids). No serial loops: a route's rank among same-expert routes of its warp comes from
-// __match_any_sync, the per-expert bases over the 64 warp groups from one warp-wide scan per expert (warp w: experts w
-// and w + 32), the block / live lists from one warp's ballots over two 32-expert halves.
+// routes (verify / decode): local slot e < nl <= RT_E (32 home + replicas) gets ceil(count_e / XNT) consecutive
+// blocks, slots ascending, none for non-local routes; a block's sorted_ids hold its routes in route order, then the
+// numel sentinel. block_experts / live are what pg_tiles writes for the same counts (widest class first, blocks
+// ascending), so gather / gg1 / gg2 run unchanged and every route's row is the moe_align path's. local_ids[r] = e or
+// -1. Ranks among a warp's same-slot routes by __match_any_sync, per-slot bases by one warp scan per slot (warp w:
+// slots w, w + 32), block / live lists by one warp over two 32-slot halves.
 constexpr int RT_MAX = 2048, RT_E = 64, RT_NB = RT_E + RT_MAX / XNT;
-// a block's width code from its valid routes v (pg_tiles' rule: the smallest listed width covering v) and the live
-// list's classes, widest first; the narrow build (_cuda_src_pgn) swaps both for its 16-token codes
-constexpr int RT_NCLS = 4, RT_FULL = 3;
+// width code of a block with v routes (pg_tiles' rule) and the live classes, widest first; the narrow build
+// (_cuda_src_pgn, the XNT 128 one) codes widths in 16-token steps
+constexpr bool RT_N16 = XNT == 128;
+constexpr int RT_NCLS = RT_N16 ? 6 : 4, RT_FULL = RT_N16 ? 7 : 3;
 DINL int route_code(int v, int wmask) {
     int code = RT_FULL;
-    if ((wmask & 4) && v <= 192) code = 2;
-    if ((wmask & 2) && v <= 128) code = 1;
-    if ((wmask & 1) && v <= 64) code = 0;
+    if (RT_N16) {
+        if ((wmask & 1) && v <= 64) code = 3;
+        if ((wmask & 8) && v <= 32) code = 1;
+        if ((wmask & 16) && v <= 16) code = 0;
+    } else {
+        if ((wmask & 4) && v <= 192) code = 2;
+        if ((wmask & 2) && v <= 128) code = 1;
+        if ((wmask & 1) && v <= 64) code = 0;
+    }
     return code;
 }
-DINL int route_cls(int i) { return RT_FULL - i; }
+DINL int route_cls(int i) { return RT_N16 ? (i < 4 ? 15 - 4 * i : 1 - (i - 4)) : RT_FULL - i; }
 __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_ids, const int* __restrict__ emap,
                                                  int n_global, int numel, int wmask, int nl,
                                                  int* __restrict__ local_ids, int* __restrict__ sorted_ids,
@@ -790,13 +795,11 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
 
 
 // ------------------------------------------------------------------ large-T routing front end
-// Local-slot align for large calls (the prefill bank's sk_route align, plt_c3 / plt_c4b skr::align_count /
-// align_scan / align_scatter): count the routes into nl <= AL_MAX local-slot counters -> one-CTA scan (ranges padded to
-// BM, block -> slot map, padding sentinels = numel) -> CTA-aggregated scatter. Same layout as moe_align_block_size over
-// the nl local slots, minus the 256-expert sort; the order of routes inside a slot's range is free (pg computes every
-// route's rows independently). ids are global expert ids mapped by emap (global -> local slot, -1 remote), or with no
-// emap already local slot ids; either way ids outside [0, n_global) and slots outside [0, nl) count as remote, and
-// local_ids[r] receives the slot or -1 (the finalize's slot ids).
+// Local-slot align for large calls (the prefill bank's skr::align_count / align_scan / align_scatter, plt_c3 /
+// plt_c4b): count the routes into nl <= AL_MAX slot counters -> one-CTA scan (ranges padded to BM, block -> slot map,
+// sentinels = numel) -> CTA-aggregated scatter: moe_align_block_size's layout over nl slots without the 256-expert
+// sort (route order inside a slot's range is free). ids: global ids mapped by emap, or local slot ids (no emap); ids
+// outside [0, n_global) and slots outside [0, nl) are remote; local_ids[r] = the slot or -1.
 constexpr int AL_MAX = 64;
 
 template <typename IT>
@@ -874,13 +877,10 @@ __global__ void __launch_bounds__(256) align_scatter(const int* __restrict__ lid
 }
 
 // ------------------------------------------------------------------ replica balancer (small-T forwards)
-// tab[e] for the 256 experts: bits 0-7 the expert's slot on this rank (255: not held here), 8-10 its home rank,
-// bit 11 replicated, 12-14 the replica's rank; tab[256 + j] = the j-th replicated expert in balancing order. Every
-// rank takes the same decision from the same top-k ids (only the slot field differs per rank): load[r] = distinct
-// active non-replicated experts homed on r; then each active replicated expert, in order, goes to whichever of its
-// two holders has the lower load (tie: home) and counts there. out[i] = route i's local slot if this rank computes
-// it, else -1 (the static map's convention); emap_out[e] (if given) = the same decision per expert, the forward's
-// global -> local map for pg_route.
+// tab[e]: bits 0-7 expert e's slot on this rank (255: not held), 8-10 its home rank, bit 11 replicated, 12-14 the
+// replica's rank; tab[256 + j] = the j-th replicated expert in balancing order. Same decision on every rank from the
+// same ids: load[r] = distinct active non-replicated experts homed on r; each active replicated expert, in order, goes
+// to the holder with the lower load (tie: home). out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
 template <typename IdT>
 __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids, int n_routes,
                                                      const int* __restrict__ tab, int n_rep, int me,
@@ -923,16 +923,13 @@ __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids
 }
 
 // ------------------------------------------------------------------ replica balancer (prefill chunks)
-// At a long prefill every expert is active and a rank's pg time follows its routed tokens, so the routes of a replicated
-// expert are split between its two holders instead of handed to one. Every rank takes the same decision from the same
-// top-k ids (integer arithmetic only): c[e] = routes of expert e; load[r] = routes of the non-replicated experts homed on
-// r; then the replicated experts by route count (descending, ties: lower id), each in turn: x = clamp((load[home] +
-// c[e] - load[replica]) / 2, 0, c[e]); the replica takes e's routes of the tokens before cut[e], the end of the first
-// sb-token block at which e's cumulative count reaches x (0 if x is 0), the home the rest, and both loads grow by their
-// parts. pg_rep_count (one CTA per sb-token block) counts the routes of every expert (global atomics into cnt, zeroed by
-// the caller) and of each replicated expert per block (bc[j][b]: the block is the CTA's own, so no atomics); pg_rep_cut
-// (one CTA) takes the decision and writes cut[256] (0 = the home takes every route); pg_rep_split maps route i (token
-// i / k) to its local slot on this rank, or -1.
+// At a long prefill every expert is active and pg time follows routed tokens, so a replicated expert's routes are split
+// between its two holders. Same decision on every rank (integers only): c[e] = routes of e; load[r] = routes of the
+// non-replicated experts homed on r; the replicated experts by count (descending, ties: lower id) in turn: x =
+// clamp((load[home] + c[e] - load[replica]) / 2, 0, c[e]); the replica takes e's routes of the tokens before cut[e],
+// the end of the first sb-token block where e's cumulative count reaches x (0 if x is 0), the home the rest.
+// pg_rep_count (one CTA per sb-token block): cnt (global atomics, zeroed by the caller) and bc[j][b] per replicated
+// expert and block; pg_rep_cut (one CTA): cut[256]; pg_rep_split: route i (token i / k) -> its slot here or -1.
 __global__ void __launch_bounds__(256) pg_rep_count(const int* __restrict__ ids, int n_routes, int topk,
                                                     const int* __restrict__ tab, int n_rep, int sb, int nb,
                                                     int* __restrict__ cnt, int* __restrict__ bc) {

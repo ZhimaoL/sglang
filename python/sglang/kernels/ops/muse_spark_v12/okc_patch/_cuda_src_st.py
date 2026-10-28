@@ -2,16 +2,11 @@
 
 st_gemm<1>: gate/up over the call's active local experts, silu*mul into a bf16 intermediate; st_gemm<2>: down into
 the per-route bf16 rows. Both read pg_moe.pack_wsf's blocks (no other weight copy) and decode them with pg's dq8r and
-the pack's block scales into mma.sync m16n8k16 A fragments (one warp's 16 rows of a pg block are exactly that fragment).
-SCALE_BF16 selects the pack's scale format (one constant, matching the tree's pack_wsf): 1 = bf16 (r0, r1) pairs,
-16 B per row pair and k-tile (WSB 5120, cand6c / cand7); 0 = 8-bit codes, 8 B (WSB 4608, cand7a). Local experts: up
-to ELOC (32 home slots + hot-expert replica slots), the count from wsf13.
+the pack's bf16 block scales into mma.sync m16n8k16 A fragments (one warp's 16 rows of a pg block are exactly that
+fragment). Local slots: up to ELOC (32 home + hot-expert replicas), the count from wsf13.
 """
 
-SCALE_BF16 = 1
-
 _CUDA_SRC = r"""
-#define ST_SF16 @@SF16@@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
@@ -22,8 +17,8 @@ namespace stk {
 
 constexpr int H = 4096;
 constexpr int NKT = 64;           // k-tiles of 64 (K = 4096 in both GEMMs)
-// pg block per (expert, w-tile, k-tile): 4096 B codes + the 64 row pairs' scales (SFB bytes each)
-constexpr int SFB = ST_SF16 ? 16 : 8;
+// pg block per (expert, w-tile, k-tile): 4096 B codes + the 64 row pairs' bf16 scale pairs (SFB bytes each)
+constexpr int SFB = 16;
 constexpr int WSB = 4096 + 64 * SFB;
 constexpr int NW = 16;            // warps per CTA; warp w owns k-tiles KPW*w .. KPW*w + KPW - 1 of every slab
 constexpr int KPW = NKT / NW;     // 4
@@ -56,7 +51,6 @@ DINL uint4 ldw(const char* p) {          // weight codes: streamed once, kept ou
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
 }
-#if ST_SF16
 typedef uint4 sf_t;
 DINL sf_t lds8(const char* p) {          // bf16 scale pairs (the 4 lanes of a row pair read the same 16 B)
     uint4 v;
@@ -64,14 +58,6 @@ DINL sf_t lds8(const char* p) {          // bf16 scale pairs (the 4 lanes of a r
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
 }
-#else
-typedef uint2 sf_t;
-DINL sf_t lds8(const char* p) {          // scale codes (the 4 lanes of a row pair read the same 8 B)
-    uint2 v;
-    asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
-    return v;
-}
-#endif
 DINL unsigned ldb32(const __nv_bfloat16* p) {   // B fragment word of an x row (written before this grid started)
     return *reinterpret_cast<const unsigned*>(p);
 }
@@ -103,22 +89,12 @@ DINL void mma_bf16(float c[4], const unsigned a[4], unsigned b0, unsigned b1) {
 // one k-tile of one warp's slab piece: 16 B codes (4 k16 steps) + the row pair's 4 scale pairs, x 4 HMMA
 DINL void ktile(float acc[4], const uint4 w, const sf_t sfp, const unsigned (&b)[4][2]) {
     const unsigned wq[4] = {w.x, w.y, w.z, w.w};
-#if ST_SF16
     const unsigned sfw[4] = {sfp.x, sfp.y, sfp.z, sfp.w};
-#else
-    const unsigned sfw[2] = {sfp.x, sfp.y};
-#endif
 #pragma unroll
     for (int q = 0; q < 4; q++) {
         __nv_bfloat162 d[4];
         dq8r(wq[q], d);
-#if ST_SF16
-        // bf16 scale pair (row r0, row r0 + 8) of k16 step q, as pg's kstep reads it
-        const __nv_bfloat162 sf2 = u32b2(sfw[q]);
-#else
-        // scale code pair (row r0, row r0 + 8) of k16 step q -> bf16 bits code * 16 + 0x75F0 (pg_moe.pack_wsf)
-        const __nv_bfloat162 sf2 = u32b2(__byte_perm(sfw[q >> 1], 0u, (q & 1) ? 0x4342u : 0x4140u) * 16u + 0x75F075F0u);
-#endif
+        const __nv_bfloat162 sf2 = u32b2(sfw[q]);   // bf16 scale pair (row r0, row r0 + 8) of k16 step q
         const __nv_bfloat162 s0 = __bfloat162bfloat162(__low2bfloat16(sf2));
         const __nv_bfloat162 s1 = __bfloat162bfloat162(__high2bfloat16(sf2));
         unsigned a[4];
@@ -391,5 +367,3 @@ void st_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch::Tens
     }
 }
 """
-
-_CUDA_SRC = _CUDA_SRC.replace("@@SF16@@", str(SCALE_BF16))
