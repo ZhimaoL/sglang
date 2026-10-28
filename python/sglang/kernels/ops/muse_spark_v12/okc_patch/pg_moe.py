@@ -10,7 +10,8 @@ This replaces the v10 wg pair (wg_moe.py), which stages the token rows and the i
 Scale handling (as in the bank): gg1 applies the expert's w13 global scale (and the 2^8 decode
 compensation) before silu; the intermediate carries 2^-6 and gg2's rows keep a per-route positive constant
 (2^-6 / the expert's w2 global scale) that the caller's post-expert RMSNorm cancels, as for the wg pair.
-Memory per captured layer per rank (32 local experts, I = H = 4096): 640 + 320 MiB of W|sf blocks.
+Memory per captured layer per rank (32 local experts, I = H = 4096): 576 + 288 MiB of W|sf blocks (27 MiB per
+expert); a layer with replicas packs 32 + R experts (moe.py, rep_table / assign_replicas below).
 """
 
 import torch
@@ -93,16 +94,35 @@ def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
                      dim=-1).contiguous()
 
 
+def rep_table(home_rank, local_slot, rep_order, rep_rank):
+    """int32 [256 + n] table of pg rep_assign (see _cuda_src_pg.py): home_rank [256], local_slot [256] (this rank's slot
+    of each expert, -1 if not held here), rep_order [n] replicated experts in balancing order, rep_rank [n] the rank
+    holding each one's replica. All ranks share every field but the slot."""
+    tab = [(255 if s < 0 else s) | (h << 8) for s, h in zip(local_slot, home_rank)]
+    for e, r in zip(rep_order, rep_rank):
+        tab[e] |= (1 << 11) | (r << 12)
+    return torch.tensor(tab + list(rep_order), dtype=torch.int32)
+
+
+def assign_replicas(topk_ids, tab, rank):
+    """[T, 8] global top-k ids -> [T, 8] int32 local slots on this rank (-1: another rank computes the route), with
+    each active replicated expert on the less loaded of its two holders. One CTA; same decision on every rank."""
+    out = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
+    pg_ext().rep_assign(topk_ids.contiguous(), tab, out, rank)
+    return out
+
+
 def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
     """x [T, 4096] bf16 -> y [T*8, 4096] bf16 per-route expert outputs (rows of non-local routes stay
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded
-    come from moe_align_block_size(local_ids, 256, ...) with -1 for non-local routes."""
+    come from moe_align_block_size(local_ids, 256, ...) with -1 for non-local routes; the local expert count is
+    wsf13's first dimension."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
     num_pid_m = block_experts.shape[0]
     ext = pg_ext()
     live = torch.empty((num_pid_m + 1,), dtype=torch.int32, device=x.device)
-    ext.tiles(block_experts, n_padded, sorted_ids, live, num_pid_m, _BLOCK_M, numel, _WMASK)
+    ext.tiles(block_experts, n_padded, sorted_ids, live, num_pid_m, _BLOCK_M, numel, _WMASK, wsf13.shape[0])
     # Persistent grid: 0 = one CTA per SM (the bank's default). Capping the CTAs trades cross-item
     # pipelining for less per-CTA setup; the bound must come from host-side sizes only (a device read
     # here would be a sync inside the forward and break graph capture).

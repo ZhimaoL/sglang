@@ -96,9 +96,21 @@ class MuseSpark1xFp4Experts(nn.Module):
         quant_config: QuantizationConfig,
         params_dtype: Optional[torch.dtype] = None,
         local_expert_ids: Optional[List[int]] = None,
+        replica_plan: Optional[dict] = None,
     ) -> None:
         super().__init__()
         intermediate_size, self.expert_tp = expert_tp.partition(intermediate_size)
+        # Hot-expert replicas (muse_spark_expert_placement.replica_plan; Marlin / pg path with a placement table only):
+        # extra local experts after the home ones, so every expert-count below includes them.
+        if replica_plan is not None and (
+            local_expert_ids is None or self.expert_tp or not _resolve_moe_runner_backend().is_marlin()
+        ):
+            replica_plan = None
+        self.num_home_experts = num_local_experts
+        if replica_plan is not None:
+            local_expert_ids = list(local_expert_ids) + list(replica_plan["local"])
+            num_local_experts += len(replica_plan["local"])
+        self.replica_plan = replica_plan
         # create_weights sizes the activation scales from ``num_experts``, so it
         # must be the LOCAL count; the kernel separately wants the global count.
         self.num_experts = num_local_experts
@@ -183,9 +195,21 @@ class MuseSpark1xFp4Experts(nn.Module):
                     local_expert_offset, local_expert_offset + num_local_experts
                 )
             )
+            # Home experts only: the replicas get routes from the per-forward balancer alone.
+            home = self.num_home_experts
             expert_map = torch.full((num_experts,), -1, dtype=torch.int32)
-            expert_map[local_ids] = torch.arange(num_local_experts, dtype=torch.int32)
+            expert_map[local_ids[:home]] = torch.arange(home, dtype=torch.int32)
         self.register_buffer("_expert_map", expert_map, persistent=False)
+        rep_table = None
+        if self.replica_plan is not None:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch.pg_moe import rep_table as _rep_table
+
+            slot = [-1] * num_experts
+            for i, e in enumerate(self.local_expert_ids):
+                slot[e] = i
+            plan = self.replica_plan
+            rep_table = _rep_table(plan["home"], slot, plan["order"], plan["rank"])
+        self.register_buffer("_okc_rep_table", rep_table, persistent=False)
 
         self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
         if not self.use_marlin and not self.quant_method.enable_flashinfer_trtllm_moe:

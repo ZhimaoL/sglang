@@ -1,7 +1,9 @@
 """The pg chain for the NVFP4 Marlin experts of Muse Spark (prefill chunks only).
 
 At T >= OKC_MOE_PG_MIN_TOKENS a captured layer runs pg_moe.grouped_pg and then the same finalize as
-_forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin.
+_forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin. A pg-only layer (the
+default) runs pg at every T; with hot-expert replicas its forwards of <= OKC_MOE_REP_MAX_TOKENS tokens map the routes
+through pg_moe.assign_replicas instead of the static home map.
 The pg packs are re-encodings of the raw NVFP4 expert tensors, so maybe_capture_nvfp4_packs must run
 right before prepare_moe_nvfp4_layer_for_marlin repacks them in place.
 """
@@ -111,7 +113,7 @@ def maybe_capture_nvfp4_packs(layer) -> bool:
     if state is None:
         logger.warning("OKC pg pack capture declined (shape/dtype mismatch); layer stays on Marlin.")
         return False
-    state["pg_only"] = _sw.MOE_PG_ONLY and layer.num_local_experts == 32 and layer.top_k == 8
+    state["pg_only"] = _sw.MOE_PG_ONLY and layer.num_local_experts < 255 and layer.top_k == 8
     layer._okc_moe_state = state
     _captured_layers += 1
     if state["pg_only"]:
@@ -158,8 +160,8 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
         return "inside torch.compile"
     if hidden_states.shape[1] != state["H"] or hidden_states.dtype is not torch.bfloat16:
         return f"hidden {tuple(hidden_states.shape)} {hidden_states.dtype}"
-    # The pg kernels hard-code topk 8 and 32 local experts (the TP8/EP8 shape).
-    if topk_ids.shape[1] != 8 or layer.num_local_experts != 32:
+    # The pg kernels hard-code topk 8; local slots are 8-bit in the replica table (255 = not held).
+    if topk_ids.shape[1] != 8 or layer.num_local_experts >= 255:
         return f"topk {topk_ids.shape[1]}, {layer.num_local_experts} local experts"
     if post_expert_norm is None:
         return "no post-expert norm"
@@ -178,10 +180,15 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
     num_tokens, size_k = x.shape
-    local_ids = topk_ids.to(torch.int32)
-    if layer._expert_map is not None:
-        local_ids = layer._expert_map[local_ids]
-    local_ids = local_ids.contiguous()
+    rep_table = getattr(layer, "_okc_rep_table", None)
+    if rep_table is not None and num_tokens <= _sw.MOE_REP_MAX_TOKENS:
+        # T is the same on every rank (TP batch), so all ranks take this branch together.
+        local_ids = pg_moe.assign_replicas(topk_ids, rep_table, layer.replica_plan["me"])
+    else:
+        local_ids = topk_ids.to(torch.int32)
+        if layer._expert_map is not None:
+            local_ids = layer._expert_map[local_ids]
+        local_ids = local_ids.contiguous()
     # Marlin's alignment convention: global expert count with -1 for non-local routes.
     align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
     sorted_ids, block_experts, n_padded = moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts)

@@ -641,6 +641,16 @@ class MuseSpark1xMoE(nn.Module):
         elif nvfp4_checkpoint:
             # Packed NVFP4: the FlashInfer TRT-LLM kernel runs the experts and we
             # finalize in torch so the post-expert norm lands before the top-k sum.
+            # Hot-expert replicas only on the pg-only path (the per-forward balancer lives in okc_patch.moe).
+            replica_plan = None
+            if okc_patch.SW_MOE_PG and okc_patch.MOE_PG_ONLY and self.moe_tp_size == 1:
+                replica_plan = muse_spark_expert_placement.replica_plan(
+                    layer_idx=layer_idx,
+                    num_experts=self.num_experts,
+                    ep_size=self.ep_size,
+                    ep_rank=self.ep_rank,
+                    count=okc_patch.MOE_REPLICAS,
+                )
             self.experts = MuseSpark1xFp4Experts(
                 num_experts=self.num_experts,
                 num_local_experts=self.num_local_experts,
@@ -655,6 +665,7 @@ class MuseSpark1xMoE(nn.Module):
                     ep_size=self.ep_size,
                     ep_rank=self.ep_rank,
                 ),
+                replica_plan=replica_plan,
             )
         else:
             self.experts = MuseSpark1xBf16Experts(

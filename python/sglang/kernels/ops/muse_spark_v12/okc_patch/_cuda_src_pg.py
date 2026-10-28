@@ -128,14 +128,15 @@ template <int GATED, int MODE> constexpr int smem_bytes(int nst) {
 }
 
 // ------------------------------------------------------------------ live tile list
-// live[0] = number of live blocks (local expert, inside n_padded); live[1 + i] = pid_m | (wcode << 20).
+// live[0] = number of live blocks (local expert < nle, inside n_padded); live[1 + i] = pid_m | (wcode << 20).
 // wcode = n/64 - 1 for the block's wgmma width n = the smallest allowed width (wmask bit0: 64, bit1: 128,
 // bit2: 192; 256 always) covering its valid-token prefix (moe_align pads each expert's range at its end).
 // Order: widest class first, pid_m ascending inside a class (round-robin CTAs then end on cheap narrow items).
 __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_experts,
                                                  const int* __restrict__ n_padded,
                                                  const int* __restrict__ sorted_ids, int numel,
-                                                 int num_pid_m, int bm, int wmask, int* __restrict__ live) {
+                                                 int num_pid_m, int bm, int wmask, int nle,
+                                                 int* __restrict__ live) {
     __shared__ int wsum[32];
     __shared__ int total_s;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -145,7 +146,7 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
     for (int cls = 3; cls >= 0; cls--) {
         for (int base = 0; base < npm; base += 1024) {
             const int pm = base + tid;
-            const bool live_blk = pm < npm && (unsigned)block_experts[pm] < 32u;
+            const bool live_blk = pm < npm && (unsigned)block_experts[pm] < (unsigned)nle;
             int code = 3;
             if (live_blk && bm == 256) {
                 const int* sid = sorted_ids + (size_t)pm * 256;
@@ -564,6 +565,52 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
 }
 
+// ------------------------------------------------------------------ replica balancer (small-T forwards)
+// tab[e] for the 256 experts: bits 0-7 the expert's slot on this rank (255: not held here), 8-10 its home rank,
+// bit 11 replicated, 12-14 the replica's rank; tab[256 + j] = the j-th replicated expert in balancing order. Every
+// rank takes the same decision from the same top-k ids (only the slot field differs per rank): load[r] = distinct
+// active non-replicated experts homed on r; then each active replicated expert, in order, goes to whichever of its
+// two holders has the lower load (tie: home) and counts there. out[i] = route i's local slot if this rank computes
+// it, else -1 (the static map's convention).
+template <typename IdT>
+__global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids, int n_routes,
+                                                     const int* __restrict__ tab, int n_rep, int me,
+                                                     int* __restrict__ out) {
+    __shared__ int tabs[256], ord[256], act[256], owner[256], load[8];
+    const int t = threadIdx.x;
+    const int v = tab[t];
+    tabs[t] = v;
+    if (t < n_rep) ord[t] = tab[256 + t];
+    act[t] = 0;
+    owner[t] = (v >> 8) & 7;
+    if (t < 8) load[t] = 0;
+    __syncthreads();
+    for (int i = t; i < n_routes; i += 256) {
+        const int e = (int)ids[i];
+        if ((unsigned)e < 256u) act[e] = 1;
+    }
+    __syncthreads();
+    if (act[t] && !((v >> 11) & 1)) atomicAdd(&load[(v >> 8) & 7], 1);
+    __syncthreads();
+    if (t == 0) {
+        unsigned long long L = 0;   // 8 bits per rank (a load is at most 32 + n_rep < 256)
+        for (int r = 0; r < 8; r++) L |= (unsigned long long)load[r] << (8 * r);
+        for (int j = 0; j < n_rep; j++) {
+            const int e = ord[j], ve = tabs[e];
+            const int h = (ve >> 8) & 7, r = (ve >> 12) & 7;
+            const int pick = ((L >> (8 * r)) & 0xFF) < ((L >> (8 * h)) & 0xFF) ? r : h;
+            if (act[e]) { owner[e] = pick; L += 1ull << (8 * pick); }
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < n_routes; i += 256) {
+        const int e = (int)ids[i];
+        int s = -1;
+        if ((unsigned)e < 256u && owner[e] == me && (tabs[e] & 0xFF) != 0xFF) s = tabs[e] & 0xFF;
+        out[i] = s;
+    }
+}
+
 }  // namespace pgk
 
 // ------------------------------------------------------------------ host
@@ -574,10 +621,24 @@ static int pg_num_sms() {
 }
 
 void tiles(torch::Tensor block_experts, torch::Tensor n_padded, torch::Tensor sorted_ids, torch::Tensor live,
-           int64_t num_pid_m, int64_t bm, int64_t numel, int64_t wmask) {
+           int64_t num_pid_m, int64_t bm, int64_t numel, int64_t wmask, int64_t nle) {
     pgk::pg_tiles<<<1, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
         block_experts.data_ptr<int>(), n_padded.data_ptr<int>(), sorted_ids.data_ptr<int>(), (int)numel,
-        (int)num_pid_m, (int)bm, (int)wmask, live.data_ptr<int>());
+        (int)num_pid_m, (int)bm, (int)wmask, (int)nle, live.data_ptr<int>());
+}
+
+void rep_assign(torch::Tensor ids, torch::Tensor tab, torch::Tensor out, int64_t me) {
+    const int n_rep = (int)tab.size(0) - 256;
+    TORCH_CHECK(tab.scalar_type() == at::kInt && out.scalar_type() == at::kInt && n_rep >= 0 && n_rep <= 256 &&
+                ids.is_contiguous() && out.is_contiguous() && out.numel() == ids.numel() && me >= 0 && me < 8,
+                "pg rep_assign: int32 table [256 + n_rep], int32 out like ids, rank < 8");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (ids.scalar_type() == at::kLong)
+        pgk::pg_rep_assign<int64_t><<<1, 256, 0, stream>>>(ids.data_ptr<int64_t>(), (int)ids.numel(),
+                                                             tab.data_ptr<int>(), n_rep, (int)me, out.data_ptr<int>());
+    else
+        pgk::pg_rep_assign<int><<<1, 256, 0, stream>>>(ids.data_ptr<int>(), (int)ids.numel(), tab.data_ptr<int>(),
+                                                       n_rep, (int)me, out.data_ptr<int>());
 }
 
 void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::Tensor live, int64_t numel) {
