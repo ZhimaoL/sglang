@@ -1419,7 +1419,7 @@ class FlashAttentionBackend(AttentionBackend):
                     part[name] = part[name][rows]
             return part
 
-        def fa3(rows, tokens, cu_q, cu_k, max_q, part_out, rows_page_table):
+        def fa3(rows, tokens, cu_q, cu_k, max_q, part_out, rows_page_table, splits):
             flash_attn_with_kvcache(
                 q=q[tokens],
                 k_cache=key_cache,
@@ -1433,7 +1433,7 @@ class FlashAttentionBackend(AttentionBackend):
                 causal=causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
-                num_splits=self.num_splits,
+                num_splits=splits,
                 out=part_out,
                 ver=self.fa_impl_ver,
                 **part_kwargs(rows),
@@ -1463,6 +1463,7 @@ class FlashAttentionBackend(AttentionBackend):
                 split.head_max_q,
                 head_out,
                 head_page_table,
+                self.num_splits,
             )
 
         def tail():
@@ -1475,6 +1476,9 @@ class FlashAttentionBackend(AttentionBackend):
                 split.tail_max_q,
                 tail_out,
                 page_table[rows],
+                # A 2,048-key window needs no split-KV; FA3's heuristic over the
+                # 8-row blocks splits anyway (~155 vs ~25 us for 15 riders).
+                1 if window_size != (-1, -1) else self.num_splits,
             )
 
         if not side_stream:
