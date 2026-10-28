@@ -391,6 +391,73 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
 
 _WST_WS = {}
 _SMS = {}
+def verify_core_rows(q, k_cache, v_cache, page_table, cache_seqlens, out, *, bs, q_len=8, sm_scale, kv_scale) -> bool:
+    """The attention core of a full layer's verify blocks on the wst kernels, for callers that run QK norm, the KV store
+    and the output norm / gate themselves (ride-along riders inside the FA3 backend's eager attention break).
+
+    q: [bs * q_len, 16, 64] float8_e4m3fn, the blocks' rows in order, QK-normed (full layers: no RoPE), not multiplied by
+    the layer's query factor; k_cache / v_cache: the layer's e4m3 pool [rows, 2, 64] (page size 1) already holding the
+    blocks' new rows; page_table: int32, >= bs rows, stride(1) == 1, any pitch; cache_seqlens: int32 [bs] including the
+    q_len block tokens; out: bf16, bs * q_len rows of 16 x 64 (contiguous), receives the pre-norm attention output (what
+    FA3 returns); sm_scale: the layer's softmax scale (d^-0.5 x scale_query_by); kv_scale: the pool's scalar scale.
+    Same routes as _wst_full (wst_ct14 below OKC_WST_BAL_MIN_BS, wst_ct14b from it; cooperative launches), with their
+    own workspace and tickets. Returns False (nothing launched) when not handled."""
+    if torch.compiler.is_compiling() or not SW_WST or q_len != 8:
+        return False
+    if q.dtype is not torch.float8_e4m3fn or q.dim() != 3 or tuple(q.shape) != (bs * q_len, 16, 64) or not q.is_contiguous():
+        return False
+    if k_cache.dtype is not torch.float8_e4m3fn or k_cache.dim() != 3 or k_cache.shape[1:] != (2, 64):
+        return False
+    if page_table.dtype is not torch.int32 or page_table.stride(1) != 1 or page_table.shape[0] < bs:
+        return False
+    if cache_seqlens.dtype is not torch.int32 or cache_seqlens.numel() != bs:
+        return False
+    if out.dtype is not torch.bfloat16 or out.numel() != bs * q_len * 16 * 64 or not out.is_contiguous():
+        return False
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import wst_ext
+
+    device = q.device
+    dkey = str(device)
+    G = _SMS.get(dkey)
+    if G is None:
+        G = _SMS[dkey] = torch.cuda.get_device_properties(device).multi_processor_count
+    B, L = bs, q_len
+    LG = L * 8
+    bal = B >= WST_BAL_MIN_BS and G <= 256
+    S = 0 if bal else G // B
+    nrow = (G + B) * 2 * LG if bal else B * 2 * S * LG
+    ws = _WST_WS.get(("core_ws", dkey))
+    if ws is None or ws["acc"].shape[0] < nrow:
+        n = max(nrow, (G + 32) * 2 * LG)
+        ws = {
+            "acc": torch.empty((n, 64), dtype=torch.bfloat16 if WST_ACC16 else torch.float32, device=device),
+            "m": torch.empty((n,), dtype=torch.float32, device=device),
+            "l": torch.empty((n,), dtype=torch.float32, device=device),
+        }
+        _WST_WS.setdefault(("core_all", dkey), []).append(ws)
+        _WST_WS[("core_ws", dkey)] = ws
+    key = ("core", bal, B, L, S, dkey)
+    tick = _WST_WS.get(key)
+    if tick is None:   # per (b, kv head), +256 per launch
+        tick = _WST_WS[key] = torch.zeros((2 * B,), dtype=torch.int32, device=device)
+    skey = ("scale", float(kv_scale), dkey)
+    vs = _WST_WS.get(skey)
+    if vs is None:
+        vs = _WST_WS[skey] = torch.tensor([float(kv_scale)], dtype=torch.float32, device=device)
+    seq_pre = (cache_seqlens - L).to(torch.int32)
+    ext = wst_ext()
+    smqk = sm_scale * LOG2E
+    q8, kc, vc = q.view(torch.uint8), k_cache.view(torch.uint8), v_cache.view(torch.uint8)
+    if bal:
+        ext.wst_core_bal(q8, kc, vc, page_table, seq_pre, ws["acc"], ws["m"], ws["l"], vs, smqk, B, L,
+                         page_table.stride(0), G, out, tick, vs)
+    else:
+        ext.wst_core_fqbt(q8, kc, vc, page_table, seq_pre, ws["acc"], ws["m"], ws["l"], vs, smqk, B, L,
+                          page_table.stride(0), S, out, tick, vs)
+    log_once("wst_core[q_len=8]", f"(first bs={bs})")
+    return True
+
+
 _VFG_WS = {}
 
 
