@@ -5,6 +5,10 @@ decomposition the pin itself uses above 8 tokens); T == 1 runs both dots in one 
 GEMV over interleaved hi/lo rows, T = 2..8 runs the fused Triton split-K. Output is
 fp32 logits [T, E], bit-compatible with what FusedMuseSparkRouting consumes.
 
+Both split-K kernels store one fp32 partial per K slice and reduce_launch(FOLD=2) sums
+the slices in a fixed order, so the logits are deterministic: every TP rank routes on
+its own copy, and atomics could resolve a top-8 near-tie differently across ranks.
+
 Measured at the kernel court: T=1 pair GEMV 8.3 us vs 13.5 us fp32 F.linear; the
 Triton split-K was the proj lane's 3.19x m8 winner. Cache cost: hi + lo + interleaved
 pairs = 3 bf16 copies of the [256, 8192] router = 12 MiB per MoE layer (~0.7 GiB per
@@ -20,10 +24,11 @@ import triton.language as tl
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import proj_ext
 
 MAX_TOKENS = 8
+_SPLIT_K = 16  # K slices of both kernels (= fp32 partial planes reduced in order)
 
 
 @triton.jit
-def _router_fused(x_ptr, hi_ptr, lo_ptr, out_ptr, M,
+def _router_fused(x_ptr, hi_ptr, lo_ptr, part_ptr, M,
                   N: tl.constexpr, K: tl.constexpr,
                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
                   SPLIT_K: tl.constexpr):
@@ -43,8 +48,9 @@ def _router_fused(x_ptr, hi_ptr, lo_ptr, out_ptr, M,
         wl = tl.load(lo_ptr + offs_n[:, None] * K + offs_k[None, :])
         acc += tl.dot(x_t, tl.trans(wh), out_dtype=tl.float32)
         acc += tl.dot(x_t, tl.trans(wl), out_dtype=tl.float32)
-    tl.atomic_add(out_ptr + offs_m[:, None] * N + offs_n[None, :], acc,
-                  mask=m_mask[:, None])
+    # this K slice's partial -> part[pid_k, m, n]; reduce_launch sums the slices in order
+    tl.store(part_ptr + (pid_k * M + offs_m[:, None]) * N + offs_n[None, :], acc,
+             mask=m_mask[:, None])
 
 
 # gate weight (data_ptr, shape) -> (hi [N,K], lo [N,K], pairs [2N,K]) bf16 row-major.
@@ -86,19 +92,24 @@ def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
     if weight.shape[1] != hidden:
         return None
     x = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
-    if tokens == 1 and hidden % (16 * 256 * 2) == 0:
+    if tokens == 1 and hidden % (_SPLIT_K * 256 * 2) == 0:
         hi, lo, pairs = _hi_lo_pairs(weight)
-        logits = torch.zeros((tokens, ne), dtype=torch.float32, device=x.device)
-        proj_ext().gemv_router_launch(pairs, x, logits, tokens, hidden, 1, 16, 2, 2)
+        ext = proj_ext()
+        part = torch.empty((_SPLIT_K, tokens, ne), dtype=torch.float32, device=x.device)
+        ext.gemv_router_launch(pairs, x, part, tokens, hidden, 1, _SPLIT_K, 2, 2)
+        logits = torch.empty((tokens, ne), dtype=torch.float32, device=x.device)
+        ext.reduce_launch(part, logits, tokens, ne, _SPLIT_K, 2)
         return logits
-    if ne % 32 == 0 and hidden % (16 * 256) == 0:
+    if ne % 32 == 0 and hidden % (_SPLIT_K * 256) == 0:
         hi, lo, pairs = _hi_lo_pairs(weight)
-        logits = torch.zeros((tokens, ne), dtype=torch.float32, device=x.device)
-        _router_fused[(ne // 32, 16)](
-            x, hi, lo, logits,
+        part = torch.empty((_SPLIT_K, tokens, ne), dtype=torch.float32, device=x.device)
+        _router_fused[(ne // 32, _SPLIT_K)](
+            x, hi, lo, part,
             tokens, N=ne, K=hidden,
             BLOCK_M=max(16, triton.next_power_of_2(tokens)),
-            BLOCK_N=32, BLOCK_K=256, SPLIT_K=16,
+            BLOCK_N=32, BLOCK_K=256, SPLIT_K=_SPLIT_K,
             num_warps=4, num_stages=3)
+        logits = torch.empty((tokens, ne), dtype=torch.float32, device=x.device)
+        proj_ext().reduce_launch(part, logits, tokens, ne, _SPLIT_K, 2)
         return logits
     return None

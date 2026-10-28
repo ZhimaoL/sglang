@@ -1,5 +1,5 @@
-"""muse_bf16_proj v5 CUDA source, byte-identical to the certified kernel-track lane
-(same load_inline name and flags -> torch_extensions build-cache hit)."""
+"""muse_bf16_proj v5 CUDA source (the certified kernel-track lane) with a deterministic router: the T = 1
+GEMV stores per-K-slice partials instead of fp32 atomics, and reduce_k<2> sums them in a fixed order."""
 
 _CUDA_SRC = r"""
 #include <torch/extension.h>
@@ -74,7 +74,8 @@ __global__ void gemv_ffma_k(const uint4* __restrict__ W, const uint4* __restrict
 }
 
 // Router: Wp = [2*NR, K] bf16, rows 2j / 2j+1 = hi_j / lo_j. Warp (j, sk) owns the
-// pair over K-slice sk; fp32 atomicAdd into pre-zeroed out[m, NR].
+// pair over K-slice sk and stores its fp32 partial to out = P[SK][m][NR]; reduce_k<2>
+// sums the slices in a fixed order (no atomics: every TP rank gets the same logits).
 template <int MT, int U>
 __global__ void gemv_router_k(const uint4* __restrict__ Wp, const uint4* __restrict__ X,
                               float* __restrict__ out, int m, int NR, int kvec, int SK) {
@@ -116,7 +117,7 @@ __global__ void gemv_router_k(const uint4* __restrict__ Wp, const uint4* __restr
     float v = acc[0][i] + acc[1][i];
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    if (lane == i && (MT == 1 || i < m)) atomicAdd(out + (size_t)i * NR + j, v);
+    if (lane == i && (MT == 1 || i < m)) out[((size_t)sk * m + i) * NR + j] = v;
   }
 }
 
@@ -386,7 +387,8 @@ mma_cstream_k(const uint4* __restrict__ Wm, const uint4* __restrict__ We,
 }
 
 // FOLD=0: out bf16 [m,NOUT] = sum_sk P. FOLD=1 (router): out fp32 [m,NOUT/2],
-// out[i][j] = sum_sk P[sk][i][j] + P[sk][i][j+NOUT/2].
+// out[i][j] = sum_sk P[sk][i][j] + P[sk][i][j+NOUT/2]. FOLD=2 (router): out fp32
+// [m,NOUT] = sum_sk P, sk = 0, 1, ... in order.
 template <int FOLD>
 __global__ void reduce_k(const float* __restrict__ P, void* __restrict__ out, int m, int NOUT,
                          int SK) {
@@ -403,7 +405,7 @@ __global__ void reduce_k(const float* __restrict__ P, void* __restrict__ out, in
       s.y += v.y;
     }
     reinterpret_cast<__nv_bfloat162*>(out)[tid] = __float22bfloat162_rn(s);
-  } else {
+  } else if (FOLD == 1) {
     int half = NOUT >> 1;
     int total = m * half;
     if (tid >= total) return;
@@ -414,6 +416,13 @@ __global__ void reduce_k(const float* __restrict__ P, void* __restrict__ out, in
       s += p[j] + p[j + half];
     }
     reinterpret_cast<float*>(out)[(size_t)i * half + j] = s;
+  } else {
+    int total = m * NOUT;
+    if (tid >= total) return;
+    float s = 0.f;
+#pragma unroll 16
+    for (int si = 0; si < SK; si++) s += P[plane * si + tid];
+    reinterpret_cast<float*>(out)[tid] = s;
   }
 }
 
@@ -481,10 +490,12 @@ void cmma_launch(at::Tensor Wm, at::Tensor We, at::Tensor X, at::Tensor out, int
 void reduce_launch(at::Tensor P, at::Tensor out, int64_t m, int64_t nout, int64_t SK,
                    int64_t FOLD) {
   auto stream = at::cuda::getCurrentCUDAStream();
-  int total = (int)(FOLD ? m * (nout >> 1) : (m * nout) >> 1);
+  int total = (int)(FOLD == 1 ? m * (nout >> 1) : FOLD == 2 ? m * nout : (m * nout) >> 1);
   dim3 grid((unsigned)((total + 255) / 256)), block(256u);
   const float* p = reinterpret_cast<const float*>(P.data_ptr());
-  if (FOLD)
+  if (FOLD == 2)
+    reduce_k<2><<<grid, block, 0, stream>>>(p, out.data_ptr(), (int)m, (int)nout, (int)SK);
+  else if (FOLD)
     reduce_k<1><<<grid, block, 0, stream>>>(p, out.data_ptr(), (int)m, (int)nout, (int)SK);
   else
     reduce_k<0><<<grid, block, 0, stream>>>(p, out.data_ptr(), (int)m, (int)nout, (int)SK);

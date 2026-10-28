@@ -69,9 +69,10 @@ def proj_ext():
                     _CUDA_SRC,
                 )
 
-                # Name and flags match the certified kernel-track build, so its torch_extensions cache is reused.
+                # Flags match the certified kernel-track build; the name differs because the router GEMV and
+                # reduce_k<2> changed (a shared name would rebuild over that lane's torch_extensions cache).
                 _PROJ_EXT = load_inline(
-                    name="okc_v5_stream",
+                    name="okc_v5_stream_det",
                     cpp_sources=[_PROJ_CPP],
                     cuda_sources=[_CUDA_SRC],
                     functions=[
