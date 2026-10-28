@@ -230,6 +230,9 @@ BETWEEN_CHUNK_MAX_REQS = int(os.environ.get("OKC_BETWEEN_CHUNK_MAX_REQS", "8"))
 # blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
 # "1" one merged forward, "2" diagnostic (same scheduling, the two ordinary forwards back to back).
 RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
+# Riders' full-layer attention on the wst core (attention.verify_core_rows: their own normed e4m3 q, k / v already
+# stored, pre-gate output) instead of their own FA3 call; "0" keeps FA3.
+RIDE_CORE = _flag("OKC_RIDE_CORE", "1")
 
 ANY_ATTN = SW_ATTN or SW_WST
 
@@ -245,5 +248,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_AR_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
-           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "RIDE_ALONG",
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "RIDE_ALONG", "RIDE_CORE",
            "ANY_ATTN"]

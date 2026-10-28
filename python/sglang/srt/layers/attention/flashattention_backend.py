@@ -343,6 +343,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         self._extend_split_stream: Optional[torch.cuda.Stream] = None
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        self._okc_ride_core = bool(okc_patch.RIDE_ALONG and okc_patch.RIDE_CORE)
         device_capability = get_device_capability()
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
@@ -1416,7 +1419,8 @@ class FlashAttentionBackend(AttentionBackend):
         """A ride-along layer as two calls into one output: the prefill requests through
         the prefill-attention hook (FA3 when it declines), then the riders' blocks as
         their own verify-shaped FA3 call, on a side stream beside the prefills' or after
-        them."""
+        them. Full layers give the riders' blocks to the wst core instead (OKC_RIDE_CORE),
+        after the prefills on this stream: its cooperative grid waits for every SM."""
         n, t = split.head_reqs, split.head_tokens
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         if out is None:
@@ -1481,8 +1485,30 @@ class FlashAttentionBackend(AttentionBackend):
                 self.num_splits,
             )
 
+        riders = cache_seqlens.shape[0] - n
+        core = (
+            self._okc_ride_core
+            and window_size == (-1, -1)
+            and self.page_size == 1
+            and split.tail_tokens == 8 * riders
+            and q.dtype == torch.float8_e4m3fn
+            and layer.k_scale_float == layer.v_scale_float
+        )
+
         def tail():
             rows = slice(n, None)
+            if core:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import attention
+
+                kv_scale = layer.k_scale_float
+                if attention.verify_core_rows(
+                    q[t : t + split.tail_tokens],
+                    key_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    page_table[rows], cache_seqlens[rows], tail_out, bs=riders,
+                    sm_scale=layer.scaling, kv_scale=1.0 if kv_scale is None else kv_scale,
+                ):
+                    return
             fa3(
                 rows,
                 slice(t, t + split.tail_tokens),
@@ -1494,7 +1520,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.num_splits,
             )
 
-        if not side_stream:
+        if not side_stream or core:
             head()
             tail()
             return out
