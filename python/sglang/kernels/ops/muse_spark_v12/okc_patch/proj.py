@@ -2,16 +2,19 @@
 
 m == 1 runs the FFMA streaming GEMV straight off the resident [N, K] bf16 weight (no
 copies). m = 2..8 runs the lane's tensor-core MMA path (needs a packed B-fragment
-copy of the weight, built lazily per weight; OKC_SW_PROJ_MMA opts into that memory)
-or the tuned Triton dot where that won. Only the court-certified (N, K) shapes are
-claimed; everything else falls through to the stock dispatcher.
+copy of the weight, built at weight load by prepare_weight; OKC_SW_PROJ_MMA opts into
+that memory) or the tuned Triton dot where that won. Only the court-certified (N, K)
+shapes are claimed; everything else falls through to the stock dispatcher.
 
 Certified per-call wins (kernel court, H200, graph replay, cold L2): the small-T CUDA
 stack is where decode1 1.46x / verify1 1.27-1.29x per layer came from.
 
-Memory cost of OKC_SW_PROJ_MMA, per Muse TP8 layer that hits it: qkv_gate pack
-[2304, 8192] bf16 = 36 MiB + pooler pack [4096, 8192] bf16 = 64 MiB, so about
-100 MiB x 62 layers = 6.1 GiB per rank. OKC_SW_PROJ alone copies nothing.
+Memory cost of OKC_SW_PROJ_MMA: the qkv_gate pack [2304, 8192] bf16 = 36 MiB per Muse
+TP8 layer, 62 layers = 2.2 GiB per rank, allocated at load (before KV-pool sizing).
+The pooler [4096, 8192] runs column-split through gemm_ag since v6, so it is not
+packed; a weight without a pack declines the MMA path (packs are never built inside
+a forward, where they would land after KV sizing or inside a graph capture).
+OKC_SW_PROJ alone copies nothing.
 """
 
 import torch
@@ -73,15 +76,25 @@ _TRI_CFG = {
 # (data_ptr, shape) -> packed B-fragment tensor. Weights are frozen after load, so
 # the pointer identifies the tensor for the process lifetime.
 _MMA_PACKS = {}
+# The shapes prepare_weight packs: qkv_gate only (see the module docstring).
+_PACKED_SHAPES = ((2304, 8192),)
 
 
-def _mma_pack(w):
-    key = (w.data_ptr(), tuple(w.shape))
-    pack = _MMA_PACKS.get(key)
-    if pack is None:
-        pack = _repack_mma(w)
-        _MMA_PACKS[key] = pack
-    return pack
+def prepare_weight(weight) -> None:
+    """Build the resident MMA pack of a certified weight at load time (the caller is
+    MuseSpark1xForCausalLM.post_load_weights); small_m_gemm only looks packs up."""
+    if not SW_PROJ_MMA or tuple(weight.shape) not in _PACKED_SHAPES:
+        return
+    if weight.dtype is not torch.bfloat16 or not weight.is_cuda or not weight.is_contiguous():
+        return
+    key = (weight.data_ptr(), tuple(weight.shape))
+    if key in _MMA_PACKS:
+        return
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.moe import build_resident
+
+    w = weight.data
+    with torch.no_grad():
+        _MMA_PACKS[key] = build_resident(lambda: {"pack": _repack_mma(w)})["pack"]
 
 
 def small_m_gemm(x, weight):
@@ -116,8 +129,8 @@ def small_m_gemm(x, weight):
         cfg = _MMA_CFG.get((n, k))
         if cfg is not None:
             MR, SK, WPC, G = cfg
-            if _mma_ok(n, k, m, MR, SK, WPC, G):
-                wp = _mma_pack(weight)
+            wp = _MMA_PACKS.get((weight.data_ptr(), (n, k)))
+            if wp is not None and _mma_ok(n, k, m, MR, SK, WPC, G):
                 ext = proj_ext()
                 P = torch.empty((SK, m, n), dtype=torch.float32, device=x.device)
                 ext.mma_launch(wp, x2, P, m, n, k, MR, 1, SK, WPC, G)

@@ -12,7 +12,8 @@ its own copy, and atomics could resolve a top-8 near-tie differently across rank
 Measured at the kernel court: T=1 pair GEMV 8.3 us vs 13.5 us fp32 F.linear; the
 Triton split-K was the proj lane's 3.19x m8 winner. Cache cost: hi + lo + interleaved
 pairs = 3 bf16 copies of the [256, 8192] router = 12 MiB per MoE layer (~0.7 GiB per
-rank over 61 MoE layers).
+rank over 61 MoE layers), built at weight load by prepare_gate (before KV-pool sizing,
+outside any graph capture); a gate without them declines to the stock router.
 """
 
 from typing import Optional
@@ -57,23 +58,33 @@ def _router_fused(x_ptr, hi_ptr, lo_ptr, part_ptr, M,
 _SPLITS = {}
 
 
-def _hi_lo_pairs(weight):
+def prepare_gate(gate) -> None:
+    """Split the fp32 gate weight into its resident bf16 hi/lo copies at load time (the
+    caller is MuseSpark1xForCausalLM.post_load_weights); router_logits_small only looks
+    them up."""
+    weight = gate.weight
+    if weight.dtype is not torch.float32 or not weight.is_cuda or weight.dim() != 2:
+        return
+    if weight.shape[1] % (_SPLIT_K * 256):
+        return  # neither kernel claims this K
     key = (weight.data_ptr(), tuple(weight.shape))
-    entry = _SPLITS.get(key)
-    if entry is None:
-        with torch.no_grad():
-            hi = weight.to(torch.bfloat16)
-            lo = (weight - hi.to(torch.float32)).to(torch.bfloat16)
-            hi = hi.contiguous()
-            lo = lo.contiguous()
-            pairs = torch.empty(
-                (hi.shape[0] * 2, hi.shape[1]), dtype=torch.bfloat16, device=hi.device
-            )
-            pairs[0::2] = hi
-            pairs[1::2] = lo
-            entry = (hi, lo, pairs.contiguous())
-            _SPLITS[key] = entry
-    return entry
+    if key in _SPLITS:
+        return
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.moe import build_resident
+
+    w = weight.data
+
+    def build():
+        hi = w.to(torch.bfloat16)
+        lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
+        pairs = torch.empty((w.shape[0] * 2, w.shape[1]), dtype=torch.bfloat16, device=w.device)
+        pairs[0::2] = hi
+        pairs[1::2] = lo
+        return {"hi": hi.contiguous(), "lo": lo.contiguous(), "pairs": pairs}
+
+    with torch.no_grad():
+        built = build_resident(build)
+    _SPLITS[key] = (built["hi"], built["lo"], built["pairs"])
 
 
 def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
@@ -91,9 +102,12 @@ def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
     ne = weight.shape[0]
     if weight.shape[1] != hidden:
         return None
+    entry = _SPLITS.get((weight.data_ptr(), (ne, hidden)))
+    if entry is None:
+        return None
+    hi, lo, pairs = entry
     x = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
     if tokens == 1 and hidden % (_SPLIT_K * 256 * 2) == 0:
-        hi, lo, pairs = _hi_lo_pairs(weight)
         ext = proj_ext()
         part = torch.empty((_SPLIT_K, tokens, ne), dtype=torch.float32, device=x.device)
         ext.gemv_router_launch(pairs, x, part, tokens, hidden, 1, _SPLIT_K, 2, 2)
@@ -101,7 +115,6 @@ def router_logits_small(gate, hidden_states) -> Optional[torch.Tensor]:
         ext.reduce_launch(part, logits, tokens, ne, _SPLIT_K, 2)
         return logits
     if ne % 32 == 0 and hidden % (_SPLIT_K * 256) == 0:
-        hi, lo, pairs = _hi_lo_pairs(weight)
         part = torch.empty((_SPLIT_K, tokens, ne), dtype=torch.float32, device=x.device)
         _router_fused[(ne // 32, _SPLIT_K)](
             x, hi, lo, part,
