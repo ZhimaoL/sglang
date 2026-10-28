@@ -279,9 +279,10 @@ void muse_vfg_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t
                      int64_t k_cache, int64_t v_cache, int64_t inv_freq, int64_t out, int64_t B, int64_t NS,
                      int64_t window, double c2, double k_rscale, double v_rscale, double v_scale, double eps,
                      int64_t ws, int64_t dbgp, int64_t stream);
-void muse_vp2_launch(int64_t qkv, int64_t page_table, int64_t seq_lens, int64_t cache_loc, int64_t k_cache,
-                     int64_t v_cache, int64_t inv_freq, int64_t out, int64_t window, double c2, double k_rscale,
-                     double v_rscale, double v_scale, double eps, int64_t dbgp, int64_t stream);
+void muse_vp2_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t seq_lens, int64_t cache_loc,
+                     int64_t k_cache, int64_t v_cache, int64_t inv_freq, int64_t out, int64_t B, int64_t window,
+                     double c2, double k_rscale, double v_rscale, double v_scale, double eps, int64_t dbgp,
+                     int64_t stream);
 """
 
 
@@ -300,7 +301,7 @@ def vfg_ext():
 
                 # The bank's flags for its svsd module (v16c_m7g_rlx3 _svsd_ext); a name of our own.
                 _VFG_EXT = load_inline(
-                    name="okc_vfg_verify_v1",
+                    name="okc_vfg_verify_v2",
                     cpp_sources=[_VFG_CPP],
                     cuda_sources=[_CUDA_SRC],
                     functions=["muse_vfg_launch", "muse_vp2_launch"],
