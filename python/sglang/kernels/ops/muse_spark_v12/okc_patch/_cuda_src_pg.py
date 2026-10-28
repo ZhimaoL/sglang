@@ -1136,6 +1136,145 @@ __global__ void __launch_bounds__(256) pg_rep_split(const int* __restrict__ ids,
     }
 }
 
+// Counts-in form of the replica balancer for extend-sized calls (rep_align_scan below; rep_owner is the verify / st form): cnt [256] this
+// call's routes per global expert, tabs [256] / ord [n_rep] the table (all shared). An active expert weighs (wmode)
+// 0: 1, 1: ceil(c / 8), 2: its pg cost in 1/8 SM-us (bm-token blocks of 64 + bm, a tail of 64 + its width class: bm 128
+// narrow 16 / 64 / 128, else 64 / 128 / 256); sort: replicated experts by count descending (ties: id ascending, as
+// pg_rep_cut), else the table order; each active one goes to the holder with the lower load (tie: home). Leaves
+// owner [256] (synced); load [8] / sord [256] shared scratch; loads are 32-bit.
+__device__ __forceinline__ int rep_cost(int c, int wmode, int bm) {
+    if (c <= 0) return 0;
+    if (wmode == 0) return 1;
+    if (wmode == 1) return (c + 7) >> 3;
+    const int full = c / bm, tail = c - full * bm;
+    const int tw = tail <= 0 ? 0 : bm == 128 ? (tail <= 16 ? 16 : tail <= 64 ? 64 : 128)
+                                             : (tail <= 64 ? 64 : tail <= 128 ? 128 : 256);
+    return full * (64 + bm) + (tail > 0 ? 64 + tw : 0);
+}
+
+__device__ __forceinline__ void rep_decide(const int* cnt, const int* tabs, const int* ord, int n_rep, int wmode,
+                                           int bm, int sort, int* owner, int* load, int* sord) {
+    const int t = threadIdx.x;
+    if (t < 256) owner[t] = (tabs[t] >> 8) & 7;
+    if (t < 8) load[t] = 0;
+    __syncthreads();
+    if (t < 256 && !((tabs[t] >> 11) & 1)) {
+        const int w = rep_cost(cnt[t], wmode, bm);
+        if (w) atomicAdd(&load[(tabs[t] >> 8) & 7], w);
+    }
+    __syncthreads();
+    if (t == 0) {
+        for (int j = 0; j < n_rep; j++) {
+            const int e = ord[j];
+            int k = j;
+            if (sort)
+                while (k > 0 && (cnt[sord[k - 1]] < cnt[e] || (cnt[sord[k - 1]] == cnt[e] && sord[k - 1] > e))) {
+                    sord[k] = sord[k - 1];
+                    k--;
+                }
+            sord[k] = e;
+        }
+        for (int j = 0; j < n_rep; j++) {
+            const int e = sord[j], c = cnt[e];
+            if (!c) continue;
+            const int v = tabs[e], h = (v >> 8) & 7, r = (v >> 12) & 7;
+            const int pick = load[r] < load[h] ? r : h;
+            owner[e] = pick;
+            load[pick] += rep_cost(c, wmode, bm);
+        }
+    }
+    __syncthreads();
+}
+
+// Extend-sized calls with replicas (above OKC_MOE_REP_MAX_TOKENS, below the split): align_local's three kernels with
+// the balancer inside the scan, from this call's per-expert counts: count the routes per global expert -> one CTA:
+// rep_decide (pg cost weights, count order) -> this call's [256] global -> slot map, the slot counts and the scan ->
+// scatter through the map. align_local(ids, map)'s layout; every rank decides alike from the same counts.
+template <typename IT>
+__global__ void __launch_bounds__(256) rep_align_count(const IT* __restrict__ ids, int numel, int* __restrict__ gcnt) {
+    __shared__ int h[256];
+    h[threadIdx.x] = 0;
+    __syncthreads();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += gridDim.x * blockDim.x) {
+        const long long g = (long long)ids[i];
+        if (g >= 0 && g < 256) atomicAdd(&h[g], 1);
+    }
+    __syncthreads();
+    if (h[threadIdx.x]) atomicAdd(&gcnt[threadIdx.x], h[threadIdx.x]);
+}
+
+__global__ void __launch_bounds__(256) rep_align_scan(int* __restrict__ gcnt, const int* __restrict__ tab,
+                                                      int n_rep, int me, int nl, int* __restrict__ emap,
+                                                      int* __restrict__ off, int* __restrict__ cur,
+                                                      int* __restrict__ sorted_ids, int* __restrict__ block_experts,
+                                                      int* __restrict__ n_padded, int numel, int nblocks, int BM) {
+    __shared__ int cnt[256], tabs[256], ord[256], owner[256], sord[256], load[8], so[AL_MAX + 1], sc[AL_MAX];
+    const int t = threadIdx.x;
+    const int v = tab[t];
+    tabs[t] = v;
+    cnt[t] = gcnt[t];
+    gcnt[t] = 0;                               // the layer's counter, zero for its next call
+    if (t < n_rep) ord[t] = tab[256 + t];
+    if (t < AL_MAX) sc[t] = 0;
+    __syncthreads();
+    rep_decide(cnt, tabs, ord, n_rep, 2, BM, 1, owner, load, sord);
+    const int slot = (owner[t] == me && (v & 0xFF) != 0xFF && (v & 0xFF) < nl) ? (v & 0xFF) : -1;
+    emap[t] = slot;
+    if (slot >= 0) sc[slot] = cnt[t];          // a slot holds one expert
+    __syncthreads();
+    if (t == 0) {
+        int acc = 0;
+        for (int e = 0; e < nl; e++) {
+            so[e] = acc;
+            acc += (sc[e] + BM - 1) / BM * BM;
+        }
+        so[nl] = acc;
+        *n_padded = acc;
+    }
+    __syncthreads();
+    for (int b = t; b < nblocks; b += blockDim.x) {
+        const int pos = b * BM;
+        int ex = -1;
+        for (int e = 0; e < nl; e++)
+            if (pos >= so[e] && pos < so[e + 1]) ex = e;
+        block_experts[b] = ex;
+    }
+    for (int e = 0; e < nl; e++)
+        for (int p = so[e] + sc[e] + t; p < so[e + 1]; p += blockDim.x) sorted_ids[p] = numel;
+    if (t < nl) {
+        off[t] = so[t];
+        cur[t] = 0;
+    }
+}
+
+template <typename IT>
+__global__ void __launch_bounds__(256) rep_align_scatter(const IT* __restrict__ ids, const int* __restrict__ emap,
+                                                         int numel, int nl, const int* __restrict__ off,
+                                                         int* __restrict__ cur, int* __restrict__ lids,
+                                                         int* __restrict__ sorted_ids, int chunk) {
+    __shared__ int em[256], h[AL_MAX], base[AL_MAX];
+    em[threadIdx.x] = emap[threadIdx.x];
+    if (threadIdx.x < AL_MAX) h[threadIdx.x] = 0;
+    __syncthreads();
+    const int lo = blockIdx.x * chunk, hi = min(numel, lo + chunk);
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const long long g = (long long)ids[i];
+        const int e = (g >= 0 && g < 256) ? em[g] : -1;
+        lids[i] = e;
+        if (e >= 0) atomicAdd(&h[e], 1);
+    }
+    __syncthreads();
+    if (threadIdx.x < nl) {
+        base[threadIdx.x] = h[threadIdx.x] ? off[threadIdx.x] + atomicAdd(&cur[threadIdx.x], h[threadIdx.x]) : 0;
+        h[threadIdx.x] = 0;
+    }
+    __syncthreads();
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const int e = lids[i];
+        if (e >= 0) sorted_ids[base[e] + atomicAdd(&h[e], 1)] = i;
+    }
+}
+
 }  // namespace pgk
 
 // ------------------------------------------------------------------ host
@@ -1249,9 +1388,11 @@ void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, 
 
 // Large-T front end: ids [numel] int32 / int64 global ids (emap [n_global] int32, global -> local slot) or local slot ids
 // (emap empty); writes local_ids and moe_align_block_size's outputs over nl slots; cnt [nl] must be zero on entry.
-void align(torch::Tensor ids, torch::Tensor emap, torch::Tensor local_ids, torch::Tensor cnt, torch::Tensor off,
-           torch::Tensor cur, torch::Tensor sorted_ids, torch::Tensor block_experts, torch::Tensor n_padded,
-           int64_t numel, int64_t BM, int64_t nl, int64_t n_global) {
+// tab non-empty: the extend balancer (rep_align_*) on global ids: cnt = the layer's [256] counter (zero on entry and
+// exit), emap = this call's [256] map (written), me = this rank.
+void align(torch::Tensor ids, torch::Tensor emap, torch::Tensor tab, torch::Tensor local_ids, torch::Tensor cnt,
+           torch::Tensor off, torch::Tensor cur, torch::Tensor sorted_ids, torch::Tensor block_experts,
+           torch::Tensor n_padded, int64_t numel, int64_t BM, int64_t nl, int64_t n_global, int64_t me) {
     TORCH_CHECK(nl >= 1 && nl <= pgk::AL_MAX && cnt.numel() >= nl, "pg align: 1..64 local slots");
     TORCH_CHECK(ids.is_contiguous() && local_ids.numel() >= numel && local_ids.scalar_type() == at::kInt,
                 "pg align: ids / local_ids");
@@ -1261,6 +1402,29 @@ void align(torch::Tensor ids, torch::Tensor emap, torch::Tensor local_ids, torch
     const int nblocks = (int)block_experts.numel();
     const int chunk = 4096;
     const int nscat = (int)((numel + chunk - 1) / chunk);
+    if (tab.numel() > 0) {
+        const int n_rep = (int)tab.size(0) - 256;
+        TORCH_CHECK(n_rep >= 0 && cnt.numel() == 256 && emap.numel() == 256 && me >= 0 && me < 8, "pg align: rep");
+        const bool i64 = ids.scalar_type() == at::kLong;
+        if (i64)
+            pgk::rep_align_count<long long><<<nscat, 256, 0, st>>>(
+                reinterpret_cast<const long long*>(ids.data_ptr()), (int)numel, cnt.data_ptr<int>());
+        else
+            pgk::rep_align_count<int><<<nscat, 256, 0, st>>>(ids.data_ptr<int>(), (int)numel, cnt.data_ptr<int>());
+        pgk::rep_align_scan<<<1, 256, 0, st>>>(cnt.data_ptr<int>(), tab.data_ptr<int>(), n_rep, (int)me, (int)nl,
+                                              emap.data_ptr<int>(), off.data_ptr<int>(), cur.data_ptr<int>(),
+                                              sorted_ids.data_ptr<int>(), block_experts.data_ptr<int>(),
+                                              n_padded.data_ptr<int>(), (int)numel, nblocks, (int)BM);
+        if (i64)
+            pgk::rep_align_scatter<long long><<<nscat, 256, 0, st>>>(
+                reinterpret_cast<const long long*>(ids.data_ptr()), emap.data_ptr<int>(), (int)numel, (int)nl,
+                off.data_ptr<int>(), cur.data_ptr<int>(), local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(), chunk);
+        else
+            pgk::rep_align_scatter<int><<<nscat, 256, 0, st>>>(ids.data_ptr<int>(), emap.data_ptr<int>(), (int)numel,
+                (int)nl, off.data_ptr<int>(), cur.data_ptr<int>(), local_ids.data_ptr<int>(),
+                sorted_ids.data_ptr<int>(), chunk);
+        return;
+    }
     if (ids.scalar_type() == at::kLong)
         pgk::align_count<long long><<<nscat, 256, 0, st>>>(reinterpret_cast<const long long*>(ids.data_ptr()), em,
             (int)n_global, (int)nl, local_ids.data_ptr<int>(), (int)numel, cnt.data_ptr<int>());

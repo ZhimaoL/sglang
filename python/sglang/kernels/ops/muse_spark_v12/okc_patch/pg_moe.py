@@ -113,13 +113,15 @@ def _ext(bm: int):
     return pg_ext() if bm == _BLOCK_M else pg_narrow_ext() if bm == 128 else pg_narrow64_ext()
 
 
-def align_local(ids, expert_map=None, n_local=32, block_m=_BLOCK_M):
+def align_local(ids, expert_map=None, n_local=32, block_m=_BLOCK_M, rep_tab=None, rep_cnt=None, rank=0):
     """Large-T front end (the prefill bank's local-slot align): ids [T, 8] global expert ids (int32 / int64) mapped by
     expert_map ([E] int32, global -> local slot, -1 remote), or with expert_map None already local slot ids (-1 = not
     this rank's, e.g. a balancer's slots over 32 + R replicas) -> (local_ids [T, 8] int32, sorted_ids, block_experts,
     n_padded): moe_align_block_size(local_ids, block_m, n_local)'s layout without its 256-expert sort, sized for n_local
     slots (<= 64); block_m = the pg build's token block (256, or 128 for a narrow build). Routes inside a slot's range
-    come in no fixed order; pg's per-route rows do not depend on it."""
+    come in no fixed order; pg's per-route rows do not depend on it. rep_tab (the replica table, with global ids): the
+    extend balancer inside the align: each active replicated expert, whole, to the holder with the lower pg-cost load in
+    count order, from the call's per-expert counts (rep_cnt: the layer's [256] counter, zero on entry and exit)."""
     numel = ids.numel()
     device = ids.device
     nblocks = (numel + n_local * (block_m - 1) + block_m - 1) // block_m
@@ -127,13 +129,17 @@ def align_local(ids, expert_map=None, n_local=32, block_m=_BLOCK_M):
     sorted_ids = torch.empty((nblocks * block_m,), dtype=torch.int32, device=device)
     block_experts = torch.empty((nblocks,), dtype=torch.int32, device=device)
     n_padded = torch.empty((1,), dtype=torch.int32, device=device)
-    cnt = torch.zeros((n_local,), dtype=torch.int32, device=device)
     off = torch.empty((n_local,), dtype=torch.int32, device=device)
     cur = torch.empty((n_local,), dtype=torch.int32, device=device)
-    emap = expert_map if expert_map is not None else local_ids.new_empty((0,))
-    n_global = expert_map.shape[0] if expert_map is not None else n_local
-    pg_ext().align(ids.contiguous(), emap, local_ids, cnt, off, cur, sorted_ids, block_experts, n_padded,
-                   numel, block_m, n_local, n_global)
+    if rep_tab is not None:
+        cnt = rep_cnt if rep_cnt is not None else torch.zeros((256,), dtype=torch.int32, device=device)
+        emap, n_global, tab = local_ids.new_empty((256,)), 256, rep_tab
+    else:
+        cnt = torch.zeros((n_local,), dtype=torch.int32, device=device)
+        emap = expert_map if expert_map is not None else local_ids.new_empty((0,))
+        n_global, tab = (expert_map.shape[0] if expert_map is not None else n_local), local_ids.new_empty((0,))
+    pg_ext().align(ids.contiguous(), emap, tab, local_ids, cnt, off, cur, sorted_ids, block_experts, n_padded,
+                   numel, block_m, n_local, n_global, rank)
     return local_ids, sorted_ids, block_experts, n_padded
 
 
