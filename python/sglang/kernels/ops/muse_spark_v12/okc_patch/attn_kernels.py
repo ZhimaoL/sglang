@@ -24,9 +24,9 @@ def _sliding_prep(
     HAS_ROPE: tl.constexpr, D: tl.constexpr, BLOCK_R: tl.constexpr,
     PDL: tl.constexpr = False,
 ):
-    if PDL:   # programmatic dependent launch: wait for the producers before any load or store
+    if PDL:   # programmatic dependent launch: wait for the producers before any load or store. No early trigger:
+        # a verify kernel launched while these CTAs still hold SMs lands unevenly (bs4 _sl_verify_f2 19.2 -> 24.8 us)
         tlc.gdc_wait()
-        tlc.gdc_launch_dependents()
     t = tl.program_id(0)          # token = b * L + l
     b = t // L
     l = t % L
