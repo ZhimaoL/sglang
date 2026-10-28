@@ -80,10 +80,15 @@ SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
 # kernel unless capability >= 10; > 1 allows the cluster kernel (GB300 policy C = 16 / 8 / 4 / 2 at M <= 8 / 16 / 32
 # / 64) up to this size on sm_90. 1 = upstream behaviour.
 HOPPER_NORM_MAX_CLUSTER = int(os.environ.get("OKC_HOPPER_NORM_MAX_CLUSTER", "1"))
+# sglang's fused multicast all-gather + FFN norm-residual boundary (all_gather_norm_residual.py) on sm_90: the
+# unpooler's column slices are gathered inside the boundary kernel instead of a separate all_gather launch (upstream
+# gates it to capability >= 10). Cluster size follows the Hopper rule above.
+SW_AG_NORM_HOPPER = _flag("OKC_SW_AG_NORM_HOPPER", "0")
 
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS",
-           "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER", "ANY_ATTN"]
+           "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
+           "SW_AG_NORM_HOPPER", "ANY_ATTN"]
