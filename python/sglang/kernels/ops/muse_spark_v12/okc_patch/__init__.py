@@ -62,22 +62,22 @@ GEMM_AG_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_MAX_TOKENS", "128"))
 SP_SYMM = _flag("OKC_SP_SYMM", "1")
 SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
 
-# Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call for one
-# request of >= OKC_PFMHA_MIN_TOKENS tokens on full layers (sliding layers too with OKC_PFMHA_SLIDING=1).
+# Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call. Per request:
+# full layers from OKC_PFMHA_MIN_TOKENS new tokens, sliding layers from OKC_PFMHA_SLIDING_MIN_TOKENS (1xH200 over a 75K
+# prefix: full 1.39x FA3 at 128 tokens .. 2.6x at 2048; sliding 0.94x at 256, 1.17x at 753, 1.45-1.68x from 1024).
+# A co-batch (bs <= OKC_PFMHA_RAGGED_MAX_BS, every request over the threshold) runs one call per request (1.55-1.93x
+# FA3's batched call at bs 2-8 of 753-1500-token follow-ups).
 SW_PREFILL_FMHA = _flag("OKC_SW_PREFILL_FMHA", "1")
-PFMHA_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_MIN_TOKENS", "512"))
+PFMHA_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_MIN_TOKENS", "128"))
 PFMHA_SLIDING = _flag("OKC_PFMHA_SLIDING", "1")
-PFMHA_SLIDING_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_SLIDING_MIN_TOKENS", "4096"))
-# Co-batched follow-up extends (bs > 1, ragged q_len): one fmha7 call per request when every request has at least
-# OKC_PFMHA_RAGGED_MIN_TOKENS tokens and bs <= OKC_PFMHA_RAGGED_MAX_BS.
-PFMHA_RAGGED = _flag("OKC_PFMHA_RAGGED", "0")
-PFMHA_RAGGED_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_RAGGED_MIN_TOKENS", "512"))
-PFMHA_RAGGED_MAX_BS = int(os.environ.get("OKC_PFMHA_RAGGED_MAX_BS", "8"))
+PFMHA_SLIDING_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_SLIDING_MIN_TOKENS", "512"))
+PFMHA_RAGGED = _flag("OKC_PFMHA_RAGGED", "1")
+PFMHA_RAGGED_MAX_BS = int(os.environ.get("OKC_PFMHA_RAGGED_MAX_BS", "32"))
 
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
-           "PFMHA_RAGGED_MIN_TOKENS", "PFMHA_RAGGED_MAX_BS",
+           "PFMHA_RAGGED_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]

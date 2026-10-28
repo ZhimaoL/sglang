@@ -10,8 +10,8 @@ Applies to: Muse target layers (MuseSpark1xAttention marks its RadixAttention), 
 request (the 16K chunks of a first turn and single follow-up extends; a ragged co-batch with OKC_PFMHA_RAGGED,
 one call per request), q / KV e4m3, page size 1,
 16 q heads / 2 kv heads / head dim 64 per rank, causal, no softcap / sinks / score mod, not under capture.
-Full layers attend [0, len); sliding layers (OKC_PFMHA_SLIDING) the 2048-key window. Below
-OKC_PFMHA_MIN_TOKENS real tokens FA3 keeps the call.
+Full layers attend [0, len); sliding layers (OKC_PFMHA_SLIDING) the 2048-key window. A request below the
+layer's token threshold (OKC_PFMHA_MIN_TOKENS / OKC_PFMHA_SLIDING_MIN_TOKENS) keeps its batch on FA3.
 
 Kernel (okc_patch/_cuda_src_fmha.py): gather_kp copies the request's paged K/V rows into per (kv head,
 128-key block) 16 KB stage images (zero-filled past the context), fmha7 streams them by TMA into 3 or 4
@@ -29,7 +29,6 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     PFMHA_MIN_TOKENS,
     PFMHA_RAGGED,
     PFMHA_RAGGED_MAX_BS,
-    PFMHA_RAGGED_MIN_TOKENS,
     PFMHA_SLIDING,
     PFMHA_SLIDING_MIN_TOKENS,
 )
@@ -131,12 +130,12 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
         # page_table = req_to_token[req, :max_seq_len_k]: its width is the request's prefix + chunk (host int)
         reqs = [(0, tokens, page_table.shape[1])]
     else:
-        # A ragged co-batch (follow-up extends): one call per request, each >= OKC_PFMHA_RAGGED_MIN_TOKENS.
+        # A ragged co-batch (follow-up extends, a chunk beside them): one call per request, each over the threshold.
         q_lens = forward_batch.extend_seq_lens_cpu
         seq_cpu = forward_batch.seq_lens_cpu
         if q_lens is None or seq_cpu is None or len(q_lens) != bs or sum(q_lens) != tokens:
             return _decline(tokens, threshold)
-        if min(q_lens) < PFMHA_RAGGED_MIN_TOKENS or bs > PFMHA_RAGGED_MAX_BS:
+        if min(q_lens) < threshold or bs > PFMHA_RAGGED_MAX_BS:
             return _decline(tokens, threshold)
         reqs, off = [], 0
         for i, n in enumerate(q_lens):
