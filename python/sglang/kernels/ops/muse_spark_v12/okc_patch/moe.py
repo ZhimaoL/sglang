@@ -299,9 +299,8 @@ def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps)
 
 
 def pg_prep(layer, topk_ids):
-    """For the SP MoE pipeline (okc_patch/sp_moe_ovl.py): the route alignment of pg, which needs only the top-k ids,
-    so it can run while the token rows are still in flight -> (local slot ids [T, 8], -1 = not this rank's expert,
-    and moe_align_block_size's sorted ids / block experts / padded count)."""
+    """The route alignment of pg, from the top-k ids only -> (local slot ids [T, 8], -1 = not this rank's expert,
+    and the aligned blocks: sorted ids / block experts / padded count)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
@@ -318,23 +317,6 @@ def pg_prep(layer, topk_ids):
     # Marlin's alignment convention: global expert count with -1 for non-local routes.
     align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
     return (local_ids, *moe_align_block_size(local_ids, bm, align_num_experts))
-
-
-def pg_run(layer, x, prep, post_expert_norm):
-    """pg on x [T, H] (pre-expert-normed) with pg_prep's alignment -> y [T, 8, H] per-route outputs; finalize_routes
-    then combines any row range. pg-only layers (the pipeline checks), so a decline is an error."""
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
-
-    state = layer._okc_moe_state
-    local_ids, sorted_ids, block_experts, n_padded = prep
-    decline = _decline_reason(layer, x, local_ids, post_expert_norm, state)
-    if decline is not None:
-        raise RuntimeError(f"OKC pg-only MoE layer cannot run this batch: {decline}")
-    y = pg_moe.grouped_pg(
-        x.contiguous(), sorted_ids, block_experts, n_padded,
-        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], bm=pg_moe.block_m(x.shape[0]),
-    )
-    return y.view(x.shape[0], 8, x.shape[1])
 
 
 def finalize_routes(layer, y, topk_scores, local_ids):
