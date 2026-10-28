@@ -44,8 +44,6 @@ if okc_patch.ANY_ATTN:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import attention as okc_attention
 if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
-if okc_patch.SW_AR_NORM:
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import ar_norm as okc_ar_norm
 if okc_patch.SW_RS_NORM_FOLD:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_tp_ce as okc_sp_tp_ce
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
@@ -1249,12 +1247,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
             if result is not None:
                 return result
-        okc_f = okc_patch.SW_AR_NORM and okc_ar_norm.fused(self, attn_input)
         # OKC rsfold: under SP the o-proj reduce-scatter leaves its slots unsummed for the boundary's norm kernel
-        rs_fold = (okc_patch.SW_RS_NORM_FOLD and not okc_f and get_forward().sp_active
+        rs_fold = (okc_patch.SW_RS_NORM_FOLD and get_forward().sp_active
                    and self._fused_attn_boundary.jit_selected())
         with okc_sp_tp_ce.defer_slot_sum() if rs_fold else contextlib.nullcontext():
-            attn_output = (okc_f.attn if okc_f else self.self_attn)(positions, attn_input, forward_batch)
+            attn_output = self.self_attn(positions, attn_input, forward_batch)
         rs_slots = okc_sp_tp_ce.take_slots(attn_output) if rs_fold else None
         router_dtype = self._router_dtype
         if router_dtype is not None and (
@@ -1267,7 +1264,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 stream, attn_output, branch_dtype=self.operator_dtype, router_dtype=router_dtype,
                 branch_slots=rs_slots)
         else:
-            ffn_input, stream, router_input = (okc_f or self._fused_attn_boundary)(
+            ffn_input, stream, router_input = self._fused_attn_boundary(
                 stream,
                 attn_output,
                 branch_dtype=self.operator_dtype,
