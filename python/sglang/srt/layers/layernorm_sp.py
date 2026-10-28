@@ -35,6 +35,7 @@ nothing in this module executes.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -45,6 +46,8 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils.common import ceil_align
+
+logger = logging.getLogger(__name__)
 
 # Architectures whose decoder layers route attention/MLP through
 # layer boundaries with the standard participant linears, and for which SP
@@ -97,6 +100,45 @@ def okc_hopper_sp_symm() -> bool:
     return _okc_hopper.symm
 
 
+def _okc_symm_probe() -> bool:
+    """Run both torch symm-mem fused ops once on a tiny problem across the TP group and check the result, then
+    agree: the MIN of every rank's success flag over the CPU group, so all ranks take the same path. A node where
+    symm-mem setup or IPC fails runs the NCCL participant linears instead of failing at the first long prefill."""
+    import torch.distributed as dist
+
+    tp_group = get_parallel().tp_group
+    world = tp_group.world_size
+    ok = 1
+    try:
+        group_name = tp_group.device_group.group_name
+        device = torch.device("cuda", torch.cuda.current_device())
+        # all ones, K = 256: every output is an exact small integer in bf16
+        weight = torch.ones((128, 256), dtype=torch.bfloat16, device=device)
+        shard = torch.ones((16, 256), dtype=torch.bfloat16, device=device)
+        _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+            shard, [weight.t()], gather_dim=0, group_name=group_name
+        )
+        reduced = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+            shard.repeat(world, 1), weight.t(), "sum", scatter_dim=0, group_name=group_name
+        )
+        torch.cuda.synchronize()
+        gathered = mm_outputs[0]
+        if not (
+            tuple(gathered.shape) == (16 * world, 128)
+            and bool((gathered == 256).all())
+            and tuple(reduced.shape) == (16, 128)
+            and bool((reduced == 256 * world).all())
+        ):
+            logger.warning("OKC SP: torch symm-mem fused ops returned wrong values in the startup probe.")
+            ok = 0
+    except Exception as e:  # any setup / IPC failure means NCCL
+        logger.warning("OKC SP: torch symm-mem fused ops failed the startup probe: %r", e)
+        ok = 0
+    flag = torch.tensor([ok], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+    return bool(flag.item())
+
+
 def initialize_layernorm_sp(*, model_config) -> None:
     """Materialize ``flags.sp.enabled``; runs once per worker after distributed
     setup, alongside ``initialize_dp_attention``."""
@@ -114,7 +156,10 @@ def initialize_layernorm_sp(*, model_config) -> None:
 
         _okc_hopper.min_tokens = SP_MIN_TOKENS
 
-        _okc_hopper.symm = SP_SYMM and _HAS_TORCH_SYMM_MEM_FUSED
+        # Every rank evaluates the same switches, so all of them enter the collective probe together.
+        _okc_hopper.symm = SP_SYMM and _HAS_TORCH_SYMM_MEM_FUSED and _okc_symm_probe()
+        if SP_SYMM and _HAS_TORCH_SYMM_MEM_FUSED and not _okc_hopper.symm:
+            logger.warning("OKC SP: symm-mem fused linears unavailable on this node; using NCCL collectives.")
         _okc_hopper.symm_min_tokens = SP_SYMM_MIN_TOKENS
     get_flags().sp.enabled = bool(
         (get_parallel().enable_layernorm_sp or _okc_hopper.active)
