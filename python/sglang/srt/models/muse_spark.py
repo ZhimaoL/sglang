@@ -1604,6 +1604,13 @@ class MuseSpark1xForCausalLM(nn.Module):
             # duplicate the full replicated draft context with torch.cat.
             # Release the tap list before allocating the gathered output.
             aux_hidden_states = pack_aux_hidden_states(aux_hidden_states)
+            # OKC: the draft's fc + hidden_norm (row-wise) on this shard, so the gather moves [N, hidden] rather than
+            # [N, taps * hidden] and no rank projects the whole chunk (OKC_SW_DFLASH_FC_SP; set by the DFlash worker).
+            okc_project = getattr(self, "_okc_aux_project", None)
+            if okc_project is not None:
+                projected = okc_project(aux_hidden_states)
+                if projected is not None:
+                    aux_hidden_states = projected
             aux_hidden_states = layernorm_sp.sp_exit_gather(
                 aux_hidden_states, num_tokens=num_tokens
             )

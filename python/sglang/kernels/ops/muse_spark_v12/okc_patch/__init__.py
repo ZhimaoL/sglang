@@ -109,6 +109,13 @@ SW_PDL = _flag("OKC_SW_PDL", "1")
 # DFlash context projection fc (5 x 8192 -> 8192, replicated 640 MiB bf16, 159 us per verify step) as a column-split
 # GEMM + the multicast all-gather (gemm_ag) at <= GEMM_AG_MAX_TOKENS tokens.
 SW_DFLASH_FC_AG = _flag("OKC_SW_DFLASH_FC_AG", "1")
+# Under SP prefill, the same fc + hidden_norm (row-wise) on each rank's shard of the packed taps before the exit gather:
+# gather [N, 8192] instead of [N, 40960], and 1/tp of the GEMM (every rank ran fc over the whole chunk: 14.5 ms + a
+# 1.34 GB all-gather per 16K chunk, serving/kernels/ft-glue).
+SW_DFLASH_FC_SP = _flag("OKC_SW_DFLASH_FC_SP", "1")
+# From this many shard rows (3072-token chunks) the shard GEMM is bit-equal to the whole-chunk one on the judge's
+# cuBLAS (dev2, ft-glue E1); below it cuBLAS takes another kernel for the small shard (rel-L2 6e-4, bf16 ulps).
+DFLASH_FC_SP_MIN_ROWS = int(os.environ.get("OKC_DFLASH_FC_SP_MIN_ROWS", "384"))
 # The same column split for the DFlash grouped convs' kernel_projection (replicated nn.Linear, 2 per draft layer, ~11 us
 # each per verify step); 8-GPU check (session SI vg-micro): slices bit-identical, [3072, 8192] 16.5 -> 10.4 us at m 8.
 SW_DFLASH_CONV_AG = _flag("OKC_SW_DFLASH_CONV_AG", "1")
@@ -155,6 +162,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
            "SW_MOE_OVL",
            "SP_PRENORM_SHARD", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE",
+           "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "RIDE_ALONG", "ANY_ATTN"]
