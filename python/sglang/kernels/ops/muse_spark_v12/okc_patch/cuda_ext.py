@@ -114,9 +114,9 @@ def st_ext():
 
                 # bf16 scales and the 64-slot table (the lane's okc_st_moe_c1 reads 8-bit codes, 32 slots)
                 _ST_EXT = load_inline(
-                    name="okc_st_moe_c4_s16_e64",
+                    name="okc_st_moe_c5_s16_e64",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "torch::Tensor, torch::Tensor, torch::Tensor, int64_t);",
+                    "torch::Tensor, torch::Tensor, torch::Tensor, int64_t, torch::Tensor, double);",
                     cuda_sources=_st_src._CUDA_SRC,
                     functions=["st_moe"],
                     extra_cuda_cflags=[

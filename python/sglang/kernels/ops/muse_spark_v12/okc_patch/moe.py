@@ -161,6 +161,10 @@ def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm,
         small = _small_front(hidden_states, topk_ids, pre_expert_norm)
         if small is not None:
             return _moe_pg_small(layer, hidden_states, topk_scores, topk_ids, state, *small)
+    if path.startswith("st") and _sw.SW_ST_NORM_FOLD:
+        fold = _norm_fold(hidden_states, pre_expert_norm)
+        if fold is not None:
+            return _moe_st(layer, hidden_states, topk_scores, topk_ids, state, *fold)
     if pre_expert_norm is not None:
         hidden_states = pre_expert_norm(hidden_states)
     if path.startswith("st"):
@@ -198,15 +202,32 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
     return name
 
 
-def _moe_st(layer, x, topk_scores, topk_ids, state):
-    """The st pair (okc_patch/st_moe.py) on pre-normed x."""
+def _moe_st(layer, x, topk_scores, topk_ids, state, norm_weight=None, norm_eps=0.0):
+    """The st pair (okc_patch/st_moe.py) on pre-normed x, or on un-normed x with the pre-expert RMSNorm folded into
+    its gate/up kernel (norm_weight, norm_eps from _norm_fold)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import st_moe
 
     local_ids = local_routes(layer, topk_ids)
     y = st_moe.grouped_st(
         x, local_ids, wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.MOE_ST_PDL,
+        norm_weight=norm_weight, norm_eps=norm_eps,
     )
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
+
+
+def _norm_fold(hidden_states, pre_expert_norm):
+    """(norm weight, eps) when st can fold the pre-expert norm (F.rms_norm(x, (H,), bf16 weight, eps) reproduced
+    exactly in its gate/up kernel), else None (the norm keeps its own launch)."""
+    from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm
+
+    if type(pre_expert_norm) is not MuseSpark1xRMSNorm or not hidden_states.is_contiguous():
+        return None
+    weight = pre_expert_norm._get_effective_weight()
+    if weight is None or weight.dtype is not torch.bfloat16 or not weight.is_contiguous():
+        return None
+    if weight.numel() != hidden_states.shape[1]:
+        return None
+    return weight, float(pre_expert_norm.eps)
 
 
 def _small_front(hidden_states, topk_ids, pre_expert_norm):

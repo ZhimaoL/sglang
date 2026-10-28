@@ -49,6 +49,9 @@ SW_MOE_ST = _flag("OKC_SW_MOE_ST", "1")
 # 72: st beats the narrow small front by 6-15 % at T 40..72, 3 % at 80, loses from 96 (smallt-moe LOG E17 / E21).
 MOE_ST_MAX_TOKENS = min(128, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "72")))
 MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
+# st folds the pre-expert RMSNorm into its gate/up kernel (bit-identical to F.rms_norm, as pg_gather_norm), saving the
+# separate norm launch on every st layer.
+SW_ST_NORM_FOLD = _flag("OKC_SW_ST_NORM_FOLD", "1")
 
 
 # Verify-side kernel stack (kernel-track grafts): fused sliding-window / full attention for decode and verify,
@@ -227,7 +230,7 @@ RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL",
+           "MOE_REP_PREFILL", "MOE_REP_SPLIT_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
