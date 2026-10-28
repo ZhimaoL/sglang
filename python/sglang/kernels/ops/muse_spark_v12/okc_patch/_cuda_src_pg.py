@@ -155,6 +155,7 @@ constexpr int SB  = (16384 + 2 * WSB + 1023) / 1024 * 1024;   // PAIR stage: X 2
 #else   // PGN_WSET
 constexpr int SB  = 37888;               // stage stride: X 32768 + W|sf 5120 (a whole number of 1024 B atoms)
 #endif  // PGN_WSET
+constexpr int SB4 = 16384 + 4 * WSB;     // pg_n4 PAIR stage: X 2 x 8 KB + W|sf (kt, kt + 1) of two w-tiles
 constexpr int PREGS = 40, CREGS = 232;   // setmaxnreg targets
 static_assert(128 * PREGS + 256 * CREGS <= 384 * 168, "setmaxnreg budget exceeds the launch allocation");
 constexpr int EPI1 = XB / 2;             // gg1 epilogue per WG: its half of the inter tile [256 t][64 B] (SW64)
@@ -443,9 +444,10 @@ template <int GATED, int NV, int NST, int MODE, int LAG, int PAIR = 0, int SUB =
 DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
     constexpr unsigned XOFF = PAIR ? SUB * 8192 : 0;
     constexpr unsigned WOFF = PAIR ? 16384 + SUB * WSB : XB;
+    constexpr int SBK = N4 ? SB4 : SB;                  // pg_n4's slot: two w-tiles' W|sf
     if (!PAIR || SUB == 0) mbar_wait(c.mb + c.sl * 8, c.cph);
     if (MODE == 0) {
-        const char* stp = c.smem + c.sl * SB + (N4 ? c.woff : 0);
+        const char* stp = c.smem + c.sl * SBK + (N4 ? c.woff : 0);
         const uint4 w = *reinterpret_cast<const uint4*>(stp + WOFF + c.ctid * 16);
         const uint4 sfp = *reinterpret_cast<const uint4*>(stp + WOFF + 4096 + c.sfo);   // bf16 (r0, r1) x 4
         const unsigned* sfq = reinterpret_cast<const unsigned*>(&sfp);
@@ -464,7 +466,7 @@ DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
         }
     }
     if (MODE != 3) {
-        const unsigned xaddr = c.sbase + c.sl * SB + XOFF;
+        const unsigned xaddr = c.sbase + c.sl * SBK + XOFF;
         constexpr unsigned HS = PAIR ? 4096 : XB / 2;     // gg2: stride of the two SW64 half-tiles in the slot
         // the descriptor's start-address field is (addr >> 4) < 2^14 for every smem address (16 B aligned), below
         // the LBO bits of dhi's low word: base + compile-time k16 offset needs no mask and no carry handling
@@ -947,6 +949,123 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
 }
 
+
+#if defined(PGN_WSET) && defined(PGN_N4)
+// ------------------------------------------------------------------ gg1 on four consumer warpgroups (PGN_N4)
+// The prefill bank's pg_n4 (pg_kernel9) on the narrow build's items: an item is (live block, w-tile pair wp) = 256
+// weight rows; consumer warpgroup cw4 computes rows 64 (cw4 & 1) .. +63 of w-tile 2 wp + (cw4 >> 1) with the same
+// kstep / item_body / epilogue as pg_gemm (same decode, same k order per output element: bitwise). Every item is a
+// PAIR item (nv <= 64 at XNT 64): slot = token k-tiles kt / kt + 1 at 0 / 8 KB, W|sf (kt, kt + 1) of w-tile 2 wp at
+// 16 KB and of 2 wp + 1 at 16 KB + 2 WSB. Twice the consumer warps per scheduler on the one ring (the narrow k-loop is
+// latency-bound at 2 consumer warpgroups); 640 threads, setmaxnreg 24 / 112 (32 accumulators at nv <= 64).
+constexpr int N4_PREGS = 24, N4_CREGS = 112;
+static_assert(128 * N4_PREGS + 512 * N4_CREGS <= 640 * 96, "n4 setmaxnreg budget exceeds the launch allocation");
+static_assert(SB4 % 1024 == 0 && XNT == 64, "n4: 64-token blocks, 1024 B aligned slots");
+constexpr int n4_smem_bytes(int nst) { return nst * SB4 + BAR_BYTES + 4 * EPI1; }
+
+template <int NST, int WSET>
+__global__ void __launch_bounds__(640, 1) pg_n4(
+    const char* __restrict__ xg, const char* __restrict__ wsf, const float* __restrict__ gs,
+    void* __restrict__ out, const int* __restrict__ block_experts, const int* __restrict__ live, int NWT, int snake)
+{
+    extern __shared__ __align__(1024) char smem[];
+    const int tid = threadIdx.x;
+    const unsigned sbase = smem_u32(smem);
+    if (sbase & 1023) __trap();
+    const unsigned mb = sbase + NST * SB4;              // full[NST] | empty[NST] | meta[2][4]
+    int* meta = reinterpret_cast<int*>(smem + NST * SB4 + 2 * NST * 8);
+    const unsigned ebase = mb + BAR_BYTES;              // 4 consumer epilogue buffers
+    if (tid < NST) {
+        mbar_init(mb + tid * 8, 1);
+        mbar_init(mb + NST * 8 + tid * 8, 512);         // empty: every consumer thread arrives
+    }
+    pdl_wait();
+    pdl_trigger();
+    __syncthreads();
+    const int NWP = NWT / 2;
+    const int n_items = live[0] * NWP;
+    const int wg = tid >> 7;
+
+    if (wg == 0) {
+        reg_dec<N4_PREGS>();
+        if (tid == 0) {
+            int sl = 0, rnd = 0;
+            int item = sched_item(0, blockIdx.x, gridDim.x, snake);
+            int ent_n = item < n_items ? live[1 + item / NWP] : 0;
+            int e_n = item < n_items ? block_experts[ent_n & 0xFFFFF] : 0;
+            float g_n = item < n_items ? gs[e_n] : 0.f;
+            for (int j = 0; item < n_items; j++) {
+                const int wp = item % NWP;
+                const int ent = ent_n, e = e_n;
+                const float gsv = g_n;
+                const int pm = ent & 0xFFFFF, wcode = ent >> 20;
+                const int nv = eff_nv<WSET>(wcode);
+                const int nxt = sched_item(j + 1, blockIdx.x, gridDim.x, snake);
+                if (nxt < n_items) ent_n = live[1 + nxt / NWP];
+                int* mt = meta + (j & 1) * 4;
+                mt[0] = pm; mt[1] = wp; mt[2] = wcode; mt[3] = __float_as_int(gsv);
+                const char* xs = xg + (size_t)pm * NKT * XB;
+                const char* ws0 = wsf + ((size_t)e * NWT + 2 * wp) * (size_t)NKT * WSB;
+                const char* ws1 = ws0 + (size_t)NKT * WSB;
+                for (int ks = 0; ks < NKT / 2; ks++) {
+                    if (rnd > 0) mbar_wait(mb + NST * 8 + sl * 8, (rnd - 1) & 1);
+                    const unsigned st = sbase + sl * SB4;
+                    const int kt = 2 * ks;
+                    mbar_expect_tx(mb + sl * 8, 2 * nv * 128 + 4 * WSB);
+#pragma unroll
+                    for (int sub = 0; sub < 2; sub++)
+                        bulk_g2s(st + sub * 8192, xs + (size_t)(kt + sub) * XB, nv * 128, mb + sl * 8);
+                    bulk_g2s(st + 16384, ws0 + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);
+                    bulk_g2s(st + 16384 + 2 * WSB, ws1 + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);
+                    if (++sl == NST) { sl = 0; rnd++; }
+                    if (ks == 8 && nxt < n_items) e_n = block_experts[ent_n & 0xFFFFF];
+                    if (ks == 16 && nxt < n_items) g_n = gs[e_n];
+                }
+                item = nxt;
+            }
+        }
+        return;
+    }
+
+    reg_inc<N4_CREGS>();
+    const int cw4 = wg - 1;
+    Ctx c;
+    c.smem = smem;
+    c.sbase = sbase;
+    c.mb = mb;
+    c.cw = cw4 & 1;                         // row half of the w-tile (W stage index, scales, rows)
+    c.bar = 1 + cw4; c.hf = cw4 & 1; c.woff = (cw4 >> 1) * 2 * WSB;
+    c.ctid = c.cw * 128 + (tid & 127);
+    c.wtid = tid & 127;
+    c.lw = (tid >> 5) & 3;
+    c.lane = tid & 31;
+    c.r0l = c.cw * 64 + c.lw * 16 + (c.lane >> 2);
+    c.r1l = c.r0l + 8;
+    c.sfo = 16 * (c.cw * 32 + c.lw * 8 + (c.lane >> 2));
+    c.dhi = (1ull << 16) | ((unsigned long long)(1024 >> 4) << 32) | (1ull << 62);
+    c.epi = ebase + cw4 * EPI1;
+    c.sl = 0; c.cph = 0;
+    c.rsl = 0;
+    const int wtid = c.wtid;
+    for (int j = 0, item = sched_item(0, blockIdx.x, gridDim.x, snake); item < n_items;
+         j++, item = sched_item(j, blockIdx.x, gridDim.x, snake)) {
+        mbar_wait(c.mb + c.sl * 8, c.cph);
+        const volatile int* mt = meta + (j & 1) * 4;
+        const int pm = mt[0], wt = 2 * mt[1] + (cw4 >> 1), wcode = mt[2];
+        const float gsv = __int_as_float(mt[3]);
+        float acc[XNT / 2];
+        unsigned bA[16], bB[16];
+        const int nv = eff_nv<WSET>(wcode);
+        if ((WSET & 16) && nv == 16)
+            item_body<1, NST, 0, 16, 1, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
+        else if ((WSET & 8) && nv == 32)
+            item_body<1, NST, 0, 32, 1, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
+        else
+            item_body<1, NST, 0, XNT, 1, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
+    }
+    if (wtid == 0) bulk_wait0();
+}
+#endif  // PGN_WSET && PGN_N4
 
 // ------------------------------------------------------------------ large-T routing front end
 // Local-slot align for large calls (the prefill bank's skr::align_count / align_scan / align_scatter, plt_c3 /
@@ -1603,6 +1722,23 @@ void gg1(torch::Tensor xg, torch::Tensor wsf, torch::Tensor gs, torch::Tensor in
          torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl) {
     TORCH_CHECK(cfg == 350, "pg: only cfg 350 is built");
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
+#if defined(PGN_WSET) && defined(PGN_N4)
+    {
+        auto fn = pgk::pg_n4<PGN_N4, PGN_WSET>;
+        constexpr int smem = pgk::n4_smem_bytes(PGN_N4);
+        static bool set = false;
+        if (!set) {
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            set = true;
+        }
+        const int NWT = wsf.size(1);
+        TORCH_CHECK(wsf.size(2) == pgk::NKT && wsf.size(3) == pgk::WSB && NWT % 2 == 0, "pg n4: wsf layout");
+        pg_launch(fn, dim3(grid > 0 ? grid : pg_num_sms()), dim3(640), smem, pdl != 0,
+                  reinterpret_cast<const char*>(xg.data_ptr()), reinterpret_cast<const char*>(wsf.data_ptr()),
+                  gs.data_ptr<float>(), inter.data_ptr(), block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, snake);
+        return;
+    }
+#endif  // PGN_WSET && PGN_N4
 #ifdef PGN_WSET
     launch<1, PGN_NST, 0, PGN_WSET>(xg, wsf, gs.data_ptr<float>(), inter.data_ptr(), nullptr, block_experts, live, 0, grid,
 #else   // PGN_WSET

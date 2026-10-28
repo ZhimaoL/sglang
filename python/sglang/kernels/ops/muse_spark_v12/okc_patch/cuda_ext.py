@@ -111,10 +111,11 @@ def pg_narrow64_ext():
             if _PG_NARROW64_EXT is None:
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
 
+                n4 = int(os.environ.get("OKC_PG64_N4", "0"))   # prototype: gg1 on 4 consumer WGs, n4 ring slots
                 _PG_NARROW64_EXT = _pg_load(
-                    "okc_pg_moe_n24x64s7_int_d3_b6", _CUDA_SRC,
+                    "okc_pg_moe_n24x64s7_int_d3_b6" + (f"_n4s{n4}" if n4 else ""), _CUDA_SRC,
                     ["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
-                    ["-DPGN_WSET=24", "-DPGN_NST=7", "-DPGN_XNT=64"],
+                    ["-DPGN_WSET=24", "-DPGN_NST=7", "-DPGN_XNT=64"] + ([f"-DPGN_N4={n4}"] if n4 else []),
                 )
     return _PG_NARROW64_EXT
 
