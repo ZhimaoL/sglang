@@ -55,7 +55,7 @@ DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, un
     const int CLM[6] = {0, 4, 2, 1, 8, 16};
     for (int ci = 0; ci < 6; ci++) {
         const int cls = CLS[ci];
-        if (ci > 0 && !(wmask & CLM[ci])) continue;
+        if (cls != XNT / 16 - 1 && !(wmask & CLM[ci])) continue;   // the full-block class always runs
         for (int base = 0; base < npm; base += 1024) {
             const int pm = base + tid;
             const bool live_blk = pm < npm && (unsigned)block_experts[pm] < 32u;
