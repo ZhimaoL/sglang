@@ -33,7 +33,6 @@ MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 # the m<=8 dense projections and the small-T router. All four modules stage BF16 activations only
 # (docs/COMPLIANCE-FP16-1025.md) and measured c1 +5.6% / c4 +2.1% with consistency 0.943-0.949 (session Q).
 SW_ATTN = _flag("OKC_SW_ATTN", "1")
-SW_FS = _flag("OKC_SW_FS", "1")
 SW_PROJ = _flag("OKC_SW_PROJ", "1")
 SW_PROJ_MMA = _flag("OKC_SW_PROJ_MMA", "1")
 # Small-m dense GEMMs at verify m (okc_patch/smallm.py): TMA + wgmma straight off the resident row-major bf16 weight
@@ -148,10 +147,10 @@ AR_TP8_GRAPH_MC_MIN_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_MC_MIN_BYTES", 
 # "1" one merged forward, "2" diagnostic (same scheduling, the two ordinary forwards back to back).
 RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
 
-ANY_ATTN = SW_ATTN or SW_FS or SW_WST
+ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
-           "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_SMALLM", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
+           "SW_ATTN", "SW_PROJ", "SW_PROJ_MMA", "SW_SMALLM", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",

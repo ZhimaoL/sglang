@@ -9,27 +9,17 @@ Two env-gated paths, both consuming the FlashAttention backend's per-step metada
   OKC_SW_WST   full layers at q_len 8, bs >= OKC_WST_MIN_BS: the attention lane's verify-full kernels (wst_ct14 with the
                row-sliced in-kernel merge, wst_ct14b balanced over the batch from OKC_WST_BAL_MIN_BS up), one
                launch per layer for QK norm + new KV rows + FP8 attention + merge + output norm and gate.
-  OKC_SW_FS    full layers: physical-order streaming over counting-sorted rows. The
-               sort metadata depends only on (page_table, seq_lens), so the FIRST full
-               layer of a forward builds it IN-GRAPH and stores it on the ForwardBatch
-               (okc_fs_meta); the other full layers of the step reuse it. Under CUDA
-               graphs the build is captured once per graph and replays per step, which
-               is the amortization: ~90 us of sort meta at bs 32 over 16 full layers is
-               ~6 us/layer against a measured ~75 us/layer stream win (court d32-full
-               1.20x INCLUDING a per-layer rebuild; sharing the build only helps).
 
 Every eligibility miss returns None and the caller falls through to the stock path.
 Decisions depend only on config, forward mode, and batch shape, so a decision taken
 during CUDA-graph capture holds for every replay of that graph.
 
 Operating points (kernel court, H200): sliding d1/d16/d32 1.48/1.44/1.45x, v1/v16/v32
-1.25/1.21/1.14x per call; fs full d32 1.203x, v1-full 1.138x. d16-full stays on FA3
-(OKC_FS_SORT_MIN_BS, default 24); verify-full goes to wst (OKC_SW_WST), the fs verify only below OKC_WST_MIN_BS.
+1.25/1.21/1.14x per call; decode-full stays on FA3.
 """
 
 import logging
 import math
-import os
 from typing import Optional
 
 import torch
@@ -50,7 +40,6 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN,
     SW_ATTN_ACC16,
     SW_ATTN_V3,
-    SW_FS,
     SW_PDL,
     SW_WST,
     WST_ACC16,
@@ -60,9 +49,6 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
 LOG2E = 1.4426950408889634
-# Below this sorted-path batch size, decode-full stays on FA3 (court: d16 sort tax ==
-# stream win; d32 wins). Arbitrary between the two measured points; retune on-box.
-FS_SORT_MIN_BS = int(os.environ.get("OKC_FS_SORT_MIN_BS", "24"))
 
 _FA_CLS = None
 
@@ -235,22 +221,22 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
     if theta is not None or backend.page_size != 1:
         return None
     return _full_rows(
-        ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+        qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
         bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d, is_fp8=is_fp8,
         kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
     )
 
 
 def verify_full_rows(attn, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
-                     bs, q_len=8, ctx=None) -> Optional[torch.Tensor]:
+                     bs, q_len=8) -> Optional[torch.Tensor]:
     """A full-attention layer's verify blocks on explicit rows (ride-along riders inside an EXTEND forward): the
-    same eligibility and routing as a TARGET_VERIFY step in try_attention (wst from OKC_WST_MIN_BS, fs below it).
+    same eligibility and routing as a TARGET_VERIFY step in try_attention (wst from OKC_WST_MIN_BS).
 
     qkv: the blocks' pre-norm projection rows [bs * q_len, (2 hq + 2 hkv) d] (row slices of the forward's qkv are
     fine); k_cache / v_cache: the layer's pool [rows, hkv, d] (page size 1); cache_loc: the blocks' reserved slots
     [bs * q_len] (their new k / v rows are (re)written there); seq_pre: int32 [bs] committed lengths (cache_seqlens -
-    q_len); page_table: int32 rows >= bs (any width, any pitch), positions [0, seq_pre + q_len) of request b in row b;
-    ctx: a per-step dict for the fs route's sort metadata (bs below OKC_WST_MIN_BS). Returns the gated output
+    q_len); page_table: int32 rows >= bs (any width, any pitch), positions [0, seq_pre + q_len) of request b in row b.
+    Returns the gated output
     [bs * q_len, hq * d] bf16, or None when not handled (the caller keeps its own path)."""
     if torch.compiler.is_compiling() or q_len != 8:
         return None
@@ -269,13 +255,13 @@ def verify_full_rows(attn, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table
     if seq_pre.dtype is not torch.int32 or seq_pre.numel() != bs or page_table.shape[0] < bs:
         return None
     return _full_rows(
-        {} if ctx is None else ctx, qkv, k_cache, v_cache, cache_loc, seq_pre.contiguous(), page_table,
+        qkv, k_cache, v_cache, cache_loc, seq_pre.contiguous(), page_table,
         bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d, is_fp8=is_fp8,
         kv_scale=kv_scale, sm_scale=d**-0.5, qk_factor=attn.scale_query_by, eps=eps,
     )
 
 
-def _full_rows(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+def _full_rows(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
                bs, q_len, hq, hkv, d, is_fp8, kv_scale, sm_scale, qk_factor, eps):
     """Full-layer routing (decode and verify); None = stock path."""
     # The wst kernels hard-code the TP8 head layout (16 q / 2 kv heads of 64) and read e4m3 cache bytes.
@@ -286,19 +272,7 @@ def _full_rows(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
             bs=bs, q_len=q_len, kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
         )
-    if not SW_FS:
-        return None
-    if q_len == 1:
-        if bs != 1 and bs < FS_SORT_MIN_BS:
-            return None
-    elif q_len != 8 or bs != 1:
-        return None
-    log_once(f"fs_full[q_len={q_len}]", f"(first bs={bs})")
-    return _fs_full(
-        ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
-        bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
-        kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, fp8_pool=is_fp8, eps=eps,
-    )
+    return None
 
 
 _CNT = {}
@@ -591,141 +565,3 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
                           B, L, pt_pitch, 0, S, 0, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, tick, vs)
     return out
 
-
-def _fs_sorted_rows(ctx, page_table, seq_pre, bs, total):
-    """Counting-sorted physical rows, built once per step by the first full layer
-    (_fs_hist2 -> _fs_scan -> _fs_scatter; in-graph, ~90 us at d32)."""
-    maxP = page_table.shape[1]
-    key = ("fs_sorted", bs, maxP, page_table.data_ptr())
-    sorted_rows = ctx.get(key)
-    if sorted_rows is not None:
-        return sorted_rows
-    device = page_table.device
-    blog = 13  # bucket 2^13 pool rows; court sweep was flat across 2^9..2^15
-    PB = 8192
-    nblk = triton.cdiv(total, 1 << blog)
-    pc = triton.cdiv(maxP, PB)
-    sorted_rows = torch.empty((bs * maxP,), dtype=torch.int32, device=device)
-    counts = torch.empty((bs, nblk * pc), dtype=torch.int32, device=device)
-    cursors = torch.empty((bs, nblk * pc), dtype=torch.int32, device=device)
-    ak._fs_hist2[(pc, bs)](
-        page_table, seq_pre, counts, page_table.stride(0), nblk,
-        BUCKET_LOG=blog, PB=PB, TILE=1024,
-        NB_POW=triton.next_power_of_2(nblk + 1),
-        num_warps=4, num_stages=1)
-    ak._fs_scan[(bs,)](counts, cursors, nblk * pc, maxP, CHUNK=4096,
-                       num_warps=4, num_stages=1)
-    pbs = 1024
-    ak._fs_scatter[(triton.cdiv(maxP, pbs), bs)](
-        page_table, seq_pre, cursors, sorted_rows, page_table.stride(0), nblk, pc,
-        BUCKET_LOG=blog, PBH_LOG=PB.bit_length() - 1, PB=pbs,
-        TILE=pbs, SORT_TILE=True,
-        num_warps=4, num_stages=1)
-    ctx[key] = sorted_rows
-    return sorted_rows
-
-
-def _fs_full(ctx, qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
-             bs, q_len, hq, hkv, d, kv_scale, sm_scale, qk_factor, fp8_pool, eps):
-    """v2 full-attention streamer over the sorted rows (always SORTED: the court's
-    B == 1 bitmap walk reads dead pool rows, which a serving pool cannot guarantee
-    are NaN-free)."""
-    device = qkv.device
-    B, L = bs, q_len
-    group = hq // hkv
-    kc = k_cache.view(k_cache.shape[0], -1)
-    vc = v_cache.view(v_cache.shape[0], -1)
-    total = kc.shape[0]
-    maxP = page_table.shape[1]
-    sorted_rows = _fs_sorted_rows(ctx, page_table, seq_pre, bs, total)
-    out = torch.empty((B * L, hq * d), dtype=torch.bfloat16, device=device)
-    alpha = sm_scale * kv_scale * LOG2E
-    gate_col0 = (hq + 2 * hkv) * d
-    if L == 1:
-        S, BN = (256, 64) if B == 1 else (32, 128)
-        P = B * S
-        ws_acc = torch.empty((P * hq, d), dtype=torch.float32, device=device)
-        ws_m = torch.empty((P * hq,), dtype=torch.float32, device=device)
-        ws_l = torch.empty((P * hq,), dtype=torch.float32, device=device)
-        ak._fs_decode[(P,)](
-            qkv, kc, vc,
-            cache_loc, seq_pre, sorted_rows,
-            ws_acc, ws_m, ws_l,
-            qkv.stride(0), total, maxP,
-            alpha, 1.0 / kv_scale, 1.0 / kv_scale, qk_factor,
-            EPS=eps, GROUP=group, HQ=hq, HKV=hkv,
-            S=S, SORTED=True,
-            D=d, BLOCK_M=max(16, triton.next_power_of_2(hq)), BLOCK_N=BN,
-            BLOCK_H=triton.next_power_of_2(hkv),
-            num_warps=4, num_stages=3,
-        )
-        _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, 1, hq, 1, S, d,
-                  gate_col0, kv_scale, eps, device)
-        return out
-    # L == 8, B == 1 verify: prep (q norm -> ws, own k/v -> cache), streamer, merge.
-    LG = L * group
-    S, BN = 128, 128
-    q_ws = torch.empty((B * hkv * LG, d), dtype=torch.bfloat16, device=device)
-    P = B * hkv * S
-    ws_acc = torch.empty((P * LG, d), dtype=torch.float32, device=device)
-    ws_m = torch.empty((P * LG,), dtype=torch.float32, device=device)
-    ws_l = torch.empty((P * LG,), dtype=torch.float32, device=device)
-    br = triton.next_power_of_2(hq + 2 * hkv)
-    ak._sliding_prep[(B * L,)](
-        qkv, q_ws, kc, vc,
-        cache_loc, seq_pre,
-        qkv.stride(0),
-        1.0 / kv_scale, 1.0 / kv_scale, qk_factor, 0.0,
-        EPS=eps,
-        L=L, GROUP=group, HQ=hq, HKV=hkv,
-        GROUP_Q=group, HKV_Q=hkv,
-        HAS_ROPE=False, D=d, BLOCK_R=br, PDL=SW_PDL,
-        num_warps=4 if br <= 64 else 8, num_stages=1, launch_pdl=SW_PDL,
-    )
-    ak._fs_verify[(P,)](
-        q_ws, kc, vc,
-        cache_loc, seq_pre, sorted_rows,
-        ws_acc, ws_m, ws_l,
-        total, maxP,
-        alpha,
-        L=L, GROUP=group, HKV=hkv,
-        S=S, SORTED=True, FP8Q=fp8_pool,
-        D=d, BLOCK_M=max(16, triton.next_power_of_2(LG)), BLOCK_N=BN,
-        BLOCK_L=max(16, triton.next_power_of_2(L)), PDL=SW_PDL,
-        num_warps=4, num_stages=3, launch_pdl=SW_PDL,
-    )
-    _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, hkv, group, L, S, d,
-              gate_col0, kv_scale, eps, device)
-    return out
-
-
-def _fs_merge(ws_acc, ws_m, ws_l, qkv, out, B, hkv_l, group_l, L, S, D,
-              gate_col0, kv_scale, eps, device):
-    """Partials -> gated output: _fs_reduce + _fs_combine when S is large."""
-    LG = L * group_l
-    cm = min(16, max(16, triton.next_power_of_2(LG)))
-    tiles = math.ceil(LG / cm)
-    bh = B * hkv_l
-    SC = 8
-    if S > 32:
-        spp = 16
-        parts = triton.cdiv(S, spp)
-        w2a = torch.empty((bh * parts * LG, D), dtype=torch.float32, device=device)
-        w2m = torch.empty((bh * parts * LG,), dtype=torch.float32, device=device)
-        w2l = torch.empty((bh * parts * LG,), dtype=torch.float32, device=device)
-        ak._fs_reduce[(bh * tiles, parts)](
-            ws_acc, ws_m, ws_l, w2a, w2m, w2l, parts,
-            S=S, SPP=spp, SC=SC, LG=LG, TILES=tiles, D=D, BLOCK_M=cm, PDL=SW_PDL,
-            num_warps=4, num_stages=3, launch_pdl=SW_PDL,
-        )
-        ws_acc, ws_m, ws_l = w2a, w2m, w2l
-        S = parts
-    out_stride = hkv_l * group_l * D
-    ak._fs_combine[(bh * tiles,)](
-        ws_acc, ws_m, ws_l, qkv, out,
-        qkv.stride(0), out_stride, gate_col0, kv_scale,
-        EPS=eps, L=L, GROUP=group_l, HKV=hkv_l, S=S,
-        BLOCK_S=triton.next_power_of_2(S), SC=SC, TILES=tiles,
-        D=D, BLOCK_M=cm, PDL=SW_PDL,
-        num_warps=4, num_stages=3, launch_pdl=SW_PDL,
-    )
