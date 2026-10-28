@@ -14,10 +14,13 @@ import json
 import os
 from typing import List, Optional
 
-_PLACEMENT_PATH = os.path.join(
+# OKC_MOE_PLACEMENT_FILE / OKC_MOE_REPLICA_FILE: other tables of the same form (experiments; unset in serving)
+_PLACEMENT_PATH = os.environ.get("OKC_MOE_PLACEMENT_FILE") or os.path.join(
     os.path.dirname(__file__), "muse_spark_expert_placement.json"
 )
-_REPLICA_PATH = os.path.join(os.path.dirname(__file__), "muse_spark_expert_replicas.json")
+_REPLICA_PATH = os.environ.get("OKC_MOE_REPLICA_FILE") or os.path.join(
+    os.path.dirname(__file__), "muse_spark_expert_replicas.json"
+)
 
 
 @functools.cache

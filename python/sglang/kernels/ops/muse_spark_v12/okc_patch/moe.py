@@ -287,7 +287,7 @@ def local_routes(layer, topk_ids):
     mode = _rep_mode(layer, topk_ids.shape[0])
     if mode == "assign":
         # verify-sized: each active replicated expert to the holder with less work (st passes on the st chain)
-        st = _sw.SW_MOE_ST and topk_ids.shape[0] <= _sw.MOE_ST_MAX_TOKENS
+        st = _sw.MOE_REP_PASSES and _sw.SW_MOE_ST and topk_ids.shape[0] <= _sw.MOE_ST_MAX_TOKENS
         return pg_moe.assign_replicas(topk_ids, layer._okc_rep_table, layer.replica_plan["me"], passes=st)
     if mode == "split":
         # prefill chunks: every expert is active; each replicated expert's routes split to level routed tokens
