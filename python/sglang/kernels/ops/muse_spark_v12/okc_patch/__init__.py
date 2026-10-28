@@ -74,11 +74,14 @@ PFMHA_SLIDING = _flag("OKC_PFMHA_SLIDING", "1")
 PFMHA_SLIDING_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_SLIDING_MIN_TOKENS", "640"))
 PFMHA_RAGGED = _flag("OKC_PFMHA_RAGGED", "1")
 PFMHA_RAGGED_MAX_BS = int(os.environ.get("OKC_PFMHA_RAGGED_MAX_BS", "32"))
+# Every exp2 of the softmax on MUFU ex2.f16x2 (no piecewise-linear exp; the scores stay f16): a cleaner-numerics
+# build of the same kernels, compiled separately when on.
+PFMHA_EXACT = _flag("OKC_PREFILL_FMHA_EXACT", "0")
 
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
-           "PFMHA_RAGGED_MAX_BS",
+           "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]

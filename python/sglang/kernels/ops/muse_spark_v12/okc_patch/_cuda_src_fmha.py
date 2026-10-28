@@ -1,6 +1,7 @@
 """CUDA source of the OKC prefill FMHA (okc_patch/prefill_fmha.py): the prefill lane's fmha7 path, trimmed
 from muse-opt serving/kernels/fmha/wsattn_c4b.py (md5 56ad280c; bank plt_c4b 5db91e12) by mk_src.py:
-pgfa (fmha7 + combine) and skw::gather_kp verbatim, plus three host launchers."""
+pgfa (fmha7 + combine) and skw::gather_kp verbatim, plus three host launchers; -DPFMHA_EXACT=1 selects the
+all-MUFU exp2 OPT pair."""
 
 _CUDA_SRC = r"""
 #include <torch/extension.h>
@@ -1247,6 +1248,13 @@ __global__ void __launch_bounds__(256) gather_kp(
 
 }  // namespace pfg
 
+#if PFMHA_EXACT
+#define PFMHA_OPT4 411043671LL   // nc 4, all-MUFU exp2
+#define PFMHA_OPT3 201328471LL   // nc 3, all-MUFU exp2
+#else
+#define PFMHA_OPT4 4706009687LL
+#define PFMHA_OPT3 4496294487LL
+#endif
 static void pg_fmha4(torch::Tensor q, torch::Tensor kvt, torch::Tensor out, torch::Tensor po, torch::Tensor pml,
                      torch::Tensor lens, torch::Tensor k_scale, torch::Tensor v_scale, double smqk_log2e,
                      int64_t B, int64_t L, int64_t capblks, int64_t S, int64_t win, int64_t nc,
@@ -1261,10 +1269,10 @@ static void pg_fmha4(torch::Tensor q, torch::Tensor kvt, torch::Tensor out, torc
     const int* lp = lens.data_ptr<int>();
     const float *ks = k_scale.data_ptr<float>(), *vsp = v_scale.data_ptr<float>();
     if (nc == 4)
-        pgfa::run_fmha7<4706009687LL>(grid4, st, qp, kp, op, pop, pmp, lp, ks, vsp, (float)smqk_log2e, (int)B, (int)L,
+        pgfa::run_fmha7<PFMHA_OPT4>(grid4, st, qp, kp, op, pop, pmp, lp, ks, vsp, (float)smqk_log2e, (int)B, (int)L,
                                   (int)capblks, (int)S, (int)win, gate, (int)gstride, (float)ng_eps);
     else
-        pgfa::run_fmha7<4496294487LL>(grid3, st, qp, kp, op, pop, pmp, lp, ks, vsp, (float)smqk_log2e, (int)B, (int)L,
+        pgfa::run_fmha7<PFMHA_OPT3>(grid3, st, qp, kp, op, pop, pmp, lp, ks, vsp, (float)smqk_log2e, (int)B, (int)L,
                                   (int)capblks, (int)S, (int)win, gate, (int)gstride, (float)ng_eps);
 }
 

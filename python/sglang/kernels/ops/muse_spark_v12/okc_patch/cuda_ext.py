@@ -100,11 +100,15 @@ void gatherp(torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor kvt, to
 """
 
 
-def fmha_ext():
+def fmha_ext(exact: bool = False):
+    """exact=True: the same kernels with every exp2 on MUFU (-DPFMHA_EXACT=1, its own build)."""
     global _FMHA_EXT
-    if _FMHA_EXT is None:
+    key = bool(exact)
+    if _FMHA_EXT is None or key not in _FMHA_EXT:
         with _lock:
             if _FMHA_EXT is None:
+                _FMHA_EXT = {}
+            if key not in _FMHA_EXT:
                 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
                 from torch.utils.cpp_extension import load_inline
 
@@ -113,8 +117,8 @@ def fmha_ext():
                 )
 
                 # The prefill lane's flags for this module (fmha7's TMA / wgmma PTX needs sm_90a).
-                _FMHA_EXT = load_inline(
-                    name="okc_pfmha_c4b",
+                _FMHA_EXT[key] = load_inline(
+                    name="okc_pfmha_c4b_exact" if key else "okc_pfmha_c4b",
                     cpp_sources=[_FMHA_CPP],
                     cuda_sources=[_CUDA_SRC],
                     functions=["fmha4n_split", "combine", "gatherp"],
@@ -122,7 +126,8 @@ def fmha_ext():
                         "-O3",
                         "--use_fast_math",
                         "-gencode=arch=compute_90a,code=sm_90a",
-                    ],
+                    ]
+                    + (["-DPFMHA_EXACT=1"] if key else []),
                     verbose=False,
                 )
-    return _FMHA_EXT
+    return _FMHA_EXT[key]

@@ -16,7 +16,8 @@ layer's token threshold (OKC_PFMHA_MIN_TOKENS / OKC_PFMHA_SLIDING_MIN_TOKENS) ke
 Kernel (okc_patch/_cuda_src_fmha.py): gather_kp copies the request's paged K/V rows into per (kv head,
 128-key block) 16 KB stage images (zero-filled past the context), fmha7 streams them by TMA into 3 or 4
 consumer warpgroups (f16 QK, lazy-max hybrid exp2, e4m3 P, fp8 PV, tensor-core row sums), split-KV + combine
-when one request's grid under-fills the GPU (pick_cfg below = the bank's pick_cfg4).
+when one request's grid under-fills the GPU (pick_cfg below = the bank's pick_cfg4). OKC_PREFILL_FMHA_EXACT=1 runs
+every exp2 on MUFU (no piecewise-linear exp).
 """
 
 import logging
@@ -26,6 +27,7 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import (
+    PFMHA_EXACT,
     PFMHA_MIN_TOKENS,
     PFMHA_RAGGED,
     PFMHA_RAGGED_MAX_BS,
@@ -153,7 +155,7 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
         return _decline(tokens, threshold)
     # (expanded [bs, hkv] descale views of the layer's [] scale: data_ptr()[0] is that scale)
 
-    ext = fmha_ext()
+    ext = fmha_ext(PFMHA_EXACT)
     win = window_size[0] + 1 if is_swa else 0
     if out is None or out.dtype is not torch.bfloat16 or not out.is_contiguous() or out.numel() != tokens * HQ * D:
         out = torch.empty((tokens, HQ, D), dtype=torch.bfloat16, device=device)
