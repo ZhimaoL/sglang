@@ -44,7 +44,7 @@ _MAX_MATCH_REQS = 16
 # last cached token is re-extended), and a request that does not fit would be chunked.
 _BETWEEN_MARGIN_TOKENS = 64
 # A progress line every this many fold passes.
-_FOLD_LOG_EVERY = 200
+_FOLD_LOG_EVERY = 10
 
 
 class SmallPrefillFirst:
