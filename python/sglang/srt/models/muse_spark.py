@@ -1074,6 +1074,10 @@ class MuseSpark1xMoE(nn.Module):
                 topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
                     None, router_logits, self.top_k, True, want_packed=True
                 )
+        # The SP shard's pre-expert norm does not read the routing: run it under the router's tail.
+        prenormed = okc_patch.SP_PRENORM_EARLY and sp_active and layernorm_sp.okc_hopper_sp() and self._okc_prenorm_shard()
+        if prenormed:
+            expert_input = self.pre_expert_norm(expert_input)
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -1099,7 +1103,7 @@ class MuseSpark1xMoE(nn.Module):
             capturer.capture(layer_id=self.layer_idx, topk_indices=capture_topk_ids)
         if getattr(get_forward(), "sp_active", False):
             return self._forward_sp_experts(
-                expert_input, topk_scores, topk_ids, router_logits
+                expert_input, topk_scores, topk_ids, router_logits, prenormed=prenormed
             )
         if self.nvfp4_checkpoint:
             output = self.experts(
@@ -1125,16 +1129,26 @@ class MuseSpark1xMoE(nn.Module):
             )
         return output
 
+    def _okc_prenorm_shard(self) -> bool:
+        state = getattr(self.experts, "_okc_moe_state", None)
+        return bool(
+            okc_patch.SP_PRENORM_SHARD
+            and self.pre_expert_norm is not None
+            and (not self.nvfp4_checkpoint or (state is not None and state["pg_only"]))
+        )
+
     def _forward_sp_experts(
         self,
         expert_input: torch.Tensor,
         topk_scores: torch.Tensor,
         topk_ids: torch.Tensor,
         router_logits: torch.Tensor,
+        *,
+        prenormed: bool = False,
     ) -> torch.Tensor:
         """Return combined source-token shards, before the nonlinear FFN tail."""
         if layernorm_sp.okc_hopper_sp():
-            return self._forward_gathered_experts(expert_input, topk_scores, topk_ids)
+            return self._forward_gathered_experts(expert_input, topk_scores, topk_ids, prenormed=prenormed)
         if self.pre_expert_norm is not None:
             expert_input = self.pre_expert_norm(expert_input)
         if self.use_megamoe:
@@ -1164,6 +1178,8 @@ class MuseSpark1xMoE(nn.Module):
         expert_input: torch.Tensor,
         topk_scores: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        prenormed: bool = False,
     ) -> torch.Tensor:
         """SP prefill without the A2A dispatcher: every rank runs its local experts on the whole
         sequence, exactly the non-SP EP, and reduce-scatters the partial sums back to the shards.
@@ -1187,13 +1203,8 @@ class MuseSpark1xMoE(nn.Module):
         # The pre-expert RMSNorm is per row: on the shard before the gather it costs 1/tp of normalizing every
         # rank's copy of the whole chunk (16K chunk: 13 vs 85 us per layer), with the same values. pg-only and BF16
         # experts apply it as a plain op; the FlashInfer path fuses it into its input quantization, so it keeps it.
-        state = getattr(self.experts, "_okc_moe_state", None)
-        prenorm_shard = (
-            okc_patch.SP_PRENORM_SHARD
-            and self.pre_expert_norm is not None
-            and (not self.nvfp4_checkpoint or (state is not None and state["pg_only"]))
-        )
-        if prenorm_shard:
+        prenorm_shard = self._okc_prenorm_shard()
+        if prenorm_shard and not prenormed:
             expert_input = self.pre_expert_norm(expert_input)
         grouped = _okc_grouped_gather(tp_group, (expert_input, topk_scores, topk_ids)) if okc_patch.SP_AG_GROUP else None
         if grouped is not None:
