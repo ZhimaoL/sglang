@@ -52,6 +52,7 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN_V3,
     SW_FS,
     SW_WST,
+    WST_ACC16,
     WST_BAL_MIN_BS,
 )
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
@@ -470,8 +471,8 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
               bs, q_len, kv_scale, sm_scale, qk_factor, eps):
     """Full-layer verify on the attention lane's wst kernels (bank v16c_m7g_rlx3 `_full_wst`, wst_cfg 54, no RoPE):
     every CTA builds its e4m3 q fragments from qkv (RMSNorm), the split holding the block's new positions writes their
-    k (RMSNorm) / v rows to the cache before staging them, and the (b, kv head) partials (bf16 O, fp32 m / l) are folded
-    in-kernel with RMSNorm x sigmoid(gate). Splits come from the device-side lengths only (never the table width).
+    k (RMSNorm) / v rows to the cache before staging them, and the (b, kv head) partials (O fp32, bf16 with
+    OKC_WST_ACC16=1; m / l fp32) are folded in-kernel with RMSNorm x sigmoid(gate). Splits come from the device-side lengths only (never the table width).
 
       bs < WST_BAL_MIN_BS: wst_ct14, grid (SMs // bs, bs), uniform split of the batch's longest span, row-sliced
                            K-waiter merge (all CTAs co-resident: SMs // bs * bs <= SMs at 1 CTA / SM).
@@ -495,7 +496,7 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     if st is None:
         nrow = (G + B) * 2 * LG if bal else B * 2 * S * LG   # partial slots: bal c + b, fqbt (b, kv head, split)
         st = _WST_WS[key] = {
-            "acc": torch.empty((nrow, 64), dtype=torch.bfloat16, device=device),
+            "acc": torch.empty((nrow, 64), dtype=torch.bfloat16 if WST_ACC16 else torch.float32, device=device),
             "m": torch.empty((nrow,), dtype=torch.float32, device=device),
             "l": torch.empty((nrow,), dtype=torch.float32, device=device),
             "tick": torch.zeros((2 * B,), dtype=torch.int32, device=device),   # per (b, kv head), +256 per launch

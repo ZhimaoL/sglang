@@ -47,6 +47,8 @@ SW_ATTN_ACC16 = _flag("OKC_SW_ATTN_ACC16", "0")
 # From OKC_WST_BAL_MIN_BS up the tiles are balanced over the batch (wst_ct14b, cooperative launch).
 SW_WST = _flag("OKC_SW_WST", "1")
 WST_BAL_MIN_BS = int(os.environ.get("OKC_WST_BAL_MIN_BS", "17"))
+# Their split-KV O partials: "0" (default) fp32 like FA3; "1" the attention bank's bf16 partials (a separate build).
+WST_ACC16 = _flag("OKC_WST_ACC16", "0")
 # Sequence-parallel prefill on Hopper (layers/layernorm_sp.py okc_hopper_sp): the residual stream, norms, router,
 # pooler and unpooler run on 1/tp of the tokens; the experts see every token through an all-gather and return a
 # reduce-scatter, so the bytes on the wire match the two all-reduces they replace.
@@ -71,5 +73,5 @@ ANY_ATTN = SW_ATTN or SW_FS or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
-           "SW_WST", "WST_BAL_MIN_BS",
+           "SW_WST", "WST_BAL_MIN_BS", "WST_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]
