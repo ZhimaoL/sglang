@@ -475,6 +475,41 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         )
 
+    def _okc_draft_sched(self, forward_batch, q, layer, page_table, cache_seqlens, cu_seqlens_q, max_seqlen_q,
+                         causal, window_size, num_splits, kwargs):
+        """OKC (OKC_SW_DRAFT_FA3_SCHED): the FA3 scheduler metadata of this call, computed once per DFlash draft forward
+        (forward_batch.okc_fa3_sched, set by the draft model) and reused by its other layers, instead of the call's
+        own prepare_varlen_num_blocks per layer. Same arguments as the call derives (max_seqlen_k = the page table's
+        width x page size, no new K), so the schedule and the outputs are the call's own. None = the call computes it."""
+        cache = getattr(forward_batch, "okc_fa3_sched", None)
+        if (cache is None or self._get_scheduler_metadata is None or self.fa_impl_ver != 3 or self.use_mla
+                or self._disable_scheduler_metadata_precompute or set(kwargs) - {"k_descale", "v_descale"}):
+            return None
+        # the schedule reads the lengths and the page table's width, not its entries (SWA layers may translate them)
+        key = (layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, layer.v_head_dim, q.dtype,
+               page_table.shape[1], cache_seqlens.data_ptr(), cu_seqlens_q.data_ptr(), int(max_seqlen_q),
+               bool(causal), tuple(window_size), bool(layer.logit_cap), int(num_splits))
+        sched = cache.get(key)
+        if sched is None:
+            sched = cache[key] = self._get_scheduler_metadata(
+                batch_size=cu_seqlens_q.shape[0] - 1,
+                max_seqlen_q=int(max_seqlen_q),
+                max_seqlen_k=page_table.shape[1] * self.page_size,
+                num_heads=layer.tp_q_head_num,
+                num_heads_k=layer.tp_k_head_num,
+                headdim=layer.head_dim,
+                headdim_v=layer.v_head_dim,
+                cache_seqlens=cache_seqlens,
+                qkv_dtype=q.dtype,
+                cu_seqlens_q=cu_seqlens_q,
+                page_size=self.page_size,
+                causal=bool(causal),
+                window_size=tuple(window_size),
+                has_softcap=bool(layer.logit_cap),
+                num_splits=int(num_splits),
+            )
+        return sched
+
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
@@ -2006,6 +2041,11 @@ class FlashAttentionBackend(AttentionBackend):
                         causal, kwargs, _fa_out,
                     )
                 if result is None:
+                    num_splits = (
+                        1
+                        if metadata.extend_split is not None and is_swa_layer
+                        else self.num_splits
+                    )
                     result = flash_attn_with_kvcache(
                         q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                         k_cache=key_cache,
@@ -2022,13 +2062,13 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn or return_lse,
                         # Ride-along sliding layers: the split heuristic over the riders'
                         # short blocks costs ~+25-40 us per layer; one split is free.
-                        num_splits=(
-                            1
-                            if metadata.extend_split is not None and is_swa_layer
-                            else self.num_splits
-                        ),
+                        num_splits=num_splits,
                         out=_fa_out,
                         ver=self.fa_impl_ver,
+                        scheduler_metadata=self._okc_draft_sched(
+                            forward_batch, q, layer, page_table, cache_seqlens, cu_seqlens_q, max_seqlen_q,
+                            causal and not use_cascade_attn, window_size, num_splits, kwargs,
+                        ),
                         **kwargs,
                     )
 

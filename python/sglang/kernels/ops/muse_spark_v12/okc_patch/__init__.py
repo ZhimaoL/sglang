@@ -189,6 +189,10 @@ DFLASH_FC_SP_MIN_ROWS = int(os.environ.get("OKC_DFLASH_FC_SP_MIN_ROWS", "384"))
 # The same column split for the DFlash grouped convs' kernel_projection (replicated nn.Linear, 2 per draft layer, ~11 us
 # each per verify step); 8-GPU check (session SI vg-micro): slices bit-identical, [3072, 8192] 16.5 -> 10.4 us at m 8.
 SW_DFLASH_CONV_AG = _flag("OKC_SW_DFLASH_CONV_AG", "1")
+# DFlash draft: the grouped conv as one IEEE kernel (bit-identical to the compiled one) and one FA3 scheduler metadata
+# per draft forward for its layers instead of a prepare_varlen_num_blocks per layer (smallt-moe LOG E25)
+SW_DRAFT_CONV = _flag("OKC_SW_DRAFT_CONV", "1")
+SW_DRAFT_FA3_SCHED = _flag("OKC_SW_DRAFT_FA3_SCHED", "1")
 # BF16 expert layers (0 and 61 of the NVFP4 export): local ids by one table lookup and the fused finalize kernel at
 # every token count (the wrapper's torch chain below 32 tokens is 11 launches).
 SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
@@ -275,7 +279,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
-           "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
+           "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_DRAFT_CONV", "SW_DRAFT_FA3_SCHED", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_AR_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",

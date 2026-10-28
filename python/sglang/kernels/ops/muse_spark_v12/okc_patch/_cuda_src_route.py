@@ -1,6 +1,8 @@
 """Fused small-T routing (router.route_small): route_k sums each token's split-K partials in reduce_k<2>'s order, then
 runs routing.cuh's routing_kernel (sigmoid, E 256, top-8) op for op: bit-identical to reduce_launch(FOLD=2) ->
 FusedMuseSparkRouting's JIT kernel (no --use_fast_math, as both). serving/kernels/smallt-moe LOG E23.
+dconv_k: the DFlash draft's grouped 2-tap conv (dflash.DFlashGroupedConv._convolve) with inductor's exact arithmetic
+(fp32 coefficient add, fma(c0, x, c1 * x_prev), one bf16 rounding), 8 channels per thread (LOG E25).
 """
 
 _CUDA_SRC = r"""
@@ -143,6 +145,72 @@ __global__ void __launch_bounds__(64) route_k(const float* __restrict__ P, int T
 }
 
 }  // namespace okcr
+
+namespace okcr {
+// out[t, c] = bf16(fma(b0[c] + d0[t, c / gs], x[t, c], (b1[c] + d1[t, c / gs]) * (t's place in its block >= 1 ? x[t - 1,
+// c] : 0))), in fp32 (inductor's triton_poi for _grouped_conv: add.f32, add.f32, mul.f32, fma.rn.f32, cvt.rn.bf16).
+// d: the side's [T, 2, G] coefficient view (row stride ds, tap stride G); base [2, H]. 8 channels per thread (gs % 8 == 0).
+__global__ void __launch_bounds__(256) dconv_k(const __nv_bfloat16* __restrict__ x, long long xs,
+                                               const __nv_bfloat16* __restrict__ d, long long ds, int G,
+                                               const __nv_bfloat16* __restrict__ base, __nv_bfloat16* __restrict__ out,
+                                               int T, int H, int gs, int bsz, int pdl) {
+  if (pdl) pdl_wait();
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const int nv = H >> 3;
+  if (i >= (long long)T * nv) return;
+  const int t = (int)(i / nv), c = (int)(i - (long long)t * nv) << 3, g = c / gs;
+  const int pos = (bsz & (bsz - 1)) == 0 ? (t & (bsz - 1)) : (t % bsz);
+  const uint4 xv = *reinterpret_cast<const uint4*>(x + t * xs + c);
+  uint4 pv = make_uint4(0u, 0u, 0u, 0u);
+  if (pos >= 1 && t >= 1) pv = *reinterpret_cast<const uint4*>(x + (t - 1) * xs + c);
+  const uint4 b0 = *reinterpret_cast<const uint4*>(base + c), b1 = *reinterpret_cast<const uint4*>(base + H + c);
+  const float d0 = __bfloat162float(d[t * ds + g]), d1 = __bfloat162float(d[t * ds + G + g]);
+  const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+  const __nv_bfloat162* ph = reinterpret_cast<const __nv_bfloat162*>(&pv);
+  const __nv_bfloat162* b0h = reinterpret_cast<const __nv_bfloat162*>(&b0);
+  const __nv_bfloat162* b1h = reinterpret_cast<const __nv_bfloat162*>(&b1);
+  uint4 ov;
+  __nv_bfloat162* oh = reinterpret_cast<__nv_bfloat162*>(&ov);
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const float2 xf = __bfloat1622float2(xh[j]), pf = __bfloat1622float2(ph[j]);
+    const float2 c0 = __bfloat1622float2(b0h[j]), c1 = __bfloat1622float2(b1h[j]);
+    const float p0 = pos >= 1 ? pf.x : 0.0f, p1 = pos >= 1 ? pf.y : 0.0f;
+    const float lo = __fmaf_rn(__fadd_rn(c0.x, d0), xf.x, __fmul_rn(__fadd_rn(c1.x, d1), p0));
+    const float hi = __fmaf_rn(__fadd_rn(c0.y, d0), xf.y, __fmul_rn(__fadd_rn(c1.y, d1), p1));
+    oh[j] = __floats2bfloat162_rn(lo, hi);
+  }
+  *reinterpret_cast<uint4*>(out + (long long)t * H + c) = ov;
+  if (pdl) pdl_trigger();
+}
+}  // namespace okcr
+
+// x [T, H] bf16 (row stride xs), d [T, 2, G] bf16 view of one side's coefficients, base [2, H] bf16 -> out [T, H]
+void dconv(torch::Tensor x, torch::Tensor d, torch::Tensor base, torch::Tensor out, int64_t gs, int64_t bsz,
+           int64_t pdl) {
+  const int T = (int)x.size(0), H = (int)x.size(1), G = (int)d.size(2);
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && d.scalar_type() == at::kBFloat16 && base.scalar_type() == at::kBFloat16 &&
+              x.stride(1) == 1 && x.stride(0) % 8 == 0 && H % 8 == 0 && gs % 8 == 0 && H == G * gs && d.size(1) == 2 &&
+              d.stride(2) == 1 && d.stride(1) == G && base.is_contiguous() && base.numel() == 2 * H &&
+              out.is_contiguous() && out.sizes() == x.sizes() && bsz > 0 &&
+              ((uintptr_t)x.data_ptr() | (uintptr_t)base.data_ptr() | (uintptr_t)out.data_ptr()) % 16 == 0,
+              "okc dconv: bf16 x [T, H], d [T, 2, H / gs], base [2, H], gs % 8 == 0");
+  if (T == 0) return;
+  const unsigned nb = (unsigned)(((long long)T * (H / 8) + 255) / 256);
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(nb);
+  cfg.blockDim = dim3(256u);
+  cfg.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = pdl ? 1 : 0;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, okcr::dconv_k, (const __nv_bfloat16*)x.data_ptr(), (long long)x.stride(0),
+                                    (const __nv_bfloat16*)d.data_ptr(), (long long)d.stride(0), G,
+                                    (const __nv_bfloat16*)base.data_ptr(), (__nv_bfloat16*)out.data_ptr(), T, H,
+                                    (int)gs, (int)bsz, (int)pdl));
+}
 
 // P [SK, T, 256] fp32 split-K partials -> tw [T, 8] fp32, ti / tp [T, 8] int32
 void route(torch::Tensor P, torch::Tensor bias, torch::Tensor tw, torch::Tensor ti, torch::Tensor tp, int64_t T,

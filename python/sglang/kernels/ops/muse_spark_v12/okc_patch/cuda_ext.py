@@ -159,11 +159,12 @@ def route_ext():
 
                 # no --use_fast_math, as reduce_k<2> and the routing kernel
                 _ROUTE_EXT = load_inline(
-                    name="okc_route_c8",
+                    name="okc_route_c9",
                     cpp_sources="void route(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "int64_t, int64_t, double, double, double, int64_t);",
+                    "int64_t, int64_t, double, double, double, int64_t);\nvoid dconv(torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);",
                     cuda_sources=_CUDA_SRC,
-                    functions=["route"],
+                    functions=["route", "dconv"],
                     extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
                     verbose=False,
                 )

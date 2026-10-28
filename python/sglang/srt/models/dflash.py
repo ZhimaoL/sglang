@@ -568,6 +568,22 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size
     return out.flatten(-2)
 
 
+def _okc_conv(x, delta, base, block_size, group_size, taps) -> Optional[torch.Tensor]:
+    """OKC (OKC_SW_DRAFT_CONV): _grouped_conv for 2 taps as one IEEE kernel (okc_patch route_ext dconv), bit-identical
+    to the compiled function's (fp32 add, fma, one bf16 rounding) and ~2x faster; None = declined."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import route_ext
+
+    if (taps != 2 or x.dim() != 2 or group_size % 8 or torch.compiler.is_compiling()
+            or not (x.dtype is delta.dtype is base.dtype is torch.bfloat16)
+            or x.stride(1) != 1 or x.stride(0) % 8 or delta.stride(2) != 1 or delta.stride(1) != delta.shape[2]
+            or not base.is_contiguous() or (x.data_ptr() | base.data_ptr()) % 16):
+        return None
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    route_ext().dconv(x, delta, base, out, group_size, block_size, 1 if SW_PDL else 0)
+    return out
+
+
 class DFlashGroupedConv(nn.Module):
     """Grouped dynamic depthwise K-tap convolution across one DFlash block.
 
@@ -598,6 +614,12 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        if okc_patch.SW_DRAFT_CONV:
+            out = _okc_conv(hidden_states, delta, self.base_kernel[side], self.block_size, self.group_size, self.taps)
+            if out is not None:
+                return out
         # Marked here, not inside: by the time the compiled function traces, the dim
         # is symbolic and the group index costs an integer div and mod per element.
         torch._dynamo.mark_static(hidden_states, 1)
@@ -936,10 +958,20 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
-        for layer in self.layers:
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        # OKC (OKC_SW_DRAFT_FA3_SCHED): the FA3 backend computes its scheduler metadata at the first layer of this
+        # forward and the other layers reuse it (all draft layers share the call's shape and window).
+        if okc_patch.SW_DRAFT_FA3_SCHED:
+            forward_batch.okc_fa3_sched = {}
+        try:
+            for layer in self.layers:
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
+        finally:
+            if okc_patch.SW_DRAFT_FA3_SCHED:
+                forward_batch.okc_fa3_sched = None
 
         if hidden_states.numel() != 0:
             if residual is None:
