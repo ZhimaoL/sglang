@@ -37,7 +37,7 @@ def pg_ext():
                 )
 
                 _PG_EXT = load_inline(
-                    name="okc_pg_moe_c350",
+                    name="okc_pg_moe_c350d3",
                     cpp_sources="void tiles(torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
                     "void gather(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
@@ -73,7 +73,7 @@ def st_ext():
                 )
 
                 _ST_EXT = load_inline(
-                    name="okc_st_moe_c1",
+                    name="okc_st_moe_c2",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, int64_t);",
                     cuda_sources=_CUDA_SRC,

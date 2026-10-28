@@ -3,7 +3,7 @@
 pg's gg1 / gg2 tile tokens 64 wide, so at T <= 64 a round of items costs the n64 wgmma time whatever the token
 count (per-call durations 4 + 16 x ceil(64 n_act / 132) us for gg1 on the 8xH200 traces). st reads the same blocks
 (pg_moe.pack_wsf, no other copy of the weights) with mma.sync m16n8k16, whose A fragment is the layout of one warp's
-16 rows of a pg block, so the decode is pg's (dq8r + 8-bit scale codes) and the math is the same BF16 x BF16 -> fp32:
+16 rows of a pg block, so the decode is pg's (dq3 + 8-bit scale codes) and the math is the same BF16 x BF16 -> fp32:
   * no moe_align / pg_tiles / pg_gather: every CTA builds the call's routing table from local_ids (deterministic, route
     order inside each expert); an expert with c routes runs as ceil(c / 8) passes of <= 8 tokens;
   * each CTA takes an equal contiguous range of 16-row slabs of the active experts; its 16 warps split each slab's K

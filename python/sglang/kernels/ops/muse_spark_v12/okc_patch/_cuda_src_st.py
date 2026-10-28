@@ -1,7 +1,7 @@
 """CUDA source of the st small-T MoE pair (okc_patch/st_moe.py; developed in muse-opt serving/kernels/smallt-moe).
 
 st_gemm<1>: gate/up over the call's active local experts, silu*mul into a bf16 intermediate; st_gemm<2>: down into
-the per-route bf16 rows. Both read pg_moe.pack_wsf's blocks (no other weight copy) and decode them with pg's dq8r and
+the per-route bf16 rows. Both read pg_moe.pack_wsf's blocks (no other weight copy) and decode them with pg's dq3 and
 8-bit scale codes into mma.sync m16n8k16 A fragments (one warp's 16 rows of a pg block are exactly that fragment).
 """
 
@@ -24,7 +24,6 @@ constexpr int ELOC = 32;          // local experts
 constexpr int NUMEL_MAX = 256;    // T <= 32, top-8
 constexpr int VAMAX = 64;         // passes (<= 8 tokens each): <= 32 + numel / 8
 constexpr int R = 4;              // partial ring slots
-constexpr int D = 8;              // weight k-tiles in flight per warp (2 slabs)
 
 DINL unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 DINL void mbar_init(unsigned bar, unsigned count) {
@@ -65,12 +64,12 @@ DINL unsigned ldb32cg(const __nv_bfloat16* p) { // B fragment word of the interm
 DINL __nv_bfloat162 u32b2(unsigned v) { return *reinterpret_cast<__nv_bfloat162*>(&v); }
 DINL unsigned b2u32(__nv_bfloat162 v) { return *reinterpret_cast<unsigned*>(&v); }
 
-// pg's dq8r (pg_moe.pack_wsf bit placement): one u32 of codes -> the 4 A registers as e2m1 x 2^-126 in bf16
-DINL void dq8r(unsigned t, __nv_bfloat162 d[4]) {
+// pg's dq3 (pg_moe.pack_wsf DQ3 bit placement): one u32 of codes -> the 4 A registers as e2m1 x 2^-126 in bf16
+DINL void dq3(unsigned t, __nv_bfloat162 d[4]) {
     d[0] = u32b2(t & 0x81C081C0u);
-    d[1] = u32b2((t << 6) & 0x81C081C0u);
-    d[2] = u32b2(((t << 3) & 0x01C001C0u) | ((t << 5) & 0x80008000u));
-    d[3] = u32b2(((t >> 5) & 0x01C001C0u) | ((t << 1) & 0x80008000u));
+    d[1] = u32b2(__funnelshift_l(t, t, 10) & 0x81C081C0u);
+    d[2] = u32b2(__funnelshift_l(t, t, 13) & 0x81C081C0u);
+    d[3] = u32b2(((t & 0x001B001Bu) * 0x1084u) & 0x81C081C0u);
 }
 
 DINL void mma_bf16(float c[4], const unsigned a[4], unsigned b0, unsigned b1) {
@@ -88,7 +87,7 @@ DINL void ktile(float acc[4], const uint4 w, const uint2 sfp, const unsigned (&b
 #pragma unroll
     for (int q = 0; q < 4; q++) {
         __nv_bfloat162 d[4];
-        dq8r(wq[q], d);
+        dq3(wq[q], d);
         // scale code pair (row r0, row r0 + 8) of k16 step q -> bf16 bits code * 16 + 0x75F0 (pg_moe.pack_wsf)
         const __nv_bfloat162 sf2 = u32b2(__byte_perm(sfw[q >> 1], 0u, (q & 1) ? 0x4342u : 0x4140u) * 16u + 0x75F075F0u);
         const __nv_bfloat162 s0 = __bfloat162bfloat162(__low2bfloat16(sf2));
@@ -158,7 +157,8 @@ DINL void build_tab(const int* __restrict__ ids, int numel, const float* __restr
 // KIND 2: down (W2, 32 w-tiles; B = h rows) -> y[route][row] = acc * 2^8 (pg gg2 math)
 // Work: slabs = 16 weight rows (one warp's piece of a pg block) x full K of the passes, an equal contiguous range per
 // CTA; inside the CTA the 16 warps split each slab's K; their partials meet in a 4-slot smem ring and one warp per slab
-// (slab % 16) sums them in warp order (deterministic) one slab later and runs the epilogue.
+// (slab % 16) sums them in warp order (deterministic) one slab later and runs the epilogue. Each warp keeps one slab
+// (4 k-tiles x 576 B) in flight: the loop is decode-bound, and a second slab in registers measured slower.
 template <int KIND>
 __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restrict__ xin, const char* __restrict__ wsf,
                                                    const float* __restrict__ gs, __nv_bfloat16* __restrict__ out,
@@ -200,16 +200,15 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
     const int lofs = lane * 16, sofs = 4096 + g * 8;
     auto sofs_of = [&](int jl) -> int { return sofs - ((s0 + min(jl, nslab - 1)) & 7) * 448; };
 
-    uint4 wr[D];
-    uint2 sr[D];
-#pragma unroll
-    for (int h = 0; h < 2; h++) {
-        const char* p = slab_ptr(h);
-        const int so = sofs_of(h);
+    uint4 wr[KPW];
+    uint2 sr[KPW];
+    {
+        const char* p = slab_ptr(0);
+        const int so = sofs_of(0);
 #pragma unroll
         for (int i = 0; i < KPW; i++) {
-            wr[4 * h + i] = ldw(p + (size_t)i * WSB + lofs);
-            sr[4 * h + i] = lds8(p + (size_t)i * WSB + so);
+            wr[i] = ldw(p + (size_t)i * WSB + lofs);
+            sr[i] = lds8(p + (size_t)i * WSB + so);
         }
     }
     if (KIND == 2 && pdl) pdl_wait();                  // the intermediate is complete from here on
@@ -279,29 +278,23 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
     };
 
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int j0 = 0; j0 < nslab; j0 += 2) {
+    for (int jl = 0; jl < nslab; jl++) {
+        const int va = (s0 + jl) >> LSPE;
+        if (va != cva) { cva = va; load_b(va); }
+        const char* p = slab_ptr(jl + 1);
+        const int so = sofs_of(jl + 1);
 #pragma unroll
-        for (int h = 0; h < 2; h++) {
-            const int jl = j0 + h;
-            if (jl < nslab) {
-                const int va = (s0 + jl) >> LSPE;
-                if (va != cva) { cva = va; load_b(va); }
-                const char* p = slab_ptr(jl + 2);
-                const int so = sofs_of(jl + 2);
-#pragma unroll
-                for (int i = 0; i < KPW; i++) {
-                    ktile(acc, wr[4 * h + i], sr[4 * h + i], b[i]);
-                    wr[4 * h + i] = ldw(p + (size_t)i * WSB + lofs);     // unconditional refill (clamped slab)
-                    sr[4 * h + i] = lds8(p + (size_t)i * WSB + so);
-                }
-                const int slot = jl % R;
-                if (jl >= R) mbar_wait(emptyb + slot * 8, ((jl / R) - 1) & 1);
-                part[slot][w][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
-                mbar_arrive(fullb + slot * 8);
-                acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
-                if (jl >= 1 && (jl - 1) % NW == w) reduce(jl - 1);
-            }
+        for (int i = 0; i < KPW; i++) {
+            ktile(acc, wr[i], sr[i], b[i]);
+            wr[i] = ldw(p + (size_t)i * WSB + lofs);     // unconditional refill (the last slab re-reads itself)
+            sr[i] = lds8(p + (size_t)i * WSB + so);
         }
+        const int slot = jl % R;
+        if (jl >= R) mbar_wait(emptyb + slot * 8, ((jl / R) - 1) & 1);
+        part[slot][w][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+        mbar_arrive(fullb + slot * 8);
+        acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
+        if (jl >= 1 && (jl - 1) % NW == w) reduce(jl - 1);
     }
     if ((nslab - 1) % NW == w) reduce(nslab - 1);
 }
