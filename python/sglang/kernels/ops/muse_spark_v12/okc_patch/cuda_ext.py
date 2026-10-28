@@ -17,11 +17,6 @@ void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int
                       int64_t k, int64_t MT, int64_t R, int64_t U, int64_t WPC);
 void gemv_router_launch(at::Tensor Wp, at::Tensor X, at::Tensor out, int64_t m, int64_t k,
                         int64_t MT, int64_t SK, int64_t U, int64_t WPC);
-void mma_launch(at::Tensor Wp, at::Tensor X, at::Tensor out, int64_t m, int64_t nout,
-                int64_t k, int64_t MR, int64_t SPLIT, int64_t SK, int64_t WPC, int64_t G);
-void cmma_launch(at::Tensor Wm, at::Tensor We, at::Tensor X, at::Tensor out, int64_t m,
-                 int64_t nout, int64_t k, int64_t MR, int64_t SPLIT, int64_t SK,
-                 int64_t WPC, int64_t EB);
 void reduce_launch(at::Tensor P, at::Tensor out, int64_t m, int64_t nout, int64_t SK,
                    int64_t FOLD);
 void proj_set_pdl(int64_t on);
@@ -107,16 +102,14 @@ def proj_ext():
 
                 # Flags match the certified kernel-track build; the name differs because the router GEMV and
                 # reduce_k<2> changed (a shared name would rebuild over that lane's torch_extensions cache), and
-                # again for the PDL launches (proj_set_pdl).
+                # again for the PDL launches (proj_set_pdl) and once more without the MMA-pack / 13-bit streams.
                 _PROJ_EXT = load_inline(
-                    name="okc_v5_stream_det_pdl",
+                    name="okc_v5_stream_det_pdl_g",
                     cpp_sources=[_PROJ_CPP],
                     cuda_sources=[_CUDA_SRC],
                     functions=[
                         "gemv_bf16_launch",
                         "gemv_router_launch",
-                        "mma_launch",
-                        "cmma_launch",
                         "reduce_launch",
                         "proj_set_pdl",
                     ],
