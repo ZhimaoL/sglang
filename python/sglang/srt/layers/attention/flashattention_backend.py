@@ -1387,6 +1387,75 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
+    def _okc_fused_fp8_kv(self, q, k, v, layer, forward_batch, is_prefill):
+        """OKC (OKC_SW_FA3_FUSED_KV): the FP8 casts of k / v and the paged KV write (set_kv_buffer: two cast launches +
+        store_kvcache) plus the FP8 cast of q that prepare_paged_mha_query does next, as one launch of the
+        fused_fp8_qkv_kv_cache kernel the TRT-LLM backend uses. Same values: unscaled layers only (the pool divides
+        by k_scale, the kernel multiplies by its inverse), round-to-nearest-even E4M3 both ways (the kernel saturates
+        instead of producing NaN above 448). Returns the FP8 q (or q unchanged when the attention keeps it bf16), or
+        None when not applicable (the caller runs set_kv_buffer)."""
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        if (
+            not okc_patch.SW_FA3_FUSED_KV
+            or self.use_mla
+            or self.kv_cache_is_mxfp8
+            or self._kv_shard_pool is not None
+            or layer.is_cross_attention
+            or layer.k_scale is not None
+            or layer.v_scale is not None
+            or k.dtype is not torch.bfloat16
+            or v.dtype is not torch.bfloat16
+            or q is None
+            or q.dtype is not torch.bfloat16
+        ):
+            return None
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        pool = self.token_to_kv_pool
+        is_swa = self.use_sliding_window_kv_pool and pool.layers_mapping[layer.layer_id][1]
+        sub = pool
+        if isinstance(pool, SWAKVPool):
+            sub = pool.swa_kv_pool if is_swa else pool.full_kv_pool
+        # token-major [slot, head, dim] rows written by MHATokenToKVPool's own store (no HND / page-major layouts)
+        if (
+            not isinstance(sub, MHATokenToKVPool)
+            or getattr(sub, "use_hnd", False)
+            or type(sub).set_kv_buffer is not MHATokenToKVPool.set_kv_buffer
+            or type(sub)._store_kv_layer is not MHATokenToKVPool._store_kv_layer
+        ):
+            return None
+        k_cache = pool.get_key_buffer(layer.layer_id)
+        v_cache = pool.get_value_buffer(layer.layer_id)
+        if k_cache.dtype is not torch.float8_e4m3fn or v_cache.dtype is not torch.float8_e4m3fn:
+            return None
+        if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
+            return None
+        loc = forward_batch.out_cache_loc
+        if is_swa:
+            swa_loc = self.forward_metadata.swa_out_cache_loc
+            if swa_loc is None or loc is None or swa_loc.shape[0] < loc.shape[0]:
+                return None
+            loc = swa_loc[: loc.shape[0]]
+        if loc is None or loc.shape[0] != k.shape[0] or k.shape[0] == 0:
+            return None
+        # prepare_paged_mha_query's condition for an FP8 query
+        quant_q = (
+            self.kv_cache_dtype_str != "auto"
+            and layer.head_dim <= 256
+            and (not is_prefill or self.fa_impl_ver != 4)
+        )
+        from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
+
+        ones = getattr(self, "_okc_kv_ones", None)
+        if ones is None or ones.device != k.device:
+            ones = torch.ones(1, dtype=torch.float32, device=k.device)
+            self._okc_kv_ones = ones
+        q_fp8 = fused_fp8_qkv_kv_cache(
+            q if quant_q else None, k, v, k_cache, v_cache, loc, k_scale=ones, v_scale=ones
+        )
+        return q_fp8.view(q.shape) if quant_q else q
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1446,6 +1515,10 @@ class FlashAttentionBackend(AttentionBackend):
                     cp_strategy.materialize_full_kv(
                         forward_batch, layer, k, v, swa_loc=swa_loc
                     )
+                elif (
+                    fused_q := self._okc_fused_fp8_kv(q, k, v, layer, forward_batch, True)
+                ) is not None:
+                    q = fused_q
                 else:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
@@ -1999,7 +2072,11 @@ class FlashAttentionBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if not self.use_mla:
+                if not self.use_mla and (
+                    fused_q := self._okc_fused_fp8_kv(q, k, v, layer, forward_batch, False)
+                ) is not None:
+                    q = fused_q
+                elif not self.use_mla:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
                     self.token_to_kv_pool.set_kv_buffer(

@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.ops.muse_spark_v12.norm_residual import (
+    _cluster_launch_config,
     norm_residual_launch_config,
 )
 
@@ -28,7 +29,30 @@ _VEC = 8
 
 @cache_once
 def _supports_clusters() -> bool:
-    return torch.cuda.get_device_capability()[0] >= 10
+    capability = torch.cuda.get_device_capability()
+    if capability[0] == 9:
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        # OKC: the fused gather + boundary uses sm_90 features only (multimem stores, clusters, DSMEM).
+        return okc_patch.SW_AG_NORM_HOPPER
+    return capability[0] >= 10
+
+
+def _launch_config(hidden_size: int, num_tokens: int) -> tuple[int, int, bool]:
+    """norm_residual_launch_config, with the Hopper cluster rule of norm_residual.fused_norm_residual (VG4:
+    clusters only at M <= 32, capped at OKC_HOPPER_NORM_MAX_CLUSTER)."""
+    config = norm_residual_launch_config(hidden_size=hidden_size, num_tokens=num_tokens)
+    if torch.cuda.get_device_capability()[0] != 9 or config[0] == 1:
+        return config
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    cluster_size = config[0] if num_tokens <= 32 else 1
+    while cluster_size > okc_patch.HOPPER_NORM_MAX_CLUSTER:
+        cluster_size //= 2
+    if cluster_size == config[0]:
+        return config
+    threads, prefetch = _cluster_launch_config(hidden_size, num_tokens, cluster_size)
+    return cluster_size, threads, prefetch
 
 
 @cache_once
@@ -80,10 +104,15 @@ def all_gather_norm_residual_supported(
         return False
     if not _supports_clusters():
         return False
+    if torch.cuda.get_device_capability()[0] == 9:
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        # H200 x8 (session SI vg-micro, us per boundary fused vs separate): cap 16 M 8 / 16 / 32 -0.15 / -0.16 /
+        # -0.85, M 64 +0.45, M 128 -0.87; with the row kernel (cap 1) M 16 / 32 / 64 lose (+0.4 / +1.0 / +0.3).
+        if not ((num_tokens <= 32 and okc_patch.HOPPER_NORM_MAX_CLUSTER > 1) or num_tokens >= 128):
+            return False
     try:
-        cluster_size, _, _ = norm_residual_launch_config(
-            hidden_size=hidden_size, num_tokens=num_tokens
-        )
+        cluster_size, _, _ = _launch_config(hidden_size, num_tokens)
     except RuntimeError:
         return False
     return comm.config.num_push_blocks >= 2 and (
@@ -106,7 +135,7 @@ def all_gather_norm_residual(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return BF16 normalized output and FP32 residual for the gathered branch."""
     num_tokens, hidden_size = stream.shape
-    config = norm_residual_launch_config(hidden_size=hidden_size, num_tokens=num_tokens)
+    config = _launch_config(hidden_size, num_tokens)
     output = torch.empty(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=stream.device
     )

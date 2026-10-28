@@ -199,6 +199,9 @@ def fused_norm_residual(
         if capability[0] == 9 and cluster_size > 1:
             from sglang.kernels.ops.muse_spark_v12 import okc_patch
 
+            # H200 (verify-glue VG4): clusters win at M <= 32 (M 8: 2.9 -> 1.7 / 3.6 -> 1.8 us), C 2 at M 33..64 loses
+            if m > 32:
+                cluster_size = 1
             while cluster_size > okc_patch.HOPPER_NORM_MAX_CLUSTER:
                 cluster_size //= 2
 

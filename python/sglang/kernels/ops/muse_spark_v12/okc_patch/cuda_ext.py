@@ -8,6 +8,7 @@ _lock = threading.Lock()
 _PG_EXT = None
 _PROJ_EXT = None
 _FMHA_EXT = None
+_GLUE_EXT = None
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -23,6 +24,31 @@ void reduce_launch(at::Tensor P, at::Tensor out, int64_t m, int64_t nout, int64_
                    int64_t FOLD);
 void proj_set_pdl(int64_t on);
 """
+
+
+def glue_ext():
+    global _GLUE_EXT
+    if _GLUE_EXT is None:
+        with _lock:
+            if _GLUE_EXT is None:
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_glue import _CUDA_SRC
+
+                ext = load_inline(
+                    name="okc_verify_glue_v1",
+                    cpp_sources="void tail_boundary(torch::Tensor, torch::Tensor, torch::Tensor, double, "
+                    "torch::Tensor, torch::Tensor, torch::Tensor, double, torch::Tensor, torch::Tensor);\n"
+                    "void glue_set_pdl(int64_t);",
+                    cuda_sources=_CUDA_SRC,
+                    functions=["tail_boundary", "glue_set_pdl"],
+                    extra_cuda_cflags=["-O3"],
+                    verbose=False,
+                )
+                ext.glue_set_pdl(1 if SW_PDL else 0)
+                _GLUE_EXT = ext
+    return _GLUE_EXT
 
 
 def pg_ext():
