@@ -45,6 +45,8 @@ if okc_patch.SW_PROJ:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import proj as okc_proj
 if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
+if okc_patch.SW_MOE_OVL:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_moe_ovl as okc_sp_moe_ovl
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
@@ -773,6 +775,10 @@ class MuseSpark1xMoE(nn.Module):
     def _reduce_and_unpool(
         self, output: torch.Tensor, *, already_reduced: bool = False
     ) -> torch.Tensor:
+        if getattr(self, "_okc_ovl_unpooled", False):
+            # The SP MoE pipeline (okc_patch/sp_moe_ovl.py) ran the unpooler per micro-batch.
+            self._okc_ovl_unpooled = False
+            return output
         # Expert TP already reduced across ranks, before its post-expert norm.
         if (
             self.tp_size > 1
@@ -1004,6 +1010,42 @@ class MuseSpark1xMoE(nn.Module):
             )
         tp_group = get_tp_group()
         world = tp_group.world_size
+        state = getattr(self.experts, "_okc_moe_state", None)
+        if (
+            okc_patch.SW_MOE_OVL
+            and self.nvfp4_checkpoint
+            and state is not None
+            and state["pg_only"]
+            and okc_sp_moe_ovl.eligible(expert_input.shape[0], world)
+        ):
+            # The pre-expert norm is per row: run it on the shard, before the gather, instead of on every rank's
+            # copy of the whole chunk.
+            normed = (
+                expert_input
+                if self.pre_expert_norm is None
+                else self.pre_expert_norm(expert_input)
+            )
+            post = None
+            if okc_sp_moe_ovl.UNPOOL and self.post_expert_proj is not None:
+                # SP shards are >= 512 rows, where bf16_gemm_dispatch is F.linear: the same cuBLAS call, with out=.
+                weight = self.post_expert_proj.weight
+                post = (
+                    lambda rows, out: torch.mm(rows, weight.t(), out=out),
+                    weight.shape[0],
+                )
+            shard = okc_sp_moe_ovl.run(
+                tp_group,
+                normed,
+                topk_scores,
+                topk_ids,
+                lambda x, scores, ids: self.experts(
+                    x, scores, ids, self.experts.post_expert_norm
+                ),
+                post=post,
+            )
+            if shard is not None:
+                self._okc_ovl_unpooled = post is not None
+                return shard
 
         def gather(shard: torch.Tensor) -> torch.Tensor:
             shard = shard.contiguous()
