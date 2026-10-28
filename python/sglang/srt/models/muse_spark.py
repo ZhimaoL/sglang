@@ -530,25 +530,31 @@ class MuseSpark1xMLP(nn.Module):
 
 # Diagnostic (never on in serving): OKC_TOPK_DUMP_DIR keeps, on EP rank 0, the top-k ids of every eager forward of
 # <= 256 tokens (run with --disable-decode-cuda-graph so verify steps run eager), per layer and token count, in
-# <dir>/topk_rank0.pt: {T: {layer: int16 [forwards, T, 8]}} (<= 3000 forwards per T). Feeds the EP-placement fit
-# (muse-opt serving/kernels/moe-int/topk_capture_read.py).
+# <dir>/topk_rank0.pt: {T: {layer: int16 [forwards, T, 8]}} (<= 3000 forwards per T; a failed save logs once and turns
+# the capture off). Feeds the EP-placement fit (muse-opt serving/kernels/moe-int/topk_capture_read.py).
 _OKC_TOPK_DUMP_DIR = os.environ.get("OKC_TOPK_DUMP_DIR")
 _okc_topk: dict = {}
 
 
 def _okc_dump_topk(layer_idx: int, topk_ids: torch.Tensor, save: bool) -> None:
+    global _OKC_TOPK_DUMP_DIR
     n = topk_ids.shape[0]
-    if n > 256 or torch.cuda.is_current_stream_capturing():
+    if not (save and _OKC_TOPK_DUMP_DIR) or n > 256 or torch.cuda.is_current_stream_capturing():
         return
     rows = _okc_topk.setdefault(n, {}).setdefault(layer_idx, [])
     if len(rows) >= 3000:
         return
     rows.append(topk_ids.to(torch.int16).cpu())
-    if save and layer_idx == min(_okc_topk[n]) and len(rows) % 50 == 0:
-        out = {t: {li: torch.stack(v) for li, v in d.items()} for t, d in _okc_topk.items()}
-        path = os.path.join(_OKC_TOPK_DUMP_DIR, "topk_rank0.pt")
-        torch.save(out, path + ".tmp")
-        os.replace(path + ".tmp", path)
+    if layer_idx == min(_okc_topk[n]) and len(rows) % 50 == 0:
+        try:  # a diagnostic: a failed save turns the hook off instead of failing the forward
+            out = {t: {li: torch.stack(v) for li, v in d.items()} for t, d in _okc_topk.items()}
+            os.makedirs(_OKC_TOPK_DUMP_DIR, exist_ok=True)
+            path = os.path.join(_OKC_TOPK_DUMP_DIR, "topk_rank0.pt")
+            torch.save(out, path + ".tmp")
+            os.replace(path + ".tmp", path)
+        except Exception as e:
+            logger.warning("OKC_TOPK_DUMP_DIR: save failed (%r); top-k capture off", e)
+            _OKC_TOPK_DUMP_DIR = None
 
 
 class MuseSpark1xMoE(nn.Module):
