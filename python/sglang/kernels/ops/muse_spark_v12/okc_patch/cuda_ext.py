@@ -43,7 +43,7 @@ def pg_ext():
                 # (route, gather_norm), the PDL launch flags, the local-slot align, tiles' local-expert count and the
                 # replica balancers (rep_assign, rep_split) changed the entry points.
                 _PG_EXT = load_inline(
-                    name="okc_pg_moe_c350_int",
+                    name="okc_pg_moe_c350_int_d3",
                     cpp_sources="void align(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, "
                     "int64_t, int64_t);\n"
@@ -104,7 +104,7 @@ def pg_narrow_ext():
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pgn import narrow_source
 
                 _PG_NARROW_EXT = load_inline(
-                    name="okc_pg_moe_n17x128s7_int",
+                    name="okc_pg_moe_n17x128s7_int_d3",
                     cpp_sources=_PG_CPP,
                     cuda_sources=narrow_source(),
                     functions=["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
@@ -133,7 +133,7 @@ def st_ext():
 
                 # The name carries the scale format and the 64-slot table (the lane's okc_st_moe_c1 reads codes).
                 _ST_EXT = load_inline(
-                    name=f"okc_st_moe_c1_s{16 if _st_src.SCALE_BF16 else 8}_e64",
+                    name=f"okc_st_moe_c2_s{16 if _st_src.SCALE_BF16 else 8}_e64",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, int64_t);",
                     cuda_sources=_st_src._CUDA_SRC,

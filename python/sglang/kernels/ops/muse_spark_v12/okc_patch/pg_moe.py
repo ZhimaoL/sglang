@@ -27,15 +27,19 @@ import os as _os
 _CTA_ITEMS = int(_os.environ.get("OKC_PG_CTA_ITEMS", "0"))   # 0 = one CTA per SM
 
 
-# v7 placement of the 8 codes of a weight word (see dq8r): magnitude bits at MAG[s] .. MAG[s] + 2, sign at SGN[s]
-_MAG = (6, 0, 3, 11, 22, 16, 19, 27)    # bf16 placement (see dq8r)
-_SGN = (15, 9, 10, 14, 31, 25, 26, 30)
+# DQ3 placement of the 8 codes of a weight word (see dq3 in _cuda_src_pg.py): code s goes to A register s & 3, half
+# s >> 2; _B3[s & 3][s >> 2] = bit positions of its (magnitude bit 0, 1, 2, sign). Register 0 is in place, 1 / 2 are
+# rotations by 10 / 13, 3 is three shifted copies placed by one IMAD: 8 ops per word (the v7 layout took 11).
+_B3 = (((6, 7, 8, 15), (22, 23, 24, 31)),
+       ((28, 29, 30, 5), (12, 13, 14, 21)),
+       ((25, 26, 27, 2), (9, 10, 11, 18)),
+       ((4, 0, 1, 3), (20, 16, 17, 19)))
 
 
 def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
     """e2m1 codes permuted into the wgmma m64k16 A-fragment order of the 256 consumer threads (gated: row r = gate
-    feature f, row r+8 = up of the same f; the v3 / wg12 order) with each 32-bit word's 8 codes at the v7 bit
-    positions (_MAG / _SGN: 4 bits per weight, same values), merged with the e4m3 scale bytes into one contiguous
+    feature f, row r+8 = up of the same f; the v3 / wg12 order) with each 32-bit word's 8 codes at the DQ3 bit
+    positions (_B3: 4 bits per weight, same values), merged with the e4m3 scale bytes into one contiguous
     4608 B block per (expert, w-tile, k-tile); the scales are stored as (row r, row r + 8) pairs per k16 step in the
     order the consumer threads read them (8 B per thread pair of rows).
     w_u8 [E, R, K/2] uint8, sf_u8 [E, R, K/16] uint8 -> [E, R/128, K/64, 4608] uint8."""
@@ -71,7 +75,8 @@ def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
         u32 = torch.zeros(bidx.shape[0], dtype=torch.int32, device=dev)
         for s in range(8):
             c = nib[:, s].to(torch.int32)
-            u32 |= ((c & 7) << _MAG[s]) | ((c >> 3) << _SGN[s])
+            for i, pos in enumerate(_B3[s & 3][s >> 2]):
+                u32 |= ((c >> i) & 1) << pos
         wm[e] = u32.view(torch.uint8).view(NWT, NKT, 256, 16)
     del bidx, shift
     lr = torch.arange(128, device=dev)
