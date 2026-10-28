@@ -218,8 +218,8 @@ DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
     if (MODE == 0) {
         const char* stp = c.smem + c.sl * SB + (N4 ? c.woff : 0);
         const uint4 w = *reinterpret_cast<const uint4*>(stp + WOFF + c.ctid * 16);
-        // 8-bit codes of the (r0, r1) scale pairs for k16 steps 0..3: bf16(e4m3 * 2^118) has exponent 109..126 and a
-        // 3-bit mantissa, so code = bf16 bits / 16 - 0x360 and each bf16 lane is code * 16 + 0x3600 (exact, pack_wsf).
+        // 8-bit codes of the (r0, r1) scale pairs for k16 steps 0..3: bf16(e4m3 * 2^118) has exponent field 236..253 and
+        // a 3-bit mantissa, so code = bf16 bits / 16 - 0x75F and each bf16 lane is code * 16 + 0x75F0 (exact, pack_wsf).
         const uint2 sfp = *reinterpret_cast<const uint2*>(stp + WOFF + 4096 + c.sfo);
         const unsigned sfw[2] = {sfp.x, sfp.y};
         const unsigned* wq = reinterpret_cast<const unsigned*>(&w);
@@ -227,7 +227,7 @@ DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
         for (int q = 0; q < 4; q++) {
             __nv_bfloat162 d[4];
             dq8r(wq[q], d);
-            const __nv_bfloat162 sf2 = u32b2(__byte_perm(sfw[q >> 1], 0u, (q & 1) ? 0x4342u : 0x4140u) * 16u + 0x36003600u);
+            const __nv_bfloat162 sf2 = u32b2(__byte_perm(sfw[q >> 1], 0u, (q & 1) ? 0x4342u : 0x4140u) * 16u + 0x75F075F0u);
             const __nv_bfloat162 s0 = __bfloat162bfloat162(__low2bfloat16(sf2));
             const __nv_bfloat162 s1 = __bfloat162bfloat162(__high2bfloat16(sf2));
             ab[4 * q + 0] = b2u32(__hmul2(d[0], s0));
