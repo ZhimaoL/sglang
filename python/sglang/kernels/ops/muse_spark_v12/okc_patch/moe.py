@@ -189,12 +189,12 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
             name = "align"
         if pg_moe.block_m(tokens) != pg_moe._BLOCK_M:
             name += "-narrow"
-    if getattr(layer, "_okc_rep_table", None) is not None:
-        # split_replicas is per route: the small front end's per-expert map (route_map) is static above the limit
-        if tokens <= _sw.MOE_REP_MAX_TOKENS:
-            name += "+rep"
-        elif _sw.MOE_REP_PREFILL and not name.startswith("small"):
-            name += "+split"
+    mode = _rep_mode(layer, tokens)
+    # split_replicas is per route: the small front end's per-expert map (route_map) is static above the limit
+    if mode == "assign":
+        name += "+rep"
+    elif mode == "split" and not name.startswith("small"):
+        name += "+split"
     return name
 
 
@@ -246,19 +246,30 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
     return None
 
 
+def _rep_mode(layer, tokens):
+    """The replica balancer a T-token forward uses: "assign" (<= OKC_MOE_REP_MAX_TOKENS), "split" (>=
+    OKC_MOE_REP_SPLIT_MIN_TOKENS: its 3 kernels cost ~9 us per layer, more than they save at ~1K extends), else None
+    (the static home map; replicas idle)."""
+    if getattr(layer, "_okc_rep_table", None) is None:
+        return None
+    if tokens <= _sw.MOE_REP_MAX_TOKENS:
+        return "assign"
+    return "split" if _sw.MOE_REP_PREFILL and tokens >= _sw.MOE_REP_SPLIT_MIN_TOKENS else None
+
+
 def local_routes(layer, topk_ids):
     """[T, 8] global top-k ids -> [T, 8] int32 local expert slots on this rank, -1 where another rank computes the
     route: the static home map, or with hot-expert replicas a per-forward balancer that every rank computes alike from
     the same ids (T and the ids are the same on every rank: a TP batch, or the SP gathered chunk)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
-    rep_table = getattr(layer, "_okc_rep_table", None)
-    if rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
+    mode = _rep_mode(layer, topk_ids.shape[0])
+    if mode == "assign":
         # verify-sized: each active replicated expert to the holder with fewer active experts
-        return pg_moe.assign_replicas(topk_ids, rep_table, layer.replica_plan["me"])
-    if rep_table is not None and _sw.MOE_REP_PREFILL:
-        # prefill-sized: every expert is active; each replicated expert's routes split to level routed tokens
-        return pg_moe.split_replicas(topk_ids, rep_table, layer.replica_plan["me"])
+        return pg_moe.assign_replicas(topk_ids, layer._okc_rep_table, layer.replica_plan["me"])
+    if mode == "split":
+        # prefill chunks: every expert is active; each replicated expert's routes split to level routed tokens
+        return pg_moe.split_replicas(topk_ids, layer._okc_rep_table, layer.replica_plan["me"])
     local_ids = topk_ids.to(torch.int32)
     if layer._expert_map is not None:
         local_ids = layer._expert_map[local_ids]
@@ -300,7 +311,7 @@ def pg_prep(layer, topk_ids):
             and (emap is None or emap.dtype is torch.int32) and layer.num_local_experts <= 64):
         # Large chunks: one count of the routes into the local-slot counters (map and int32 cast folded in)
         # instead of the cast + map gather + 256-expert moe_align / count_and_sort chain; same values downstream.
-        if getattr(layer, "_okc_rep_table", None) is not None:
+        if _rep_mode(layer, topk_ids.shape[0]) is not None:
             return pg_moe.align_local(local_routes(layer, topk_ids), None, layer.num_local_experts, bm)
         return pg_moe.align_local(topk_ids, emap, layer.num_local_experts, bm)
     local_ids = local_routes(layer, topk_ids)
