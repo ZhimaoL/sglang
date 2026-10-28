@@ -72,6 +72,10 @@ if _okc_patch.SW_SMALLM:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import smallm as _okc_smallm
 else:
     _okc_smallm = None
+if _okc_patch.SW_LT:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import lt as _okc_lt
+else:
+    _okc_lt = None
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
@@ -439,6 +443,10 @@ def _bf16_gemm_dispatch_impl(
         okc_out = _okc_smallm.gemm(x, weight)
         if okc_out is not None:
             return okc_out
+    if _okc_lt is not None and bias is None and addend is None:
+        okc_out = _okc_lt.lt_gemm(x, weight)
+        if okc_out is not None:
+            return okc_out
     if _okc_proj is not None and bias is None and addend is None:
         okc_out = _okc_proj.small_m_gemm(x, weight)
         if okc_out is not None:
@@ -627,6 +635,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # The OKC small-m paths also cover the default (non-cutedsl) backend route.
         if _okc_smallm is not None and bias is None and x.is_cuda:
             okc_out = _okc_smallm.gemm(x, layer.weight)
+            if okc_out is not None:
+                return okc_out
+        if _okc_lt is not None and bias is None and x.is_cuda:
+            okc_out = _okc_lt.lt_gemm(x, layer.weight)
             if okc_out is not None:
                 return okc_out
         if _okc_proj is not None and bias is None and x.is_cuda:
