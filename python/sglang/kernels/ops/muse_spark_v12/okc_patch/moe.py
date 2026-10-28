@@ -153,12 +153,56 @@ def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm,
     if not _logged_first_call:
         _logged_first_call = True
         logger.info("OKC pg MoE active (first T=%d).", tokens)
-    small = _small_front(hidden_states, topk_ids, pre_expert_norm)
-    if small is not None:
-        return _moe_pg_small(layer, hidden_states, topk_scores, topk_ids, state, *small)
+    path = dispatch_path(layer, tokens, pre_expert_norm)
+    if path.startswith("small"):
+        small = _small_front(hidden_states, topk_ids, pre_expert_norm)
+        if small is not None:
+            return _moe_pg_small(layer, hidden_states, topk_scores, topk_ids, state, *small)
     if pre_expert_norm is not None:
         hidden_states = pre_expert_norm(hidden_states)
+    if path.startswith("st"):
+        return _moe_st(layer, hidden_states.contiguous(), topk_scores, topk_ids, state)
     return _moe_pg(layer, hidden_states.contiguous(), topk_scores, topk_ids, state)
+
+
+def dispatch_path(layer, tokens, pre_expert_norm=None):
+    """Which chain a pg-only layer runs for a T-token forward (host-side sizes only, so one captured graph bucket has
+    one path): "st" (st_moe pair, T <= OKC_MOE_ST_MAX_TOKENS), "small" (pg_route / pg_gather_norm front end, <= 2048
+    routes), "align" (moe_align_block_size) or "local" (align_local, >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS); "-narrow" when
+    pg runs its narrow build (OKC_PG_NARROW_MIN_T..MAX_T); "+rep" / "+split" with hot-expert replicas (rep_assign at
+    <= OKC_MOE_REP_MAX_TOKENS, split_replicas above). The small front end still declines at run time on a dtype /
+    layout / norm it cannot fold (then the align chain runs)."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+    from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm
+
+    state = layer._okc_moe_state
+    if getattr(_sw, "SW_MOE_ST", False) and state["pg_only"] and tokens <= _sw.MOE_ST_MAX_TOKENS:
+        name = "st"
+    else:
+        small = tokens * layer.top_k <= pg_moe.SMALL_MAX_ROUTES and type(pre_expert_norm) is MuseSpark1xRMSNorm
+        if _sw.SW_PG_SMALL and small:
+            name = "small"
+        elif _sw.PG_LOCAL_ALIGN and tokens >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS and layer.num_local_experts <= 64:
+            name = "local"
+        else:
+            name = "align"
+        if pg_moe.block_m(tokens) != pg_moe._BLOCK_M:
+            name += "-narrow"
+    if getattr(layer, "_okc_rep_table", None) is not None:
+        name += "+rep" if tokens <= _sw.MOE_REP_MAX_TOKENS else ("+split" if _sw.MOE_REP_PREFILL else "")
+    return name
+
+
+def _moe_st(layer, x, topk_scores, topk_ids, state):
+    """The st pair (okc_patch/st_moe.py) on pre-normed x: the same packs read by 8-token mma.sync tiles (no align /
+    tiles / gather)."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import st_moe
+
+    local_ids = local_routes(layer, topk_ids)
+    y = st_moe.grouped_st(
+        x, local_ids, wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.MOE_ST_PDL,
+    )
+    return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
 
 
 def _small_front(hidden_states, topk_ids, pre_expert_norm):
