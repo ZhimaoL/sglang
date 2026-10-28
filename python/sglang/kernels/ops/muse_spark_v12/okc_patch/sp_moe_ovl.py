@@ -38,8 +38,10 @@ STREAMS = int(os.environ.get("OKC_MOE_OVL_STREAMS", "1"))
 # Chunk token range that takes the pipeline (a ~1K extend's collectives are latency-bound: nothing to hide).
 MIN_TOKENS = int(os.environ.get("OKC_MOE_OVL_MIN_TOKENS", "4096"))
 MAX_TOKENS = int(os.environ.get("OKC_MOE_OVL_MAX_TOKENS", "16384"))
-# Run the unpooler per micro-batch inside the pipeline (its first half hides under the last RS push).
+# Run the unpooler per micro-batch inside the pipeline (its first slices hide under the last RS push).
 UNPOOL = os.environ.get("OKC_MOE_OVL_UNPOOL", "1") == "1"
+# Run the pooler per micro-batch inside the pipeline (AG(0) starts after the first slice, beside the router).
+POOLER = os.environ.get("OKC_MOE_OVL_POOLER", "1") == "1"
 TK = 16   # int32 words of top-k per row: 8 fp32 scores (bit patterns) + 8 int32 expert ids
 
 _state = None
@@ -100,23 +102,29 @@ def eligible(num_shard_rows: int, world: int) -> bool:
     return SPLITS >= 1 and MIN_TOKENS <= tokens <= MAX_TOKENS and num_shard_rows >= SPLITS
 
 
-def run(tp_group, x_shard: torch.Tensor, scores: torch.Tensor, ids: torch.Tensor, experts_fn, post=None):
+def run(tp_group, x_shard, scores, ids, experts_fn, post=None, rows=None, routed=None):
     """x_shard [S, H] bf16 (pre-expert-normed), scores [S, 8] fp32, ids [S, 8] int32 -> [S, H] bf16 combined
     expert output of this rank's rows, or None (caller keeps the NCCL path). experts_fn(x, scores, ids) runs the
     local experts on W * m gathered rows and returns their [W * m, H] partial sums. post = (fn, width): fn(rows,
-    out) writes the [m, width] image of each micro-batch's combined rows into out, and run returns [S, width]."""
+    out) writes the [m, width] image of each micro-batch's combined rows into out, and run returns [S, width].
+    Pooler split: x_shard = (producer, S) with producer(a, m) -> the [m, H] normed rows a .. a + m on the current
+    stream (enqueued per micro-batch, so AG(0) starts after a fraction of the pooler); routed = an event after which
+    scores / ids are valid (the router's side stream, not yet joined: the router runs beside the pooler)."""
     global _logged
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
-    S, H = x_shard.shape
-    st = _buffers(tp_group, H, x_shard.device)
+    producer = None
+    if isinstance(x_shard, tuple):
+        producer, S = x_shard
+        H = rows
+    else:
+        S, H = x_shard.shape
+    st = _buffers(tp_group, H, scores.device)
     if st is None or S > st.rows or H != st.hidden:
         return None
     W, me = st.world, st.rank
     k = SPLITS
     off = [(i * S) // k for i in range(k + 1)]
-    x_shard = x_shard.contiguous()
-    tk = torch.cat((scores.float().contiguous().view(torch.int32), ids.to(torch.int32)), dim=1).contiguous()
     order = [(me + j) % W for j in range(1, W + 1)]   # peers first (staggered), own slot last
     cur = torch.cuda.current_stream()
     X = st.streams[0]
@@ -127,6 +135,8 @@ def run(tp_group, x_shard: torch.Tensor, scores: torch.Tensor, ids: torch.Tensor
         """Copy src_rows_of(p) ([m, width] rows meant for peer p) into slot `me` of micro-batch (a, m) of every
         peer's dst_views, on the comm streams; X waits for all of them."""
         base = W * a
+        for s in st.streams[1:]:
+            s.wait_stream(X)
         for j, p in enumerate(order):
             s = st.streams[j % len(st.streams)]
             with torch.cuda.stream(s):
@@ -134,13 +144,26 @@ def run(tp_group, x_shard: torch.Tensor, scores: torch.Tensor, ids: torch.Tensor
         for s in st.streams[1:]:
             X.wait_stream(s)
 
-    ev_ag, ev_rs, outs = [], [], []
+    xs_all, ev_ag, ev_rs, outs = [], [], [], []
+    tk = None
     for i in range(k):
         a, m = off[i], off[i + 1] - off[i]
-        for s in st.streams[1:]:
-            s.wait_stream(X)
-        xs, ts = x_shard[a:a + m].view(-1), tk[a:a + m].view(-1)
+        if producer is None:
+            xs = x_shard[a:a + m]
+        else:
+            xs = producer(a, m)
+            X.wait_stream(cur)
+        xs = xs.contiguous().view(-1)
+        xs_all.append(xs)
         push(st.x, H, lambda p: xs, a, m)
+        if tk is None:
+            # top-k rows of the shard as int32 [S, 16] (fp32 score bits | expert ids), packed on the comm stream
+            # once the router is done (it may still run beside the first pooler slice)
+            if routed is not None:
+                X.wait_event(routed)
+            with torch.cuda.stream(X):
+                tk = torch.cat((scores.float().contiguous().view(torch.int32), ids.to(torch.int32)), dim=1)
+        ts = tk[a:a + m].reshape(-1)
         push(st.tk, TK, lambda p: ts, a, m)
         with torch.cuda.stream(X):
             st.hdl.barrier(channel=0)
@@ -166,8 +189,6 @@ def run(tp_group, x_shard: torch.Tensor, scores: torch.Tensor, ids: torch.Tensor
         ev = torch.cuda.Event()
         ev.record(cur)
         X.wait_event(ev)
-        for s in st.streams[1:]:
-            s.wait_stream(X)
         flat = out.view(W, m * H)
         push(st.rs, H, lambda p: flat[p], a, m)
         with torch.cuda.stream(X):
@@ -176,7 +197,7 @@ def run(tp_group, x_shard: torch.Tensor, scores: torch.Tensor, ids: torch.Tensor
             ev.record(X)
         ev_rs.append(ev)
 
-    result = x_shard.new_empty((S, H if post is None else post[1]))
+    result = torch.empty((S, H if post is None else post[1]), dtype=torch.bfloat16, device=scores.device)
     for i in range(k):
         a, m = off[i], off[i + 1] - off[i]
         base = W * a
@@ -186,10 +207,12 @@ def run(tp_group, x_shard: torch.Tensor, scores: torch.Tensor, ids: torch.Tensor
             torch.sum(slots, dim=0, out=result[a:a + m])
         else:
             post[0](slots.sum(dim=0), result[a:a + m])
-    # every comm-stream op is joined (the last reduce waited for the last barrier); outs / tk / x_shard stay
-    # referenced until here, so their blocks are not handed out while the copy engines still read them.
-    del outs, tk
+    # Every comm-stream op is joined (the last reduce waited for the last barrier, which followed every push and the
+    # router event); outs / tk / the pushed rows stay referenced until here, so their blocks are not handed out
+    # while the copy engines still read them.
+    del outs, tk, xs_all
     if not _logged:
         _logged = True
-        logger.info("OKC SP MoE overlap active: %d-row shard, %d micro-batches.", S, k)
+        logger.info("OKC SP MoE overlap active: %d-row shard, %d micro-batches%s.", S, k,
+                    ", pooler split" if producer is not None else "")
     return result

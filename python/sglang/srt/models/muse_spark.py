@@ -866,8 +866,21 @@ class MuseSpark1xMoE(nn.Module):
         side_stream = self._side_stream() if use_side_stream else None
         if use_side_stream:
             side_stream.wait_stream(main_stream)
+        # OKC SP MoE pipeline with the pooler split per micro-batch: the router goes first on its side stream and is
+        # joined by the pipeline's comm stream, so the pooler slices run beside it and AG(0) starts after the first.
+        ovl_pool = (
+            sp_active
+            and okc_patch.SW_MOE_OVL
+            and use_side_stream
+            and self.pre_expert_proj is not None
+            and okc_sp_moe_ovl.POOLER
+            and get_global_experts_capturer() is None
+            and self._okc_ovl_eligible(hidden_states.shape[0])
+        )
         # nn.Linear bypasses the bf16 GEMM dispatcher.
-        if self.pre_expert_proj is None:
+        if ovl_pool:
+            expert_input = None
+        elif self.pre_expert_proj is None:
             expert_input = hidden_states
         elif _is_cpu:
             expert_input, _ = self.pre_expert_proj(hidden_states)
@@ -909,6 +922,21 @@ class MuseSpark1xMoE(nn.Module):
             topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
                 None, router_logits, self.top_k, True, want_packed=True
             )
+        if ovl_pool:
+            routed = torch.cuda.Event()
+            routed.record(side_stream)
+            weight = self.pre_expert_proj.weight
+
+            def pooled_rows(a: int, m: int) -> torch.Tensor:
+                rows = bf16_gemm_dispatch(hidden_states[a : a + m], weight, None)
+                return rows if self.pre_expert_norm is None else self.pre_expert_norm(rows)
+
+            shard = self._okc_ovl_run(
+                (pooled_rows, hidden_states.shape[0]), topk_scores, topk_ids, routed
+            )
+            if shard is not None:
+                return shard
+            expert_input = bf16_gemm_dispatch(hidden_states, weight, None)
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -992,6 +1020,45 @@ class MuseSpark1xMoE(nn.Module):
         )
         return self.sp_dispatcher.combine(combine_input)
 
+    def _okc_ovl_eligible(self, num_shard_rows: int) -> bool:
+        """The SP MoE section of this layer runs as the copy-engine micro-batch pipeline (okc_patch/sp_moe_ovl.py):
+        pg-only NVFP4 experts under OKC Hopper SP, a chunk in the pipeline's token range. Shape-only: all ranks agree."""
+        state = getattr(self.experts, "_okc_moe_state", None)
+        return (
+            okc_patch.SW_MOE_OVL
+            and self.nvfp4_checkpoint
+            and layernorm_sp.okc_hopper_sp()
+            and state is not None
+            and state["pg_only"]
+            and okc_sp_moe_ovl.eligible(num_shard_rows, get_tp_group().world_size)
+        )
+
+    def _okc_ovl_run(self, x_shard, topk_scores, topk_ids, routed=None):
+        """Run the pipeline on the normed shard (or a (producer, rows) pooler split); None = keep the NCCL path."""
+        post = None
+        if okc_sp_moe_ovl.UNPOOL and self.post_expert_proj is not None:
+            # SP shards are >= 512 rows, where bf16_gemm_dispatch is F.linear: the same cuBLAS call, with out=.
+            weight = self.post_expert_proj.weight
+            post = (
+                lambda rows, out: torch.mm(rows, weight.t(), out=out),
+                weight.shape[0],
+            )
+        shard = okc_sp_moe_ovl.run(
+            get_tp_group(),
+            x_shard,
+            topk_scores,
+            topk_ids,
+            lambda x, scores, ids: self.experts(
+                x, scores, ids, self.experts.post_expert_norm
+            ),
+            post=post,
+            rows=self.expert_hidden_size,
+            routed=routed,
+        )
+        if shard is not None:
+            self._okc_ovl_unpooled = post is not None
+        return shard
+
     def _forward_gathered_experts(
         self,
         expert_input: torch.Tensor,
@@ -1010,14 +1077,7 @@ class MuseSpark1xMoE(nn.Module):
             )
         tp_group = get_tp_group()
         world = tp_group.world_size
-        state = getattr(self.experts, "_okc_moe_state", None)
-        if (
-            okc_patch.SW_MOE_OVL
-            and self.nvfp4_checkpoint
-            and state is not None
-            and state["pg_only"]
-            and okc_sp_moe_ovl.eligible(expert_input.shape[0], world)
-        ):
+        if self._okc_ovl_eligible(expert_input.shape[0]):
             # The pre-expert norm is per row: run it on the shard, before the gather, instead of on every rank's
             # copy of the whole chunk.
             normed = (
@@ -1025,26 +1085,8 @@ class MuseSpark1xMoE(nn.Module):
                 if self.pre_expert_norm is None
                 else self.pre_expert_norm(expert_input)
             )
-            post = None
-            if okc_sp_moe_ovl.UNPOOL and self.post_expert_proj is not None:
-                # SP shards are >= 512 rows, where bf16_gemm_dispatch is F.linear: the same cuBLAS call, with out=.
-                weight = self.post_expert_proj.weight
-                post = (
-                    lambda rows, out: torch.mm(rows, weight.t(), out=out),
-                    weight.shape[0],
-                )
-            shard = okc_sp_moe_ovl.run(
-                tp_group,
-                normed,
-                topk_scores,
-                topk_ids,
-                lambda x, scores, ids: self.experts(
-                    x, scores, ids, self.experts.post_expert_norm
-                ),
-                post=post,
-            )
+            shard = self._okc_ovl_run(normed, topk_scores, topk_ids)
             if shard is not None:
-                self._okc_ovl_unpooled = post is not None
                 return shard
 
         def gather(shard: torch.Tensor) -> torch.Tensor:
