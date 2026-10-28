@@ -86,6 +86,17 @@ DINL void bulk_commit() { asm volatile("cp.async.bulk.commit_group;" ::: "memory
 DINL void bulk_wait_read0() { asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory"); }
 DINL void bulk_wait0() { asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); }
 DINL void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
+// gg1 -> gg2 per-block readiness (early W2): async-proxy stores complete -> proxy fence -> release add; gg2's producer
+// acquires the count, then a proxy fence before its bulk loads read the intermediate
+DINL void ready_release(int* p) {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    asm volatile("red.release.gpu.global.add.u32 [%0], 1;" :: "l"(p) : "memory");
+}
+DINL void ready_acquire(const int* p, int want) {
+    int v;
+    do { asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); } while (v < want);
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+}
 DINL void named_bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 template <int N> DINL void reg_dec() { asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(N)); }
 template <int N> DINL void reg_inc() { asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(N)); }
@@ -261,7 +272,8 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
                                                  int n_global, int numel, int wmask, int nl,
                                                  int* __restrict__ local_ids, int* __restrict__ sorted_ids,
                                                  int* __restrict__ block_experts, int* __restrict__ live,
-                                                 const int* __restrict__ rtab, int n_rep, int me) {
+                                                 const int* __restrict__ rtab, int n_rep, int me,
+                                                 int* __restrict__ ready, int nready) {
     __shared__ int wc[32][RT_E + 1];   // per (warp, slot): count -> base (row pad: the scan reads columns)
     __shared__ int r_tabs[256], r_cnt[256], r_own[256], r_ord[256], r_load[8], r_map[256];
     __shared__ int cnt[RT_E], bstart[RT_E], bexp[RT_NB], ltot[2 * RT_NCLS], nblk;
@@ -377,6 +389,8 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         }
     }
     const int nb = nblk;
+    if (ready)                                          // early W2's per-block counts start at zero every call
+        for (int i = tid; i < nready; i += 1024) ready[i] = 0;
     for (int i = tid; i < nb * XNT; i += 1024) {          // sentinel slots (disjoint from the route slots)
         const int x = bexp[i / XNT];
         if (i - bstart[x] * XNT >= cnt[x]) sorted_ids[i] = numel;
@@ -432,6 +446,8 @@ struct Ctx {
     int ctid, wtid, lw, lane, r0l, r1l, cw, sfo;
     int bar, hf, woff;          // named barrier, row half of the 128-row w-tile (output offsets), W|sf slot offset
     int sl, cph, rsl;
+    int rel;                    // early W2: block of this WG's previous gg1 store, released at the next epilogue
+    int* rdy;                   // early W2 counts (null: off)
 };
 
 // LAG = wgmma groups kept in flight (wait<LAG>; 1 - a 4-bank LAG 2 loop serializes); stage kt-LAG is released
@@ -541,7 +557,14 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
     if (GATED) {
         const float gsc = gsv * 256.0f;                  // 2^8 decode compensation x global scale
         const float hgs = 0.5f * gsc, gus = gsc * gsc * 0.5f;
-        if (wtid == 0) bulk_wait_read0();                // previous item's bulk store finished reading epi
+        if (wtid == 0) {                                 // previous item's bulk store finished reading epi
+            if (c.rdy) {                                 // early W2: ... and writing, then its block count goes up
+                bulk_wait0();
+                if (c.rel >= 0) ready_release(c.rdy + c.rel);
+            } else {
+                bulk_wait_read0();
+            }
+        }
         named_bar_sync(bar, 128);
         // this warpgroup's 32 features = one 64 B row per token (SW64 half-tile, independent of the other WG):
         // stmatrix.trans matrix m of an x4 = i-block 4s+m (tokens 8i..8i+7); lane 8m+j -> token t = 8i+j gets this
@@ -581,6 +604,7 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
         if (wtid == 0) {                                 // the half-tile's first NV token rows are contiguous
             bulk_s2g(reinterpret_cast<char*>(out) + ((size_t)pm * NWT + wt) * XB + cw * (XB / 2), epi, NV * 64);
             bulk_commit();
+            c.rel = pm;
         }
     } else {
         const float sc2 = 256.0f;                        // 2^8 decode comp (bf16 intermediate: no headroom)
@@ -774,7 +798,8 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
     const int* __restrict__ sorted_ids,
     const int* __restrict__ block_experts,
     const int* __restrict__ live,
-    int NWT, int numel, int snake)
+    int NWT, int numel, int snake,
+    int* __restrict__ ready)             // early W2 (null: off): per-block count of finished gg1 half-tiles
 {
     extern __shared__ __align__(1024) char smem[];
     const int tid = threadIdx.x;
@@ -788,7 +813,9 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
         mbar_init(mb + tid * 8, 1);                     // full: producer expect_tx arrival + tx bytes
         mbar_init(mb + NST * 8 + tid * 8, 256);         // empty: every consumer thread arrives
     }
-    pdl_wait();                                         // xg / live / block_experts come from the predecessors
+    // xg / live / block_experts come from the predecessors. Early W2: gg2 starts on the SMs gg1's CTAs leave and waits
+    // per block on gg1's counts instead (route / gather finished before gg1 passed its own wait); it waits at exit.
+    if (GATED || ready == nullptr) pdl_wait();
     pdl_trigger();
     if (SPL && tid == 0) meta[8] = n_wide_entries(live);   // SPL: the 64-wide blocks are pg_n4's
     __syncthreads();                                    // the last CTA-wide barrier
@@ -801,7 +828,7 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
         if (tid == 0) {
             // one thread issues every bulk copy (issuing a stage's copies from 9 lanes in one instruction was
             // measured slower: the TMA unit's per-request cost dominates, not the issuing thread)
-            int sl = 0, rnd = 0;
+            int sl = 0, rnd = 0, rdy_pm = -1;
             int item = sched_item(0, blockIdx.x, gridDim.x, snake);
             // item metadata is fetched one item ahead (live entry, expert, global scale): the loads overlap the
             // current item's 64 stages instead of stalling the ring at the item boundary
@@ -818,6 +845,10 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
                 if (nxt < n_items) ent_n = live[1 + nxt / NWT];
                 int* mt = meta + (j & 1) * 4;           // published before this item's first stage arrives
                 mt[0] = pm; mt[1] = wt; mt[2] = wcode; mt[3] = __float_as_int(gsv);
+                if (!GATED && ready != nullptr && pm != rdy_pm) {   // all NKT gg1 k-tiles of block pm, both halves
+                    ready_acquire(ready + pm, 2 * NKT);
+                    rdy_pm = pm;
+                }
                 const char* xs = xg + (size_t)pm * NKT * XB;
                 const char* ws = wsf + ((size_t)e * NWT + wt) * (size_t)NKT * WSB;
 #ifdef PGN_WSET
@@ -878,6 +909,7 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
                 item = nxt;
             }
         }
+        if (!GATED && ready != nullptr) pdl_wait();
         return;
     }
 
@@ -903,6 +935,8 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
     c.epi = ebase + c.cw * (GATED ? EPI1 : EPI2);
     c.sl = 0; c.cph = 0;                    // consume cursor
     c.rsl = 0;                              // release cursor = oldest consumed, unreleased stage
+    c.rel = -1;
+    c.rdy = ready;
     const int wtid = c.wtid;
     const int* rid_s = reinterpret_cast<const int*>(smem + (rbase - sbase));
 
@@ -944,7 +978,11 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
             item_body<GATED, NST, MODE, 256, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
 #endif  // PGN_WSET
     }
-    if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
+    if (GATED && wtid == 0) {                           // stores complete before the CTA retires its smem
+        bulk_wait0();
+        if (c.rdy && c.rel >= 0) ready_release(c.rdy + c.rel);
+    }
+    if (!GATED && ready != nullptr) pdl_wait();
 }
 
 
@@ -1469,7 +1507,7 @@ void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::
 // runs in the kernel (rep_owner, as pg_rep_assign) and emap is not read; me = this rank.
 void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor rtab, torch::Tensor local_ids,
            torch::Tensor sorted_ids, torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global,
-           int64_t nl, int64_t pdl, int64_t me) {
+           int64_t nl, int64_t pdl, int64_t me, torch::Tensor ready) {
     TORCH_CHECK(numel <= pgk::RT_MAX && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() &&
                 nl >= 1 && nl <= pgk::RT_E, "pg route: int32 ids, at most 24576 routes, 1..64 local slots");
     TORCH_CHECK(sorted_ids.numel() >= (nl + (numel + pgk::XNT - 1) / pgk::XNT) * pgk::XNT &&
@@ -1484,7 +1522,8 @@ void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor rtab, torch
 #else   // PGN_WSET
               (int)numel, 3 /* = _WMASK */, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
 #endif  // PGN_WSET
-              block_experts.data_ptr<int>(), live.data_ptr<int>(), rt, rt ? (int)rtab.numel() - 256 : 0, (int)me);
+              block_experts.data_ptr<int>(), live.data_ptr<int>(), rt, rt ? (int)rtab.numel() - 256 : 0, (int)me,
+              ready.numel() > 0 ? ready.data_ptr<int>() : nullptr, (int)ready.numel());
 }
 
 // SP row gather (pg_ag_rows): x [S, 4096] bf16, sc [S, 8] fp32, ids [S, 8] int32 -> out [world S, 4096], osc, oids;
@@ -1579,7 +1618,7 @@ void gather_norm(torch::Tensor x, torch::Tensor gamma, double eps, torch::Tensor
 template <int GATED, int NST, int MODE, int WSET, int PAIR64 = 1, int SPL = 0>
 static void launch(const torch::Tensor& xg, const torch::Tensor& wsf, const float* gs, void* out,
                    const int* sorted_ids, const torch::Tensor& block_experts, const torch::Tensor& live,
-                   int numel, int grid, int snake, bool pdl) {
+                   int numel, int grid, int snake, bool pdl, int* ready = nullptr) {
     auto fn = pgk::pg_gemm<GATED, NST, MODE, WSET, PAIR64, SPL>;
     constexpr int smem = pgk::smem_bytes<GATED, MODE>(NST);
     static bool set = false;
@@ -1591,7 +1630,7 @@ static void launch(const torch::Tensor& xg, const torch::Tensor& wsf, const floa
     TORCH_CHECK(wsf.size(2) == pgk::NKT && wsf.size(3) == pgk::WSB, "pg: wsf layout");
     pg_launch(fn, dim3(grid > 0 ? grid : pg_num_sms()), dim3(384), smem, pdl,
               reinterpret_cast<const char*>(xg.data_ptr()), reinterpret_cast<const char*>(wsf.data_ptr()),
-              gs, out, sorted_ids, block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, numel, snake);
+              gs, out, sorted_ids, block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, numel, snake, ready);
 }
 
 // snake item order for small calls (few items per CTA): tokens = numel / 8 <= pgk_snake_max_t
@@ -1599,8 +1638,11 @@ static int pgk_snake_max_t = 4096;
 void set_snake_max_t(int64_t t) { pgk_snake_max_t = (int)t; }
 
 // cfg 350 = the bank's shipped configuration (widths 64 / 128 / 256, 5 stages), the only one built here.
+// ready (empty: off): early W2's per-block counts (int32 [blocks], zeroed by route), gg1 adds, gg2 waits on them
 void gg1(torch::Tensor xg, torch::Tensor wsf, torch::Tensor gs, torch::Tensor inter,
-         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl) {
+         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl,
+         torch::Tensor ready) {
+    int* rd = ready.numel() > 0 ? ready.data_ptr<int>() : nullptr;
     TORCH_CHECK(cfg == 350, "pg: only cfg 350 is built");
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
 #ifdef PGN_WSET
@@ -1608,11 +1650,13 @@ void gg1(torch::Tensor xg, torch::Tensor wsf, torch::Tensor gs, torch::Tensor in
 #else   // PGN_WSET
     launch<1, 5, 0, 3>(xg, wsf, gs.data_ptr<float>(), inter.data_ptr(), nullptr, block_experts, live, 0, grid,
 #endif  // PGN_WSET
-                       snake, pdl != 0);
+                       snake, pdl != 0, rd);
 }
 
 void gg2(torch::Tensor xg, torch::Tensor wsf, torch::Tensor y, torch::Tensor sorted_ids,
-         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl) {
+         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl,
+         torch::Tensor ready) {
+    int* rd = ready.numel() > 0 ? ready.data_ptr<int>() : nullptr;
     TORCH_CHECK(cfg == 350, "pg: only cfg 350 is built");
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
 #ifdef PGN_WSET
@@ -1620,7 +1664,7 @@ void gg2(torch::Tensor xg, torch::Tensor wsf, torch::Tensor y, torch::Tensor sor
 #else   // PGN_WSET
     launch<0, 5, 0, 3>(xg, wsf, nullptr, y.data_ptr(), sorted_ids.data_ptr<int>(), block_experts, live,
 #endif  // PGN_WSET
-                       (int)numel, grid, snake, pdl != 0);
+                       (int)numel, grid, snake, pdl != 0, rd);
 }
 """
 

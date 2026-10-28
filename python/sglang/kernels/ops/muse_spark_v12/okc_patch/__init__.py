@@ -154,6 +154,8 @@ SP_PRENORM_EARLY = _flag("OKC_SP_PRENORM_EARLY", "1")
 PG_LOCAL_ALIGN = _flag("OKC_PG_LOCAL_ALIGN", "1")
 # 2049..24576 routes, static map: pg_route in place of the align + pg_tiles (extend E24).
 PG_ROUTE = _flag("OKC_PG_ROUTE", "1")
+# pg_route calls: gg2 starts on the SMs gg1's CTAs leave, per block once gg1 stored its tiles (extend E36).
+PG_EARLY_W2 = _flag("OKC_PG_EARLY_W2", "1")
 # with replicas, pg_route runs the verify balancer itself (rep_owner, the same decision) instead of a pg_rep_assign launch
 PG_ROUTE_REP_FOLD = _flag("OKC_PG_ROUTE_REP_FOLD", "1")
 PG_LOCAL_ALIGN_MIN_TOKENS = int(os.environ.get("OKC_PG_LOCAL_ALIGN_MIN_TOKENS", "1024"))
@@ -285,7 +287,7 @@ ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
            "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
-           "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD",
+           "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_EARLY_W2", "PG_ROUTE_REP_FOLD",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",

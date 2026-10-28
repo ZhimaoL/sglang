@@ -57,8 +57,8 @@ def glue_ext():
 # Host entry points of _cuda_src_pg (both builds): T = torch::Tensor, i = int64_t,
 # d = double.
 _PG_SIG = {"align": "TTTTTTTTTTiiiii", "tiles": "TTTTiiiii", "rep_assign": "TTTTii", "rep_split": "TTTTTTii",
-           "gather": "TTTTii", "route": "TTTTTTTiiiii", "gather_norm": "TTdTTTiii", "gg1": "TTTTTTiiii",
-           "gg2": "TTTTTTiiii", "set_snake_max_t": "i", "ag_rows": "TTTTTTTiiiiii"}
+           "gather": "TTTTii", "route": "TTTTTTTiiiiiT", "gather_norm": "TTdTTTiii", "gg1": "TTTTTTiiiiT",
+           "gg2": "TTTTTTiiiiT", "set_snake_max_t": "i", "ag_rows": "TTTTTTTiiiiii"}
 _ARG = {"T": "torch::Tensor", "i": "int64_t", "d": "double"}
 
 

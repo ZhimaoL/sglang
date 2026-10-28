@@ -16,7 +16,9 @@ replica).
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL
+from sglang.kernels.ops.muse_spark_v12.okc_patch import (
+    PG64_MAX_T, PG_EARLY_W2, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL,
+)
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow64_ext, pg_narrow_ext
 
 _BLOCK_M = 256
@@ -213,9 +215,10 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=
     xg_t = torch.empty((num_pid_m * 64 * bm * 64,), dtype=torch.bfloat16, device=x.device)
     ext.gather(x, xg_t, sorted_ids, live, numel, 0)
     inter_t = torch.empty((num_pid_m * 64 * bm * 64,), dtype=torch.bfloat16, device=x.device)
-    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, grid, 0)
+    none = live.new_empty((0,))
+    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, grid, 0, none)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
-    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid, 0)
+    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid, 0, none)
     return y
 
 
@@ -250,14 +253,16 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     emap = expert_map if expert_map is not None else topk_ids.new_empty((0,))
     n_global = expert_map.shape[0] if expert_map is not None else nl
     rtab, me = rep if rep is not None else (topk_ids.new_empty((0,)), 0)
-    ext.route(topk_ids, emap, rtab, local_ids, sorted_ids, block_experts, live, numel, n_global, nl, p, me)
+    # early W2 (OKC_PG_EARLY_W2): gg2 starts on the SMs gg1 frees, per block once its gg1 tiles are stored
+    rdy = torch.empty((nb,), dtype=torch.int32, device=dev) if PG_EARLY_W2 else live.new_empty((0,))
+    ext.route(topk_ids, emap, rtab, local_ids, sorted_ids, block_experts, live, numel, n_global, nl, p, me, rdy)
     xg_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
     if norm_weight is None:
         ext.gather(x, xg_t, sorted_ids, live, numel, p)
     else:
         ext.gather_norm(x, norm_weight, norm_eps, xg_t, sorted_ids, live, numel, p, PG_GN_SPLIT)
     inter_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
-    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, 0, p)
+    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, 0, p, rdy)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=dev)
-    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0, p)
+    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0, p, rdy)
     return y, local_ids
