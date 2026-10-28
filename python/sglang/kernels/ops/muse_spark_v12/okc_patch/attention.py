@@ -6,7 +6,7 @@ Two env-gated paths, both consuming the FlashAttention backend's per-step metada
   OKC_SW_ATTN  sliding layers at q_len <= 8: the certified 2-launch decode split
                (q_len == 1) or prep + per-head split + combine (q_len 2..8), replacing
                fused QK norm + RoPE + KV store + FA3 + gated output norm.
-  OKC_SW_WST   full layers at q_len 8, bs >= 2: the attention lane's verify-full kernels (wst_ct14 with the
+  OKC_SW_WST   full layers at q_len 8, bs >= OKC_WST_MIN_BS: the attention lane's verify-full kernels (wst_ct14 with the
                row-sliced in-kernel merge, wst_ct14b balanced over the batch from OKC_WST_BAL_MIN_BS up), one
                launch per layer for QK norm + new KV rows + FP8 attention + merge + output norm and gate.
   OKC_SW_FS    full layers: physical-order streaming over counting-sorted rows. The
@@ -24,7 +24,7 @@ during CUDA-graph capture holds for every replay of that graph.
 
 Operating points (kernel court, H200): sliding d1/d16/d32 1.48/1.44/1.45x, v1/v16/v32
 1.25/1.21/1.14x per call; fs full d32 1.203x, v1-full 1.138x. d16-full stays on FA3
-(OKC_FS_SORT_MIN_BS, default 24); verify-full bs > 1 goes to wst (OKC_SW_WST).
+(OKC_FS_SORT_MIN_BS, default 24); verify-full goes to wst (OKC_SW_WST), the fs verify only below OKC_WST_MIN_BS.
 """
 
 import logging
@@ -54,6 +54,7 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_WST,
     WST_ACC16,
     WST_BAL_MIN_BS,
+    WST_MIN_BS,
 )
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
@@ -218,10 +219,9 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
         )
     if theta is not None or backend.page_size != 1:
         return None
-    if q_len == 8 and bs >= 2:
-        # The wst kernels hard-code the TP8 head layout (16 q / 2 kv heads of 64) and read e4m3 cache bytes.
-        if not (SW_WST and is_fp8 and hq == 16 and hkv == 2 and d == 64):
-            return None
+    # The wst kernels hard-code the TP8 head layout (16 q / 2 kv heads of 64) and read e4m3 cache bytes.
+    if (q_len == 8 and bs >= max(1, WST_MIN_BS) and SW_WST and is_fp8 and hq == 16 and hkv == 2 and d == 64
+            and page_table.dtype is torch.int32 and page_table.stride(1) == 1):
         log_once(f"wst_full[q_len={q_len}]", f"(first bs={bs})")
         return _wst_full(
             qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
@@ -478,8 +478,8 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
                            K-waiter merge (all CTAs co-resident: SMs // bs * bs <= SMs at 1 CTA / SM).
       otherwise          : wst_ct14b, SM-count CTAs (cooperative launch), all tiles of the batch balanced over them.
 
-    Workspaces and ticket counters persist per (route, bs): every launch moves each counter by exactly 256 (both
-    routes), so the counters are graph-safe without a reset and wrap harmlessly."""
+    Ticket counters persist per (route, bs): every launch moves each counter by exactly 256 (both routes), so they
+    are graph-safe without a reset and wrap harmlessly. The partial workspace (5.4 MB fp32) is shared."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import wst_ext
 
     device = qkv.device
@@ -491,16 +491,24 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         G = _SMS[dkey] = torch.cuda.get_device_properties(device).multi_processor_count
     bal = B >= WST_BAL_MIN_BS and G <= 256
     S = 0 if bal else G // B
-    key = (bal, B, L, S, dkey)
-    st = _WST_WS.get(key)
-    if st is None:
-        nrow = (G + B) * 2 * LG if bal else B * 2 * S * LG   # partial slots: bal c + b, fqbt (b, kv head, split)
-        st = _WST_WS[key] = {
-            "acc": torch.empty((nrow, 64), dtype=torch.bfloat16 if WST_ACC16 else torch.float32, device=device),
-            "m": torch.empty((nrow,), dtype=torch.float32, device=device),
-            "l": torch.empty((nrow,), dtype=torch.float32, device=device),
-            "tick": torch.zeros((2 * B,), dtype=torch.int32, device=device),   # per (b, kv head), +256 per launch
+    # Partial slots: bal (c + b, kv head), fqbt (b, kv head, split) with S * B <= G. One buffer serves every bs and
+    # graph (all launches are stream-ordered); it is sized for bs 32 up front and never freed, since captured graphs
+    # keep its address.
+    nrow = (G + B) * 2 * LG if bal else B * 2 * S * LG
+    ws = _WST_WS.get(("ws", dkey))
+    if ws is None or ws["acc"].shape[0] < nrow:
+        n = max(nrow, (G + 32) * 2 * LG)
+        ws = {
+            "acc": torch.empty((n, 64), dtype=torch.bfloat16 if WST_ACC16 else torch.float32, device=device),
+            "m": torch.empty((n,), dtype=torch.float32, device=device),
+            "l": torch.empty((n,), dtype=torch.float32, device=device),
         }
+        _WST_WS.setdefault(("all", dkey), []).append(ws)
+        _WST_WS[("ws", dkey)] = ws
+    key = (bal, B, L, S, dkey)
+    tick = _WST_WS.get(key)
+    if tick is None:   # per (b, kv head), +256 per launch
+        tick = _WST_WS[key] = torch.zeros((2 * B,), dtype=torch.int32, device=device)
     skey = ("scale", float(kv_scale), dkey)
     vs = _WST_WS.get(skey)
     if vs is None:
@@ -513,11 +521,11 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     kc, vc = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
     pt_pitch = page_table.stride(0)
     if bal:
-        ext.wst_attn_bal(qkv, kc, vc, page_table, seq_pre, cache_loc, st["acc"], st["m"], st["l"], vs, smqk,
-                         B, L, pt_pitch, G, 0, 3, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, st["tick"], vs)
+        ext.wst_attn_bal(qkv, kc, vc, page_table, seq_pre, cache_loc, ws["acc"], ws["m"], ws["l"], vs, smqk,
+                         B, L, pt_pitch, G, 0, 3, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, tick, vs)
     else:
-        ext.wst_attn_fqbt(qkv, kc, vc, page_table, seq_pre, cache_loc, st["acc"], st["m"], st["l"], vs, smqk,
-                          B, L, pt_pitch, 0, S, 0, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, st["tick"], vs)
+        ext.wst_attn_fqbt(qkv, kc, vc, page_table, seq_pre, cache_loc, ws["acc"], ws["m"], ws["l"], vs, smqk,
+                          B, L, pt_pitch, 0, S, 0, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, tick, vs)
     return out
 
 
