@@ -289,10 +289,25 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         8: config(
             8,
-            graph=(128.0 * KB, 128.0 * KB, 32.00 * MB, Range(_okc_tp8_graph_mc_min(), 128 * MB)),
+            graph=_okc_tp8_graph(),
             eager=(128.0 * KB, 128.0 * KB, 128.0 * MB, Range(0, 128 * MB)),
         ),
     }
+
+
+def _okc_tp8_graph() -> tuple:
+    """OKC (verify-glue): the TP8 graph-mode heuristic. With AR_TP8_GRAPH_2PUSH_MAX_BYTES > 0, every size from 128 KB to
+    that bound runs the lamport 2-shot push (no barriers, no remote loads; 1-shot push stays below 128 KB, unmeasured
+    there). H200 x8, us per all-reduce, heuristic -> 2-shot push at 8 x bs verify rows, both bit-identical to each other
+    (session S8 vg-ar): bs1 5.49 -> 4.49, bs2 6.37 -> 5.08, bs4 8.02 -> 6.06, bs8 11.12 -> 8.79, bs16 16.17 -> 14.70,
+    bs32 (4 MB) 26.65 -> 25.84; 1-shot push loses above 128 KB (bs2 8.74). The push slots grow to 1 MB (bound / 4)."""
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    mc = Range(_okc_tp8_graph_mc_min(), 128 * MB)
+    push2 = okc_patch.AR_TP8_GRAPH_2PUSH_MAX_BYTES
+    if push2 <= 0:
+        return (128.0 * KB, 128.0 * KB, 32.00 * MB, mc)
+    return (128.0 * KB - 16, 128.0 * KB, 32.00 * MB, mc, push2)
 
 
 def _okc_tp8_graph_mc_min() -> int:

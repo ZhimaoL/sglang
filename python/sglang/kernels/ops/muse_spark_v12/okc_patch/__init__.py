@@ -188,6 +188,9 @@ SW_FA3_FUSED_KV = _flag("OKC_SW_FA3_FUSED_KV", "1")
 # TP8 graph-mode all-reduce: multicast 2-shot (copy in / out of the workspace) only from this size; below it the
 # in-place 2-shot pull (configs/custom_all_reduce_v2.py, SI vg-micro). Upstream 524288.
 AR_TP8_GRAPH_MC_MIN_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_MC_MIN_BYTES", str(2 << 20)))
+# TP8 graph-mode all-reduce: the lamport 2-shot push (upstream tunes it on B300 only; SM90 had it off) from 128 KB up to
+# this size (0 = off, the table above). H200 x8, us per AR heuristic -> 2-shot push, bitwise identical (session S8 vg-ar).
+AR_TP8_GRAPH_2PUSH_MAX_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_2PUSH_MAX_BYTES", str(4 << 20)))
 
 # HiCache staged write-back: pages per relayout + DtoH call (upstream 64; pool_host/base.py). At page_size 1 that is
 # tokens: 64 made a 16K-token prefill chunk 256 Python iterations x 3 host pools on the scheduler thread (1,792 CUDA
@@ -223,5 +226,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
-           "AR_TP8_GRAPH_MC_MIN_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "RIDE_ALONG",
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "RIDE_ALONG",
            "ANY_ATTN"]
