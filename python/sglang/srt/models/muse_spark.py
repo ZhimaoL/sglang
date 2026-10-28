@@ -46,6 +46,8 @@ if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
 if okc_patch.SW_AR_NORM:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import ar_norm as okc_ar_norm
+if okc_patch.SW_RS_NORM_FOLD:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_tp_ce as okc_sp_tp_ce
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
@@ -1240,19 +1242,29 @@ class MuseSpark1xDecoderLayer(nn.Module):
             if result is not None:
                 return result
         okc_f = okc_patch.SW_AR_NORM and okc_ar_norm.fused(self, attn_input)
-        attn_output = (okc_f.attn if okc_f else self.self_attn)(positions, attn_input, forward_batch)
+        # OKC rsfold: under SP the o-proj reduce-scatter leaves its slots unsummed for the boundary's norm kernel
+        rs_fold = (okc_patch.SW_RS_NORM_FOLD and not okc_f and get_forward().sp_active
+                   and self._fused_attn_boundary.jit_selected())
+        with okc_sp_tp_ce.defer_slot_sum() if rs_fold else contextlib.nullcontext():
+            attn_output = (okc_f.attn if okc_f else self.self_attn)(positions, attn_input, forward_batch)
+        rs_slots = okc_sp_tp_ce.take_slots(attn_output) if rs_fold else None
         router_dtype = self._router_dtype
         if router_dtype is not None and (
             _use_split_bf16_router(attn_output.shape[0])
             or (okc_patch.SW_ROUTER and attn_output.shape[0] <= okc_router.MAX_TOKENS)
         ):
             router_dtype = None
-        ffn_input, stream, router_input = (okc_f or self._fused_attn_boundary)(
-            stream,
-            attn_output,
-            branch_dtype=self.operator_dtype,
-            router_dtype=router_dtype,
-        )
+        if rs_slots is not None:   # jit_selected(): the call below would take forward_jit
+            ffn_input, stream, router_input = self._fused_attn_boundary.forward_jit(
+                stream, attn_output, branch_dtype=self.operator_dtype, router_dtype=router_dtype,
+                branch_slots=rs_slots)
+        else:
+            ffn_input, stream, router_input = (okc_f or self._fused_attn_boundary)(
+                stream,
+                attn_output,
+                branch_dtype=self.operator_dtype,
+                router_dtype=router_dtype,
+            )
         if self.is_moe_layer:
             ffn_output = self.mlp(ffn_input, router_input, forward_batch)
         else:

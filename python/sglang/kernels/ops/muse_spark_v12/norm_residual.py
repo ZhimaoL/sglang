@@ -117,6 +117,7 @@ def _jit_module(
     prefetch_weights: bool,
     cluster_size: int,
     prefetch_stream: bool = False,
+    slots: int = 0,
 ) -> Module:
     args = make_cpp_args(
         hidden_size,
@@ -126,15 +127,17 @@ def _jit_module(
         cluster_size,
         prefetch_stream,
     )
+    # OKC rsfold: slots > 0 builds the slot-sum branch instantiations as their own module (the plain one is unchanged)
+    tail = f", {slots}" if slots else ""
     return load_jit(
-        "muse_spark_v12_norm_residual",
+        "muse_spark_v12_norm_residual" + (f"_slots{slots}" if slots else ""),
         *args,
         cuda_files=["muse_spark_v12/norm_residual.cuh"],
         cuda_wrappers=[
-            ("run_std", f"MuseSparkNormResidual<{args}, false, false>::run"),
-            ("run_std_router", f"MuseSparkNormResidual<{args}, false, true>::run"),
-            ("run_scale", f"MuseSparkNormResidual<{args}, true, false>::run"),
-            ("run_scale_router", f"MuseSparkNormResidual<{args}, true, true>::run"),
+            ("run_std", f"MuseSparkNormResidual<{args}, false, false{tail}>::run"),
+            ("run_std_router", f"MuseSparkNormResidual<{args}, false, true{tail}>::run"),
+            ("run_scale", f"MuseSparkNormResidual<{args}, true, false{tail}>::run"),
+            ("run_scale_router", f"MuseSparkNormResidual<{args}, true, true{tail}>::run"),
         ],
     )
 
@@ -157,6 +160,7 @@ def fused_norm_residual(
     launch_config: Optional[tuple[int, bool]] = None,
     cluster_size: Optional[int] = None,
     prefetch_stream: bool = False,
+    branch_slots: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Return ``(output, new_stream, router_out)`` for a ``[M, H]`` row batch.
 
@@ -168,6 +172,8 @@ def fused_norm_residual(
     ``(num_threads, prefetch_weights)`` choice, for benchmarking.
     ``prefetch_stream`` (cluster kernel only; OKC): load the stream and the weights before griddepcontrol.wait. Only
     for callers whose predecessor kernel does not write ``stream`` and triggers after its own wait.
+    ``branch_slots`` (OKC rsfold): contiguous bf16 ``[W, M, H]`` whose sum over dim 0 is the branch. The kernel sums
+    them in torch's order (bit-equal to ``branch_slots.sum(dim=0)``) and leaves ``branch`` unwritten.
     """
     assert branch.dtype == torch.bfloat16 and stream.dtype == torch.float32
     assert branch.dim() == 2 and stream.shape == branch.shape
@@ -222,14 +228,21 @@ def fused_norm_residual(
             raise ValueError("launch_config only applies to cluster_size=1")
         if pre_norm_bf16:
             raise ValueError("cluster kernel requires FP32 pre-norm input")
-    module = _jit_module(hidden_size, num_threads, prefetch_weights, cluster_size, prefetch_stream and cluster_size > 1)
+    slots = 0
+    if branch_slots is not None:
+        if cluster_size == 1:
+            slots = branch_slots.shape[0]
+        else:
+            torch.sum(branch_slots, dim=0, out=branch)
+    module = _jit_module(hidden_size, num_threads, prefetch_weights, cluster_size, prefetch_stream and cluster_size > 1,
+                         slots)
     fn = getattr(
         module,
         ("run_scale" if post_norm_is_input_scale else "run_std")
         + ("_router" if want_router else ""),
     )
     fn(
-        branch,
+        branch_slots if slots else branch,
         stream,
         output,
         new_stream_out,

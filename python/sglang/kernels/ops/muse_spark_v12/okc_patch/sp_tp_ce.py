@@ -18,8 +18,12 @@ Buffer reuse across layers is ordered by the data: a peer pushes into my buffers
 collective that needed my contribution made after my reads (o_proj slots: the MoE section and the next AG follow
 my reduce; gather slots: the next o_proj / MoE reduce-scatter follows my qkv GEMMs). The two ops keep separate
 buffers for that reason. Every branch depends only on shapes and switches, so all ranks agree.
+Inside defer_slot_sum() (OKC_SW_RS_NORM_FOLD, the decoder layer around its attention) matmul_rs skips the slot sum and
+returns an unwritten output; take_slots(out) hands the slots to the post-attention norm, which sums them itself in
+torch's order (bit-equal). It reads them where the sum did, before the MoE section, so the reuse order holds.
 """
 
+import contextlib
 import logging
 import os
 
@@ -40,6 +44,31 @@ MAX_TOKENS = int(os.environ.get("OKC_SP_CE_MAX_TOKENS", "16384"))
 _state = None
 _failed = False
 _logged = set()
+# rsfold: whether the next matmul_rs defers its slot sum, and (out, slots) of the one that did
+_defer = False
+_deferred = None
+
+
+@contextlib.contextmanager
+def defer_slot_sum(on: bool = True):
+    global _defer
+    _defer = on
+    try:
+        yield
+    finally:
+        _defer = False
+
+
+def take_slots(out):
+    """The [W, S, N] slots whose dim-0 sum `out` stands for (a deferred matmul_rs output), else None."""
+    global _deferred
+    d, _deferred = _deferred, None
+    if d is None:
+        return None
+    if d[0] is out:
+        return d[1]
+    torch.sum(d[1], dim=0, out=d[0])   # not the caller's tensor: write the sum, nothing reads it unwritten
+    return None
 
 
 class _Buffers:
@@ -128,6 +157,7 @@ def ag_matmul_steps(st, x_shard, weight):
 def matmul_rs_steps(st, x, weight):
     """Generator (yields the stream that needs a barrier; returns [S, N]): x [W*S, K] @ weight [N, K]^T, reduce-scattered
     over the ranks. st: rank, world, o (flat views of every rank's receive buffer), streams."""
+    global _deferred
     M, K = x.shape
     W, me = st.world, st.rank
     S, N = M // W, weight.shape[0]
@@ -157,7 +187,12 @@ def matmul_rs_steps(st, x, weight):
     ev = torch.cuda.Event()
     ev.record(X)
     cur.wait_event(ev)
-    out = st.o[me][:W * S * N].view(W, S, N).sum(dim=0)
+    slots = st.o[me][:W * S * N].view(W, S, N)
+    if _defer:
+        out = torch.empty((S, N), dtype=x.dtype, device=x.device)
+        _deferred = (out, slots)
+    else:
+        out = slots.sum(dim=0)
     # the pushed partials stay referenced until the barrier is joined (the copy engines read them)
     del keep
     return out

@@ -435,11 +435,18 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         branch_dtype: torch.dtype = torch.bfloat16,
         router_dtype: torch.dtype | None = None,
         pre_norm_dtype: torch.dtype | None = None,
+        branch_slots: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Fused JIT CUDA implementation for the BF16/FP32 path."""
+        """Fused JIT CUDA implementation for the BF16/FP32 path.
+
+        ``branch_slots`` (OKC rsfold): ``[W, M, H]`` bf16 whose dim-0 sum is the branch (the o-proj reduce-scatter's
+        slots); ``branch`` is then unwritten and the kernel sums the slots itself, bit-equal to ``.sum(dim=0)``.
+        """
         if branch.numel() == 0 or not self._triton_supported(
             stream, branch, branch_dtype, router_dtype, pre_norm_dtype
         ):
+            if branch_slots is not None:
+                torch.sum(branch_slots, dim=0, out=branch)
             return self.forward_native(
                 stream,
                 branch,
@@ -470,6 +477,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             pre_norm_bf16=pre_norm_dtype is torch.bfloat16,
             # OKC: set by the model on the post-attention boundary only (predecessor = the o-proj all-reduce)
             prefetch_stream=okc_patch.NORM_PREFETCH and getattr(self, "_okc_prefetch_stream", False),
+            branch_slots=branch_slots,
         )
 
     def jit_selected(self) -> bool:

@@ -65,12 +65,53 @@ SGL_DEVICE fp32x2_t round_bf16(fp32x2_t v) {
   return cast<fp32x2_t>(cast<bf16x2_t>(v));
 }
 
+// OKC (rsfold): fp32 add that keeps subnormals whatever the build's -ftz.
+SGL_DEVICE float add_rn(float a, float b) {
+  float r;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
+// OKC (rsfold): torch's x.view(kSlots, M, H).sum(dim=0) of bf16 slots (sp_tp_ce.matmul_rs), bit for bit:
+// thread_reduce_impl's 4 fp32 accumulators from 0 (acc i takes slots i, i+4, ...), combined 0+1, +2, +3, one bf16
+// rounding (serving/kernels/rsfold R2). `slot0` is this row in slot 0; slot w is kSlots rows of stride further.
+template <int kSlots, typename Vec>
+SGL_DEVICE Vec slot_sum(const bf16_t* slot0, int idx, int64_t stride) {
+  Vec in[kSlots];
+#pragma unroll
+  for (int w = 0; w < kSlots; ++w)
+    in[w].load(slot0 + w * stride, idx);
+  Vec out;
+#pragma unroll
+  for (int q = 0; q < kPairs; ++q) {
+    fp32x2_t acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      acc[i] = {0.0f, 0.0f};
+#pragma unroll
+    for (int w = 0; w < kSlots; ++w) {
+      const auto v = cast<fp32x2_t>(in[w][q]);
+      acc[w % 4].x = add_rn(acc[w % 4].x, v.x);
+      acc[w % 4].y = add_rn(acc[w % 4].y, v.y);
+    }
+    fp32x2_t r = acc[0];
+#pragma unroll
+    for (int i = 1; i < 4; ++i) {
+      r.x = add_rn(r.x, acc[i].x);
+      r.y = add_rn(r.y, acc[i].y);
+    }
+    out[q] = cast<bf16x2_t>(r);
+  }
+  return out;
+}
+
 }  // namespace device::norm_residual
 
 // One CTA per row; the row stays in registers across both RMS reductions.
 // `kPrefetchWeights` additionally issues the gate / pre-norm weight loads before
 // the first reduction, so a small-M launch costs one DRAM round trip instead of
 // three; at large M the register cost of that outweighs the latency it hides.
+// `kSlots` (OKC rsfold) > 0: `branch` is [kSlots, num_rows, H], summed per element (slot_sum) as the branch.
 template <
     int64_t kHidden,
     int kNumThreads,
@@ -79,7 +120,8 @@ template <
     bool kPostNormIsInputScale,
     bool kHasRouter,
     bool kPostWeight,
-    bool kGate>
+    bool kGate,
+    int kSlots = 0>
 __global__ void __launch_bounds__(kNumThreads)
     muse_spark_norm_residual_kernel(const __grid_constant__ NormResidualParams params) {
   using namespace device;
@@ -125,7 +167,11 @@ __global__ void __launch_bounds__(kNumThreads)
   for (int p = 0; p < kPacks; ++p) {
     const int idx = threadIdx.x + p * kNumThreads;
     BF16Vec branch_v;
-    branch_v.load(branch, idx);
+    if constexpr (kSlots > 0) {
+      branch_v = slot_sum<kSlots, BF16Vec>(branch, idx, static_cast<int64_t>(params.num_rows) * kHidden);
+    } else {
+      branch_v.load(branch, idx);
+    }
 #pragma unroll
     for (int j = 0; j < kFParts; ++j)
       stream_v[p][j].load(stream, idx * kFParts + j);
@@ -662,9 +708,11 @@ template <
     int kClusterSize,
     bool kPrefetchStream,
     bool kPostNormIsInputScale,
-    bool kHasRouter>
+    bool kHasRouter,
+    int kSlots = 0>
 struct MuseSparkNormResidual {
   static_assert(kClusterSize == 1 || kClusterSize == 2 || kClusterSize == 4 || kClusterSize == 8 || kClusterSize == 16);
+  static_assert(kSlots == 0 || kClusterSize == 1, "the slot-sum branch (OKC rsfold) is on the one-CTA kernel only");
 
   static void
   run(const tvm::ffi::TensorView branch,
@@ -688,7 +736,13 @@ struct MuseSparkNormResidual {
     H.set_value(kHidden);
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({M, H}).with_dtype<bf16_t>().with_device(device_).verify(branch);
+    if constexpr (kSlots > 0) {
+      auto W = SymbolicSize{"num_slots"};
+      W.set_value(kSlots);
+      TensorMatcher({W, M, H}).with_dtype<bf16_t>().with_device(device_).verify(branch);
+    } else {
+      TensorMatcher({M, H}).with_dtype<bf16_t>().with_device(device_).verify(branch);
+    }
     TensorMatcher({M, H}).with_dtype<fp32_t>().with_device(device_).verify(stream);
     TensorMatcher({M, H}).with_dtype<bf16_t>().with_device(device_).verify(output);
     TensorMatcher({M, H}).with_dtype<fp32_t>().with_device(device_).verify(new_stream);
@@ -750,7 +804,8 @@ struct MuseSparkNormResidual {
                     kPostNormIsInputScale,
                     kHasRouter,
                     kHasPostWeight,
-                    kHasGate>,
+                    kHasGate,
+                    kSlots>,
                 params);
       } else {
         constexpr auto kernel = muse_spark_norm_residual_cluster<
