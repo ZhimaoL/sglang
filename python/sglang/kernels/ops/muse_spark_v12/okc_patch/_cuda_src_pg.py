@@ -255,12 +255,19 @@ DINL int route_code(int v, int wmask) {
     return code;
 }
 DINL int route_cls(int i) { return RT_N16 ? (i < 4 ? 15 - 4 * i : 1 - (i - 4)) : RT_FULL - i; }
+// the replica balancer (_cuda_src_rep.py, pasted before pg_rep_assign below)
+template <int NPRE, typename IdT>
+__device__ __forceinline__ void rep_owner(const IdT* __restrict__ ids, int n_routes, const int* __restrict__ tab,
+                                          int n_rep, int passes, int* tabs, int* cnt, int* owner, int* ord, int* load);
+// rtab (the replica table, else null): the map is pg_rep_assign's for these ids (rep_owner, passes 0), built here
 __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_ids, const int* __restrict__ emap,
                                                  int n_global, int numel, int wmask, int nl,
                                                  int* __restrict__ local_ids, int* __restrict__ sorted_ids,
-                                                 int* __restrict__ block_experts, int* __restrict__ live) {
+                                                 int* __restrict__ block_experts, int* __restrict__ live,
+                                                 const int* __restrict__ rtab, int n_rep, int me) {
     __shared__ int wc[32][RT_E + 1];   // per (warp, slot): count -> base (row pad: the scan reads columns)
     __shared__ int cnt[RT_E], bstart[RT_E], bexp[RT_NB], ltot[2 * RT_NCLS], nblk;
+    __shared__ int rtabs[256], rmap[256], rown[256], rord[256], rload[8];
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const unsigned lt = (1u << lane) - 1u;
     wc[w][lane] = 0;
@@ -268,6 +275,11 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
     __syncwarp();
     pdl_wait();
     pdl_trigger();
+    if (rtab) {
+        rep_owner<2>(topk_ids, numel, rtab, n_rep, 0, rtabs, rmap, rown, rord, rload);
+        if (tid < 256) rmap[tid] = rown[tid] == me && (rtabs[tid] & 0xFF) != 0xFF ? rtabs[tid] & 0xFF : -1;
+        __syncthreads();
+    }
     const int ng = (numel + 1023) / 1024;   // 32-route groups per warp
     const int r0 = w * ng * 32;
     int er[RT_G];
@@ -277,7 +289,7 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         int e = -1;
         if (k < ng && r < numel) {
             const int g = topk_ids[r];
-            if ((unsigned)g < (unsigned)n_global) e = emap ? emap[g] : g;
+            if ((unsigned)g < (unsigned)n_global) e = rtab ? rmap[g] : emap ? emap[g] : g;
             if ((unsigned)e >= (unsigned)nl) e = -1;
             local_ids[r] = e;
         }
@@ -1244,11 +1256,14 @@ void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::
 // an empty tensor (ids already local); outputs local_ids [T * 8], sorted_ids [nb_max * 256], block_experts
 // [nb_max], live [nb_max + 1] with nb_max = 32 + ceil(numel / 256).
 void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, torch::Tensor sorted_ids,
-           torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global, int64_t nl, int64_t pdl) {
+           torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global, int64_t nl, int64_t pdl,
+           torch::Tensor tab, int64_t me) {
     TORCH_CHECK(numel <= pgk::RT_MAX && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() &&
                 nl >= 1 && nl <= pgk::RT_E, "pg route: int32 ids, at most 24576 routes, 1..64 local slots");
     TORCH_CHECK(sorted_ids.numel() >= (nl + (numel + pgk::XNT - 1) / pgk::XNT) * pgk::XNT &&
                 live.numel() >= nl + (numel + pgk::XNT - 1) / pgk::XNT + 1, "pg route: output sizes");
+    TORCH_CHECK(tab.numel() == 0 || (tab.scalar_type() == at::kInt && tab.numel() >= 256 && n_global == 256 && me >= 0 &&
+                                     me < 8), "pg route: int32 replica table [256 + n_rep], 256 global ids, rank < 8");
     const int* em = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
     pg_launch(pgk::pg_route, dim3(1), dim3(1024), 0, pdl != 0, topk_ids.data_ptr<int>(), em, (int)n_global,
 #ifdef PGN_WSET
@@ -1256,7 +1271,8 @@ void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, 
 #else   // PGN_WSET
               (int)numel, 3 /* = _WMASK */, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
 #endif  // PGN_WSET
-              block_experts.data_ptr<int>(), live.data_ptr<int>());
+              block_experts.data_ptr<int>(), live.data_ptr<int>(), tab.numel() > 0 ? tab.data_ptr<int>() : nullptr,
+              tab.numel() > 0 ? (int)tab.size(0) - 256 : 0, (int)me);
 }
 
 // Large-T front end: ids [numel] int32 / int64 global ids (emap [n_global] int32, global -> local slot) or local slot ids

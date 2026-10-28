@@ -347,8 +347,11 @@ def route_map(layer, topk_ids):
 def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps, pdl=True):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
+    # the balancer's map inside pg_route (OKC_PG_ROUTE_REP): rep_owner on the same ids, passes 0 as route_map's
+    rep = (layer._okc_rep_table, layer.replica_plan["me"]) if (
+        _sw.PG_ROUTE_REP and _rep_mode(layer, topk_ids.shape[0]) == "assign" and topk_ids.dtype is torch.int32) else None
     y, local_ids = pg_moe.grouped_pg_small(
-        x, topk_ids, route_map(layer, topk_ids),
+        x, topk_ids, None if rep else route_map(layer, topk_ids), rep=rep,
         norm_weight=norm_weight, norm_eps=norm_eps,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=pdl and _sw.SW_PDL,
         bm=pg_moe.block_m(x.shape[0]),
