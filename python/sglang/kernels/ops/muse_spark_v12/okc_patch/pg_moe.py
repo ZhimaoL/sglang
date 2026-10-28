@@ -16,8 +16,8 @@ replica).
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import PG_NARROW_MAX_T, PG_NARROW_MIN_T
-from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow_ext
+from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_NARROW_MAX_T, PG_NARROW_MIN_T
+from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow64_ext, pg_narrow_ext
 
 _BLOCK_M = 256
 _CFG = 350        # the bank's shipped pg configuration (widths 64 / 128 / 256, 5 stages)
@@ -101,9 +101,16 @@ def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
 
 
 def block_m(num_tokens: int) -> int:
-    """moe_align block size for a call of num_tokens tokens: 128 on the narrow build's range, else 256. A host-side
-    size only, so a captured graph's dispatch is fixed per token bucket."""
-    return 128 if PG_NARROW_MIN_T <= num_tokens <= PG_NARROW_MAX_T else _BLOCK_M
+    """moe_align block size for a call of num_tokens tokens: 64 up to OKC_PG64_MAX_T and 128 above it on the narrow
+    build's range, else 256. A host-side size only, so a captured graph's dispatch is fixed per token bucket."""
+    if PG_NARROW_MIN_T <= num_tokens <= PG_NARROW_MAX_T:
+        return 64 if num_tokens <= PG64_MAX_T else 128
+    return _BLOCK_M
+
+
+def _ext(bm: int):
+    """The pg build for token block bm (256 shipped, 128 / 64 the narrow instances)."""
+    return pg_ext() if bm == _BLOCK_M else pg_narrow_ext() if bm == 128 else pg_narrow64_ext()
 
 
 def align_local(ids, expert_map=None, n_local=32, block_m=_BLOCK_M):
@@ -178,7 +185,7 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=
     num_tokens = x.shape[0]
     numel = num_tokens * 8
     num_pid_m = block_experts.shape[0]
-    ext = pg_narrow_ext() if bm != _BLOCK_M else pg_ext()
+    ext = _ext(bm)
     live = torch.empty((num_pid_m + 1,), dtype=torch.int32, device=x.device)
     ext.tiles(block_experts, n_padded, sorted_ids, live, num_pid_m, bm, numel, _WMASK, wsf13.shape[0])
     # Persistent grid: 0 = one CTA per SM (the bank's default). Capping the CTAs trades cross-item
@@ -214,7 +221,7 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     nl = wsf13.shape[0]
     nb = nl + (numel + bm - 1) // bm
     dev = x.device
-    ext = pg_narrow_ext() if bm != _BLOCK_M else pg_ext()
+    ext = _ext(bm)
     p = 1 if pdl else 0
     local_ids = torch.empty((num_tokens, 8), dtype=torch.int32, device=dev)
     sorted_ids = torch.empty((nb * bm,), dtype=torch.int32, device=dev)

@@ -11,7 +11,9 @@ Weights stay packed NVFP4 (pack_wsf in pg_moe.py: e2m1 codes reordered, e4m3 blo
 exactly as bf16) and are decoded in registers.
 
 Narrow build (cuda_ext.pg_narrow_ext, -DPGN_WSET=17 -DPGN_NST=7: the #ifdef PGN_WSET blocks) for verify steps and
-follow-up extends. At mid T most local experts get few tokens (rank 0 at T 1024: p10 / p50 / p90 = 2 / 16 / 96) and a
+follow-up extends; -DPGN_XNT=64 -DPGN_WSET=24 (cuda_ext.pg_narrow64_ext) is the same build on 64-token blocks with widths
+16 / 32 / 64 for verify T up to OKC_PG64_MAX_T (bs 17-32: most active experts hold <= 64 tokens and the 17-32-token
+ones get n32 items instead of n64). At mid T most local experts get few tokens (rank 0 at T 1024: p10 / p50 / p90 = 2 / 16 / 96) and a
 pg item costs about the same whatever share of its token columns is real, so it runs 128-token blocks (XNT 128) with
 item widths 16 / 64 / 128 (PGN_WSET 17; ptxas serializes the wgmmas beyond three width loops, C7512) and PGN_NST = 7
 ring slots (the 16 KB X stage). Same weights and accumulation per output element: real tokens' outputs are
@@ -136,7 +138,10 @@ DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, un
 #ifdef PGN_WSET
 @@WGMMA_N@@
 // ------------------------------------------------------------------ geometry
-constexpr int XNT = 128;                 // tokens per block (narrow build: the widest item)
+#ifndef PGN_XNT
+#define PGN_XNT 128
+#endif
+constexpr int XNT = PGN_XNT;             // tokens per block (narrow build: the widest item)
 #else   // PGN_WSET
 // ------------------------------------------------------------------ geometry
 constexpr int XNT = 256;                 // tokens per tile (wgmma n)
@@ -192,7 +197,7 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
             const int pm = base + tid;
             const bool live_blk = pm < npm && (unsigned)block_experts[pm] < (unsigned)nle;
 #ifdef PGN_WSET
-            int code = 7;
+            int code = XNT / 16 - 1;             // a full block
             if (live_blk && bm == XNT) {
                 const int* sid = sorted_ids + (size_t)pm * XNT;
                 if ((wmask & 1) && sid[64] >= numel) code = 3;
@@ -233,8 +238,8 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
 constexpr int RT_MAX = 2048, RT_E = 64, RT_NB = RT_E + RT_MAX / XNT;
 // width code of a block with v routes (pg_tiles' rule) and the live classes, widest first; the narrow build
 // (_cuda_src_pgn, the XNT 128 one) codes widths in 16-token steps
-constexpr bool RT_N16 = XNT == 128;
-constexpr int RT_NCLS = RT_N16 ? 6 : 4, RT_FULL = RT_N16 ? 7 : 3;
+constexpr bool RT_N16 = XNT <= 128;
+constexpr int RT_NCLS = RT_N16 ? 6 : 4, RT_FULL = RT_N16 ? XNT / 16 - 1 : 3;
 DINL int route_code(int v, int wmask) {
     int code = RT_FULL;
     if (RT_N16) {
