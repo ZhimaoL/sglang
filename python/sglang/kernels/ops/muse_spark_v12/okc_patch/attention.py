@@ -45,6 +45,7 @@ def log_once(path: str, detail: str = "") -> None:
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN,
+    SW_ATTN_ACC16,
     SW_ATTN_V3,
     SW_FS,
     SW_PREFILL_FMHA,
@@ -285,8 +286,10 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
                 sm_scale, qk_factor, eps):
     """attn-v3 fused sliding: single-launch decode (_sl_decode_f) or prep +
     split-with-tail verify (_sl_verify_f2); the last-arriver program folds the
-    combine, output RMSNorm and sigmoid gate into the same launch."""
+    combine, output RMSNorm and sigmoid gate into the same launch. Split-KV partials
+    are fp32 unless OKC_SW_ATTN_ACC16=1 (bf16 partials, the combine still in fp32)."""
     device = qkv.device
+    acc_dtype = torch.bfloat16 if SW_ATTN_ACC16 else torch.float32
     B, L = bs, q_len
     group = hq // hkv
     kc = k_cache.view(k_cache.shape[0], -1)
@@ -300,7 +303,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         S = max(1, min(math.ceil(window / BN), math.ceil(256 / B), 16))
         chunk = BN * math.ceil(window / (S * BN))
         P = B * S
-        ws_acc = torch.empty((P * hq, d), dtype=torch.bfloat16, device=device)
+        ws_acc = torch.empty((P * hq, d), dtype=acc_dtype, device=device)
         ws_m = torch.empty((P * hq,), dtype=torch.float32, device=device)
         ws_l = torch.empty((P * hq,), dtype=torch.float32, device=device)
         counter = _counter("sd", B, S, device)
@@ -314,7 +317,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             EPS=eps,
             GROUP=group, HQ=hq, HKV=hkv,
             WINDOW=window, PAGE=page_size, HAS_ROPE=bool(theta),
-            S=S, CHUNK=chunk, SC=sc, ACC16=True,
+            S=S, CHUNK=chunk, SC=sc, ACC16=SW_ATTN_ACC16,
             D=d,
             BLOCK_M=max(16, triton.next_power_of_2(hq)),
             BLOCK_N=BN,
@@ -330,7 +333,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     LG = L * group
     P = B * hkv * S
     q_ws = torch.empty((B * hkv * LG, d), dtype=torch.bfloat16, device=device)
-    ws_acc = torch.empty((P * LG, d), dtype=torch.bfloat16, device=device)
+    ws_acc = torch.empty((P * LG, d), dtype=acc_dtype, device=device)
     ws_m = torch.empty((P * LG,), dtype=torch.float32, device=device)
     ws_l = torch.empty((P * LG,), dtype=torch.float32, device=device)
     counter = _counter("sv", B * hkv, S, device)
@@ -356,7 +359,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         EPS=eps,
         L=L, GROUP=group, HKV=hkv,
         WINDOW=window, PAGE=page_size,
-        S=S, CHUNK=chunk, SC=sc, ACC16=True,
+        S=S, CHUNK=chunk, SC=sc, ACC16=SW_ATTN_ACC16,
         D=d,
         BLOCK_M=max(16, triton.next_power_of_2(LG)),
         BLOCK_N=BN,
