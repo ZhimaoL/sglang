@@ -278,7 +278,8 @@ def _full_images(ext, kc, vc, page_table, cache_seqlens, L, max_len, capblks, de
         _PF["next"][last[0]] = lid
     _PF["last"] = (lid, fb)
     nxt = _PF["next"].get(lid)
-    if nxt is None or old <= 0:
+    pool = getattr(backend, "token_to_kv_pool", None)
+    if nxt is None or old <= 0 or pool is None:
         return kvt
     ns = 1 - slot if slot is not None else 0
     buf = _PF["bufs"][ns]
@@ -289,7 +290,7 @@ def _full_images(ext, kc, vc, page_table, cache_seqlens, L, max_len, capblks, de
         side = _PF["stream"] = torch.cuda.Stream(device=main.device)
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        k2, v2 = backend.token_to_kv_pool.get_kv_buffer(nxt)
+        k2, v2 = pool.get_kv_buffer(nxt)
         if not (k2.is_contiguous() and v2.is_contiguous() and k2.element_size() == 1 and v2.element_size() == 1):
             return kvt
         ext.gatherp(k2.view(torch.uint8), v2.view(torch.uint8), buf[: 2 * capblks], page_table, cache_seqlens, none,
