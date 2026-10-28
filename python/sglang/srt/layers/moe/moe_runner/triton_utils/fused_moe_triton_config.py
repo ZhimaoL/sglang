@@ -86,6 +86,16 @@ def get_moe_configs(
         down_moe=down_moe,
     )
 
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch as _okc
+
+    if _okc.SW_BF16_MOE_CFG:
+        # OKC: the serving patch's table for its BF16 expert layers (EP8: E=32, N=4096) on H200, retuned at EP routing;
+        # one table serves both GEMMs
+        okc_path = os.path.join(os.path.dirname(_okc.__file__), "moe_configs", json_file_name.replace("_down.json", ".json"))
+        if os.path.exists(okc_path):
+            with open(okc_path) as f:
+                return {int(key): val for key, val in json.load(f).items()}
+
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
     # so we also include the Triton version as a key for finding the fused_moe_kernel config to achieve the best performance.
     config_dir = os.environ.get(
