@@ -868,7 +868,7 @@ class MuseSpark1xMoE(nn.Module):
             if (
                 self.tp_size in (4, 8)
                 and not sp_active
-                and large_m_capable(hidden_states.device)
+                and large_m_capable(hidden_states.device, hidden_states.shape[0])
                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
             ):
                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
