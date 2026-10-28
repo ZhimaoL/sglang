@@ -17,9 +17,10 @@ Kernel (okc_patch/_cuda_src_fmha.py): gather_kp copies the request's paged K/V r
 128-key block) 16 KB stage images (zero-filled past the context), fmha7 streams them by TMA into 3 or 4
 consumer warpgroups (f16 QK, lazy-max hybrid exp2, e4m3 P, fp8 PV, tensor-core row sums), split-KV + combine
 when one request's grid under-fills the GPU (pick_cfg below = the bank's pick_cfg4). OKC_PREFILL_FMHA_EXACT=1 runs
-every exp2 on MUFU (no piecewise-linear exp).
+every exp2 on MUFU (no piecewise-linear exp). Row blocks (OKC rsfold O1): see defer_row_blocks.
 """
 
+import contextlib
 import logging
 import os
 from typing import Optional
@@ -48,6 +49,33 @@ PATH_STATS = os.environ.get("OKC_PATH_STATS", "0") == "1"
 HITS = {"fmha": 0, "fmha_tokens": 0, "fa3": 0}
 _FIRED = set()
 _SCALES = {}
+_DEFER = (0, 0)
+_DEFERRED = None  # (output, blocks, run)
+
+
+@contextlib.contextmanager
+def defer_row_blocks(rows: int, blocks: int):
+    """A one-request sliding call of exactly rows * blocks tokens inside gathers and leaves its output unwritten;
+    take_deferred(output) gives run(j, n): fmha7 at the whole call's (nc, split) over rows [j rows, (j + n) rows) with
+    that range's length. Blocks are whole 8 * nc query tiles, so every CTA computes as in the whole call (bit-equal)."""
+    global _DEFER
+    _DEFER = (rows, blocks)
+    try:
+        yield
+    finally:
+        _DEFER = (0, 0)
+
+
+def take_deferred(output: torch.Tensor):
+    """run of the deferred call whose output `output` is, else None (another deferred call runs whole first)."""
+    global _DEFERRED
+    d, _DEFERRED = _DEFERRED, None
+    if d is None:
+        return None
+    if output.data_ptr() == d[0].data_ptr() and output.numel() == d[0].numel():
+        return d[2]
+    d[2](0, d[1])
+    return None
 
 
 def _log_once(path: str, detail: str) -> None:
@@ -157,7 +185,10 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
 
     ext = fmha_ext(PFMHA_EXACT)
     win = window_size[0] + 1 if is_swa else 0
-    if out is None or out.dtype is not torch.bfloat16 or not out.is_contiguous() or out.numel() != tokens * HQ * D:
+    usable = out is not None and out.dtype is torch.bfloat16 and out.is_contiguous() and out.numel() == tokens * HQ * D
+    # row blocks: one sliding request of exactly the blocks, and no caller copy of an unwritten result (out is used)
+    R = _DEFER[0] if bs == 1 and win and tokens == _DEFER[0] * _DEFER[1] > 0 and (out is None or usable) else 0
+    if not usable:
         out = torch.empty((tokens, HQ, D), dtype=torch.bfloat16, device=device)
     o = out.view(tokens, HQ, D)
     smqk = float(layer.scaling) * LOG2E
@@ -166,7 +197,7 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     vc = value_cache.view(torch.uint8)
     for i, (off, L, max_len) in enumerate(reqs):
         nc, split = _one(ext, q8[off:off + L], kc, vc, page_table[i:i + 1], cache_seqlens[i:i + 1], L, max_len,
-                         win, ks, vs, smqk, o[off:off + L], device)
+                         win, ks, vs, smqk, o[off:off + L], device, R)
     HITS["fmha"] += 1
     HITS["fmha_tokens"] += tokens
     _log_once("prefill_fmha" + ("_swa" if win else "") + ("_ragged" if bs > 1 else ""),
@@ -176,8 +207,10 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     return o
 
 
-def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device):
-    """One request: gather its keys into stage images, then fmha7 (+ combine). Returns (nc, split)."""
+def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device, R=0):
+    """One request: gather its keys into stage images, then fmha7 (+ combine), or with R the deferred R-row blocks.
+    Returns (nc, split)."""
+    global _DEFERRED
     cap = ((min(win - 1 + L, max_len) if win else max_len) + 255) & ~255
     capblks = cap // 128
     kvt = torch.empty((2 * capblks, 16384), dtype=torch.uint8, device=device)
@@ -192,6 +225,20 @@ def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, sm
         ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, none, none, page_table.stride(0), 0, capblks, 1, L, 0)
         ntf = capblks
     nc, split = pick_cfg(L, ntf)
+    if R and R % (8 * nc) == 0:
+        blens = lens - torch.arange(L // R - 1, -1, -1, dtype=torch.int32, device=device) * R   # block ends
+
+        def run(j, n):
+            r = slice(j * R, (j + n) * R)
+            _attend(ext, q8[r], kvt, o[r], blens[j + n - 1:j + n], ks, vs, smqk, n * R, capblks, win, nc, split, device)
+
+        _DEFERRED = (o, L // R, run)
+    else:
+        _attend(ext, q8, kvt, o, lens, ks, vs, smqk, L, capblks, win, nc, split, device)
+    return nc, split
+
+
+def _attend(ext, q8, kvt, o, lens, ks, vs, smqk, L, capblks, win, nc, split, device):
     if split <= 1:
         ext.fmha4n_split(q8, kvt, o, o, o, lens, ks, vs, smqk, 1, L, capblks, 1, win, nc)
     else:
@@ -200,4 +247,3 @@ def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, sm
         pml = torch.empty((split, rows, 2), dtype=torch.float32, device=device)
         ext.fmha4n_split(q8, kvt, o, po, pml, lens, ks, vs, smqk, 1, L, capblks, split, win, nc)
         ext.combine(po, pml, o, rows, split)
-    return nc, split

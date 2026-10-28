@@ -139,6 +139,11 @@ SP_CE_TP = _flag("OKC_SP_CE_TP", "1")
 # post-attention norm instead, in torch's fp32 order (bit-equal): the summed branch is never written or re-read and
 # one kernel goes (serving/kernels/rsfold).
 SW_RS_NORM_FOLD = _flag("OKC_SW_RS_NORM_FOLD", "1")
+# Sliding layers there: fmha7 + output gate per destination block inside one eager break with the o-proj RS, so each
+# GEMM + push starts under the attention (serving/kernels/rsfold R4-R7, bit-equal). Off until an 8-GPU arm prices it.
+SW_RS_ATTN_BLOCKS = _flag("OKC_SW_RS_ATTN_BLOCKS", "0")
+RS_ATTN_BLOCKS_MIN_ROWS = int(os.environ.get("OKC_RS_ATTN_BLOCKS_MIN_ROWS", "2048"))
+RS_ATTN_BLOCKS_GROUP = int(os.environ.get("OKC_RS_ATTN_BLOCKS_GROUP", "2"))
 # NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
 SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
 # pg calls of >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS tokens align their routes with the prefill bank's local-slot align
@@ -281,4 +286,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
            "RIDE_ALONG", "RIDE_CORE", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
+           "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP",
            "ANY_ATTN"]
