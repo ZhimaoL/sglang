@@ -1,16 +1,10 @@
-"""OKC: sp_tp_ce's all-gather + matmul with one-sided readiness flags instead of barriers (OKC_SP_CE_AG_FLAGS).
+"""OKC: sp_tp_ce's all-gather + matmul on readiness flags instead of barriers (OKC_SP_CE_AG_FLAGS).
 
-The barrier path publishes every push step with a symm-mem barrier over all ranks (7 per 16K qkv), so each source
-block's GEMM waits for the slowest rank's step (serving/kernels/moe-overlap E23: ~31 ms per first turn on rank 0).
-Here each push carries its own flag. The producer, on the push stream right after the copy into rank dest's gather
-slot, writes 1 into dest's flag[me]: cuStreamWriteValue32, a stream memory operation the GPU front end runs (no SM),
-whose default memory fence orders it after the copy (NVSHMEM's put-with-signal on a stream). The consumer waits on
-its own flag[src] == 1 (cuStreamWaitValue32) before the GEMM of src's block and resets the flag to 0.
-Captured memops keep their values, so a flag is 1 / 0, not a sequence number. Consecutive uses of a flag are
-separated by collectives over all ranks (the o_proj reduce-scatter and the MoE section follow every qkv GEMM), so
-a producer writes flag[me] again only after its consumer reset it: the same order that guards the gather slots.
-Every push and flag write is enqueued before the first wait: a wait blocks its hardware queue, which the push
-stream may share (CUDA_DEVICE_MAX_CONNECTIONS), and a peer's wait must never sit behind one of mine.
+After each push into rank dest's gather slot the push stream writes 1 into dest's flag[me] (cuStreamWriteValue32,
+fenced after the copy); the consumer waits for flag[src] == 1 (cuStreamWaitValue32) before src's GEMM, then resets
+it. Two uses of a flag are separated by all-rank collectives (o_proj RS, MoE), as for the gather slots, so 1 / 0
+suffices (captured memops keep constant values). All pushes are enqueued before the first wait: a wait blocks its
+hardware queue, which the push stream may share.
 """
 
 import logging
@@ -30,7 +24,6 @@ class Flags:
         from cuda.bindings import driver as cu
 
         self.cu = cu
-        self.me = me
         self.sig = [cu.CUdeviceptr(p + 4 * me) for p in ptrs]          # flag[me] of every rank
         self.slot = [cu.CUdeviceptr(ptrs[me] + 4 * s) for s in range(len(ptrs))]   # my flag[src]
         self.write_flags = cu.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT
@@ -62,8 +55,7 @@ def _ok(cu, res):
 
 
 def flags(tp_group, device):
-    """The symmetric flag arrays, allocated and zeroed once outside graph capture (a collective, like sp_tp_ce's
-    buffers: every rank reaches the first eligible call together). None if unusable (every rank fails alike)."""
+    """Symmetric flag arrays, allocated once outside capture like sp_tp_ce._buffers; None if unusable."""
     global _flags, _failed
     if _flags is not None or _failed:
         return _flags
@@ -75,7 +67,7 @@ def flags(tp_group, device):
         W = tp_group.world_size
         buf = symm_mem.empty(W, dtype=torch.int32, device=device)
         buf.zero_()
-        torch.cuda.synchronize(device)      # zero before any peer can return from the rendezvous and write
+        torch.cuda.synchronize(device)      # zeroed before any peer returns from the rendezvous
         hdl = symm_mem.rendezvous(buf, tp_group.device_group.group_name)
         ptrs = [hdl.get_buffer(p, (W,), torch.int32, 0).data_ptr() for p in range(W)]
         _flags = Flags(ptrs, hdl.rank)
@@ -103,8 +95,7 @@ def push(st, fl, x_shard):
 
 
 def gemms(st, fl, x_shard, weight):
-    """[W*S, N]: the own block from the shard, then each source's block once its flag is up (sources me-1, me-2, ...:
-    the order their pushes reach this rank)."""
+    """[W*S, N]: the own block, then sources me-1, me-2, ... (arrival order), each once its flag is up."""
     S, K = x_shard.shape
     W, me = st.world, st.rank
     wt = weight.t()
