@@ -11,6 +11,7 @@ _SMALLM_EXT = None
 _FMHA_EXT = None
 _GLUE_EXT = None
 _WST_EXT = None
+_VFG_EXT = None
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -232,3 +233,46 @@ def wst_ext():
                     verbose=False,
                 )
     return _WST_EXT
+
+
+_VFG_CPP = """
+void muse_vfg_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t seq_lens, int64_t cache_loc,
+                     int64_t k_cache, int64_t v_cache, int64_t inv_freq, int64_t out, int64_t B, int64_t NS,
+                     int64_t window, double c2, double k_rscale, double v_rscale, double v_scale, double eps,
+                     int64_t ws, int64_t dbgp, int64_t stream);
+void muse_vp2_launch(int64_t qkv, int64_t page_table, int64_t seq_lens, int64_t cache_loc, int64_t k_cache,
+                     int64_t v_cache, int64_t inv_freq, int64_t out, int64_t window, double c2, double k_rscale,
+                     double v_rscale, double v_scale, double eps, int64_t dbgp, int64_t stream);
+"""
+
+
+def vfg_ext():
+    """Verify attention on the attention lane's VFG / VP2 kernels (q_len 8): see _cuda_src_vfg.py."""
+    global _VFG_EXT
+    if _VFG_EXT is None:
+        with _lock:
+            if _VFG_EXT is None:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_vfg import (
+                    _CUDA_SRC,
+                )
+
+                # The bank's flags for its svsd module (v16c_m7g_rlx3 _svsd_ext); a name of our own.
+                _VFG_EXT = load_inline(
+                    name="okc_vfg_verify_v1",
+                    cpp_sources=[_VFG_CPP],
+                    cuda_sources=[_CUDA_SRC],
+                    functions=["muse_vfg_launch", "muse_vp2_launch"],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        "-gencode=arch=compute_90a,code=sm_90a",
+                        "-U__CUDA_NO_HALF_OPERATORS__",
+                        "-U__CUDA_NO_HALF_CONVERSIONS__",
+                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                        "-U__CUDA_NO_HALF2_OPERATORS__",
+                    ],
+                    verbose=False,
+                )
+    return _VFG_EXT
