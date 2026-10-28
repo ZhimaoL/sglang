@@ -134,14 +134,15 @@ template <int GATED, int MODE> constexpr int smem_bytes(int nst) {
 }
 
 // ------------------------------------------------------------------ live tile list
-// live[0] = number of live blocks (local expert, inside n_padded); live[1 + i] = pid_m | (wcode << 20).
+// live[0] = number of live blocks (local expert < nle, inside n_padded); live[1 + i] = pid_m | (wcode << 20).
 // wcode = n/64 - 1 for the block's wgmma width n = the smallest allowed width (wmask bit0: 64, bit1: 128,
 // bit2: 192; 256 always) covering its valid-token prefix (moe_align pads each expert's range at its end).
 // Order: widest class first, pid_m ascending inside a class (round-robin CTAs then end on cheap narrow items).
 __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_experts,
                                                  const int* __restrict__ n_padded,
                                                  const int* __restrict__ sorted_ids, int numel,
-                                                 int num_pid_m, int bm, int wmask, int* __restrict__ live) {
+                                                 int num_pid_m, int bm, int wmask, int nle,
+                                                 int* __restrict__ live) {
     __shared__ int wsum[32];
     __shared__ int total_s;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -153,7 +154,7 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
     for (int cls = 3; cls >= 0; cls--) {
         for (int base = 0; base < npm; base += 1024) {
             const int pm = base + tid;
-            const bool live_blk = pm < npm && (unsigned)block_experts[pm] < 32u;
+            const bool live_blk = pm < npm && (unsigned)block_experts[pm] < (unsigned)nle;
             int code = 3;
             if (live_blk && bm == 256) {
                 const int* sid = sorted_ids + (size_t)pm * 256;
@@ -178,24 +179,27 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
 
 // ------------------------------------------------------------------ small-T routing front end
 // One CTA in place of topk_ids -> local ids (expert map), moe_align_block_size and pg_tiles, for numel <= RT_MAX
-// routes (verify / decode): local expert e gets ceil(count_e / 256) consecutive blocks, experts ascending, and no
-// block exists for non-local routes; a block's 256 sorted_ids slots hold its routes in route order, then the numel
-// sentinel. block_experts / live are what pg_tiles writes for the same counts (live: widest class first, block
-// ascending inside a class), so gather / gg1 / gg2 run unchanged; every route's row is computed by the same code
-// as on the moe_align path, only the block numbering differs. local_ids[r] = e or -1 (the finalize's slot ids).
-// No serial loops: a route's rank among same-expert routes of its warp comes from __match_any_sync, the per-expert
-// bases over the 64 warp groups from one warp-wide scan per expert, the block / live lists from one warp's ballots.
-constexpr int RT_MAX = 2048, RT_E = 32, RT_NB = RT_E + RT_MAX / 256;
+// routes (verify / decode): local expert e (e < nl <= RT_E: 32 home slots + replica slots) gets ceil(count_e / 256)
+// consecutive blocks, experts ascending, and no block exists for non-local routes; a block's 256 sorted_ids slots hold
+// its routes in route order, then the numel sentinel. block_experts / live are what pg_tiles writes for the same counts
+// (live: widest class first, block ascending inside a class), so gather / gg1 / gg2 run unchanged; every route's row
+// is computed by the same code as on the moe_align path, only the block numbering differs. local_ids[r] = e or -1 (the
+// finalize's slot ids). No serial loops: a route's rank among same-expert routes of its warp comes from
+// __match_any_sync, the per-expert bases over the 64 warp groups from one warp-wide scan per expert (warp w: experts w
+// and w + 32), the block / live lists from one warp's ballots over two 32-expert halves.
+constexpr int RT_MAX = 2048, RT_E = 64, RT_NB = RT_E + RT_MAX / 256;
 __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_ids, const int* __restrict__ emap,
-                                                 int n_global, int numel, int wmask, int* __restrict__ local_ids,
-                                                 int* __restrict__ sorted_ids, int* __restrict__ block_experts,
-                                                 int* __restrict__ live) {
+                                                 int n_global, int numel, int wmask, int nl,
+                                                 int* __restrict__ local_ids, int* __restrict__ sorted_ids,
+                                                 int* __restrict__ block_experts, int* __restrict__ live) {
     __shared__ int wc[RT_MAX / 32][RT_E];   // per (32-route group g = k * 32 + warp, expert): count -> base
     __shared__ int cnt[RT_E], bstart[RT_E], bexp[RT_NB], nblk;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const unsigned lt = (1u << lane) - 1u;
     wc[w][lane] = 0;                         // rows w and 32 + w are written by this warp only
+    wc[w][32 + lane] = 0;
     wc[32 + w][lane] = 0;
+    wc[32 + w][32 + lane] = 0;
     __syncwarp();
     pdl_wait();
     pdl_trigger();
@@ -207,7 +211,7 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         if (r < numel) {
             const int g = topk_ids[r];
             if ((unsigned)g < (unsigned)n_global) e = emap ? emap[g] : g;
-            if ((unsigned)e >= (unsigned)RT_E) e = -1;
+            if ((unsigned)e >= (unsigned)nl) e = -1;
             local_ids[r] = e;
         }
         const unsigned peers = __match_any_sync(0xFFFFFFFFu, e);
@@ -216,8 +220,8 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         if (e >= 0 && rk[k] == 0) wc[k * 32 + w][e] = __popc(peers);
     }
     __syncthreads();
-    {   // warp x = expert x: exclusive scan of its 64 group counts (lane l: groups 2l, 2l + 1)
-        const int x = w;
+#pragma unroll
+    for (int x = w; x < RT_E; x += 32) {   // warp w = experts w, w + 32: exclusive scan of the 64 group counts
         const int c0 = wc[2 * lane][x], c1 = wc[2 * lane + 1][x];
         int inc = c0 + c1;
 #pragma unroll
@@ -231,39 +235,49 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         if (lane == 31) cnt[x] = inc;
     }
     __syncthreads();
-    if (w == 0) {   // lane x = expert x: blocks, block list, live list
-        const int c = cnt[lane];
-        const int nbx = (c + 255) >> 8;
-        int bs = nbx;
+    if (w == 0) {   // lane l = experts l (half 0) and 32 + l (half 1): blocks, block list, live list
+        int nbx[2], code[2], b0[2], carry = 0;
 #pragma unroll
-        for (int o = 1; o < 32; o <<= 1) {
-            const int v = __shfl_up_sync(0xFFFFFFFFu, bs, o);
-            if (lane >= o) bs += v;
-        }
-        const int b0 = bs - nbx;
-        const int nb = __shfl_sync(0xFFFFFFFFu, bs, 31);
-        bstart[lane] = b0;
-        for (int j = 0; j < nbx; j++) { bexp[b0 + j] = lane; block_experts[b0 + j] = lane; }
-        // the expert's last block holds v = c - 256 (nbx - 1) routes, the others 256 (class 3)
-        const int vl = nbx > 0 ? c - ((nbx - 1) << 8) : 0;
-        int code = 3;
-        if ((wmask & 4) && vl <= 192) code = 2;
-        if ((wmask & 2) && vl <= 128) code = 1;
-        if ((wmask & 1) && vl <= 64) code = 0;
-        int base = 0;
-        for (int cls = 3; cls >= 0; cls--) {
-            // blocks of class cls this expert contributes: its full blocks (cls 3) and / or its last block
-            const int k_c = nbx == 0 ? 0 : (cls == 3 ? nbx - 1 : 0) + (code == cls ? 1 : 0);
-            int inc = k_c;
+        for (int hf = 0; hf < 2; hf++) {
+            const int x = 32 * hf + lane;
+            const int c = cnt[x];
+            nbx[hf] = (c + 255) >> 8;
+            int bs = nbx[hf];
 #pragma unroll
             for (int o = 1; o < 32; o <<= 1) {
-                const int v = __shfl_up_sync(0xFFFFFFFFu, inc, o);
-                if (lane >= o) inc += v;
+                const int v = __shfl_up_sync(0xFFFFFFFFu, bs, o);
+                if (lane >= o) bs += v;
             }
-            int pos = base + inc - k_c;
-            if (cls == 3) for (int j = 0; j < nbx - 1; j++) live[1 + pos++] = (b0 + j) | (3 << 20);
-            if (nbx > 0 && code == cls) live[1 + pos] = (b0 + nbx - 1) | (code << 20);
-            base += __shfl_sync(0xFFFFFFFFu, inc, 31);
+            b0[hf] = carry + bs - nbx[hf];
+            carry += __shfl_sync(0xFFFFFFFFu, bs, 31);
+            bstart[x] = b0[hf];
+            for (int j = 0; j < nbx[hf]; j++) { bexp[b0[hf] + j] = x; block_experts[b0[hf] + j] = x; }
+            // the expert's last block holds v = c - 256 (nbx - 1) routes, the others 256 (class 3)
+            const int vl = nbx[hf] > 0 ? c - ((nbx[hf] - 1) << 8) : 0;
+            code[hf] = 3;
+            if ((wmask & 4) && vl <= 192) code[hf] = 2;
+            if ((wmask & 2) && vl <= 128) code[hf] = 1;
+            if ((wmask & 1) && vl <= 64) code[hf] = 0;
+        }
+        const int nb = carry;
+        int base = 0;
+        for (int cls = 3; cls >= 0; cls--) {
+#pragma unroll
+            for (int hf = 0; hf < 2; hf++) {
+                // blocks of class cls this expert contributes: its full blocks (cls 3) and / or its last block
+                const int n = nbx[hf];
+                const int k_c = n == 0 ? 0 : (cls == 3 ? n - 1 : 0) + (code[hf] == cls ? 1 : 0);
+                int inc = k_c;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int v = __shfl_up_sync(0xFFFFFFFFu, inc, o);
+                    if (lane >= o) inc += v;
+                }
+                int pos = base + inc - k_c;
+                if (cls == 3) for (int j = 0; j < n - 1; j++) live[1 + pos++] = (b0[hf] + j) | (3 << 20);
+                if (n > 0 && code[hf] == cls) live[1 + pos] = (b0[hf] + n - 1) | (code[hf] << 20);
+                base += __shfl_sync(0xFFFFFFFFu, inc, 31);
+            }
         }
         if (lane == 0) { live[0] = nb; nblk = nb; }
     }
@@ -850,6 +864,168 @@ __global__ void __launch_bounds__(256) align_scatter(const int* __restrict__ lid
     }
 }
 
+// ------------------------------------------------------------------ replica balancer (small-T forwards)
+// tab[e] for the 256 experts: bits 0-7 the expert's slot on this rank (255: not held here), 8-10 its home rank,
+// bit 11 replicated, 12-14 the replica's rank; tab[256 + j] = the j-th replicated expert in balancing order. Every
+// rank takes the same decision from the same top-k ids (only the slot field differs per rank): load[r] = distinct
+// active non-replicated experts homed on r; then each active replicated expert, in order, goes to whichever of its
+// two holders has the lower load (tie: home) and counts there. out[i] = route i's local slot if this rank computes
+// it, else -1 (the static map's convention); emap_out[e] (if given) = the same decision per expert, the forward's
+// global -> local map for pg_route.
+template <typename IdT>
+__global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids, int n_routes,
+                                                     const int* __restrict__ tab, int n_rep, int me,
+                                                     int* __restrict__ out, int* __restrict__ emap_out) {
+    __shared__ int tabs[256], ord[256], act[256], owner[256], load[8];
+    const int t = threadIdx.x;
+    const int v = tab[t];
+    tabs[t] = v;
+    if (t < n_rep) ord[t] = tab[256 + t];
+    act[t] = 0;
+    owner[t] = (v >> 8) & 7;
+    if (t < 8) load[t] = 0;
+    __syncthreads();
+    for (int i = t; i < n_routes; i += 256) {
+        const int e = (int)ids[i];
+        if ((unsigned)e < 256u) act[e] = 1;
+    }
+    __syncthreads();
+    if (act[t] && !((v >> 11) & 1)) atomicAdd(&load[(v >> 8) & 7], 1);
+    __syncthreads();
+    if (t == 0) {
+        unsigned long long L = 0;   // 8 bits per rank (a load is at most 32 + n_rep < 256)
+        for (int r = 0; r < 8; r++) L |= (unsigned long long)load[r] << (8 * r);
+        for (int j = 0; j < n_rep; j++) {
+            const int e = ord[j], ve = tabs[e];
+            const int h = (ve >> 8) & 7, r = (ve >> 12) & 7;
+            const int pick = ((L >> (8 * r)) & 0xFF) < ((L >> (8 * h)) & 0xFF) ? r : h;
+            if (act[e]) { owner[e] = pick; L += 1ull << (8 * pick); }
+        }
+    }
+    __syncthreads();
+    if (emap_out != nullptr) emap_out[t] = (owner[t] == me && (v & 0xFF) != 0xFF) ? (v & 0xFF) : -1;
+    if (out == nullptr) return;
+    for (int i = t; i < n_routes; i += 256) {
+        const int e = (int)ids[i];
+        int s = -1;
+        if ((unsigned)e < 256u && owner[e] == me && (tabs[e] & 0xFF) != 0xFF) s = tabs[e] & 0xFF;
+        out[i] = s;
+    }
+}
+
+// ------------------------------------------------------------------ replica balancer (prefill chunks)
+// At a long prefill every expert is active and a rank's pg time follows its routed tokens, so the routes of a replicated
+// expert are split between its two holders instead of handed to one. Every rank takes the same decision from the same
+// top-k ids (integer arithmetic only): c[e] = routes of expert e; load[r] = routes of the non-replicated experts homed on
+// r; then the replicated experts by route count (descending, ties: lower id), each in turn: x = clamp((load[home] +
+// c[e] - load[replica]) / 2, 0, c[e]); the replica takes e's routes of the tokens before cut[e], the end of the first
+// sb-token block at which e's cumulative count reaches x (0 if x is 0), the home the rest, and both loads grow by their
+// parts. pg_rep_count (one CTA per sb-token block) counts the routes of every expert (global atomics into cnt, zeroed by
+// the caller) and of each replicated expert per block (bc[j][b]: the block is the CTA's own, so no atomics); pg_rep_cut
+// (one CTA) takes the decision and writes cut[256] (0 = the home takes every route); pg_rep_split maps route i (token
+// i / k) to its local slot on this rank, or -1.
+__global__ void __launch_bounds__(256) pg_rep_count(const int* __restrict__ ids, int n_routes, int topk,
+                                                    const int* __restrict__ tab, int n_rep, int sb, int nb,
+                                                    int* __restrict__ cnt, int* __restrict__ bc) {
+    __shared__ int c_s[256], ridx[256], b_s[64];
+    const int t = threadIdx.x, b = blockIdx.x;
+    c_s[t] = 0;
+    ridx[t] = -1;
+    if (t < 64) b_s[t] = 0;
+    __syncthreads();
+    if (t < n_rep) ridx[tab[256 + t]] = t;
+    __syncthreads();
+    const int i1 = min(n_routes, (b + 1) * sb * topk);
+    for (int i = b * sb * topk + t; i < i1; i += 256) {
+        const int e = ids[i];
+        if ((unsigned)e >= 256u) continue;
+        atomicAdd(&c_s[e], 1);
+        if (ridx[e] >= 0) atomicAdd(&b_s[ridx[e]], 1);
+    }
+    __syncthreads();
+    if (c_s[t]) atomicAdd(&cnt[t], c_s[t]);
+    if (t < n_rep) bc[t * nb + b] = b_s[t];
+}
+
+__global__ void __launch_bounds__(1024) pg_rep_cut(const int* __restrict__ tab, int n_rep, int sb, int nb,
+                                                   const int* __restrict__ cnt_g, const int* __restrict__ bc_g,
+                                                   int* __restrict__ cut) {
+    extern __shared__ int bc[];                 // [n_rep][nb] route counts per sb-token block, then cumulative
+    __shared__ int cnt[256], ridx[256], load[8];
+    const int t = threadIdx.x;
+    if (t < 256) { cnt[t] = cnt_g[t]; ridx[t] = -1; }
+    if (t < 8) load[t] = 0;
+    for (int i = t; i < n_rep * nb; i += 1024) bc[i] = bc_g[i];
+    __syncthreads();
+    if (t < n_rep) ridx[tab[256 + t]] = t;
+    __syncthreads();
+    if (t < 256 && ridx[t] < 0) atomicAdd(&load[(tab[t] >> 8) & 7], cnt[t]);
+    // inclusive scan of each replicated expert's block counts: one warp per row (lane = a run of consecutive blocks)
+    for (int j = t >> 5; j < n_rep; j += 32) {
+        const int lane = t & 31, per = (nb + 31) / 32, b0 = lane * per, b1 = min(nb, b0 + per);
+        int* row = bc + j * nb;
+        int acc = 0;
+        for (int b = b0; b < b1; b++) acc += row[b];
+        int incl = acc;
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, incl, o);
+            if (lane >= o) incl += v;
+        }
+        int run = incl - acc;
+        for (int b = b0; b < b1; b++) { run += row[b]; row[b] = run; }
+    }
+    __syncthreads();
+    if (t == 0) {
+        int ord[64];
+        for (int j = 0; j < n_rep; j++) {       // insertion sort: count descending, expert id ascending
+            const int e = tab[256 + j];
+            int k = j;
+            while (k > 0 && (cnt[ord[k - 1]] < cnt[e] || (cnt[ord[k - 1]] == cnt[e] && ord[k - 1] > e))) {
+                ord[k] = ord[k - 1];
+                k--;
+            }
+            ord[k] = e;
+        }
+        for (int j = 0; j < n_rep; j++) {
+            const int e = ord[j], v = tab[e], h = (v >> 8) & 7, r = (v >> 12) & 7, c = cnt[e];
+            const int* cum = bc + ridx[e] * nb;
+            int x = (load[h] + c - load[r]) / 2;
+            x = x < 0 ? 0 : (x > c ? c : x);
+            int part = 0, cu = 0;
+            if (x > 0) {
+                int lo = 0, hi = nb - 1;        // first block with cum >= x (cum[nb - 1] = c >= x)
+                while (lo < hi) { const int mid = (lo + hi) >> 1; if (cum[mid] >= x) hi = mid; else lo = mid + 1; }
+                part = cum[lo];
+                cu = (lo + 1) * sb;
+            }
+            load[r] += part;
+            load[h] += c - part;
+            cnt[e] = -1 - cu;                   // stash the cut (cnt is no longer needed for e)
+        }
+    }
+    __syncthreads();
+    if (t < 256) cut[t] = ridx[t] >= 0 ? -1 - cnt[t] : 0;
+}
+
+__global__ void __launch_bounds__(256) pg_rep_split(const int* __restrict__ ids, int n_routes, int topk,
+                                                    const int* __restrict__ tab, const int* __restrict__ cut, int me,
+                                                    int* __restrict__ out) {
+    __shared__ int tabs[256], cuts[256];
+    tabs[threadIdx.x] = tab[threadIdx.x];
+    cuts[threadIdx.x] = cut[threadIdx.x];
+    __syncthreads();
+    for (int i = blockIdx.x * 256 + threadIdx.x; i < n_routes; i += gridDim.x * 256) {
+        const int e = ids[i];
+        int s = -1;
+        if ((unsigned)e < 256u) {
+            const int v = tabs[e];
+            const int owner = (i / topk) < cuts[e] ? (v >> 12) & 7 : (v >> 8) & 7;
+            if (owner == me && (v & 0xFF) != 0xFF) s = v & 0xFF;
+        }
+        out[i] = s;
+    }
+}
+
 }  // namespace pgk
 
 // ------------------------------------------------------------------ host
@@ -877,10 +1053,52 @@ static void pg_launch(void (*k)(KArgs...), dim3 grid, dim3 block, size_t smem, b
 }
 
 void tiles(torch::Tensor block_experts, torch::Tensor n_padded, torch::Tensor sorted_ids, torch::Tensor live,
-           int64_t num_pid_m, int64_t bm, int64_t numel, int64_t wmask) {
+           int64_t num_pid_m, int64_t bm, int64_t numel, int64_t wmask, int64_t nle) {
     pgk::pg_tiles<<<1, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
         block_experts.data_ptr<int>(), n_padded.data_ptr<int>(), sorted_ids.data_ptr<int>(), (int)numel,
-        (int)num_pid_m, (int)bm, (int)wmask, live.data_ptr<int>());
+        (int)num_pid_m, (int)bm, (int)wmask, (int)nle, live.data_ptr<int>());
+}
+
+// out: [numel] per-route slots, emap: [256] per-expert map; either may be empty (not written)
+void rep_assign(torch::Tensor ids, torch::Tensor tab, torch::Tensor out, torch::Tensor emap, int64_t me) {
+    const int n_rep = (int)tab.size(0) - 256;
+    TORCH_CHECK(tab.scalar_type() == at::kInt && n_rep >= 0 && n_rep <= 256 && ids.is_contiguous() && me >= 0 &&
+                me < 8 && (out.numel() == 0 || (out.scalar_type() == at::kInt && out.is_contiguous() &&
+                                                out.numel() == ids.numel())) &&
+                (emap.numel() == 0 || (emap.scalar_type() == at::kInt && emap.numel() == 256)),
+                "pg rep_assign: int32 table [256 + n_rep], int32 out like ids, int32 map [256], rank < 8");
+    int* o = out.numel() > 0 ? out.data_ptr<int>() : nullptr;
+    int* m = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (ids.scalar_type() == at::kLong)
+        pgk::pg_rep_assign<int64_t><<<1, 256, 0, stream>>>(ids.data_ptr<int64_t>(), (int)ids.numel(),
+                                                             tab.data_ptr<int>(), n_rep, (int)me, o, m);
+    else
+        pgk::pg_rep_assign<int><<<1, 256, 0, stream>>>(ids.data_ptr<int>(), (int)ids.numel(), tab.data_ptr<int>(),
+                                                       n_rep, (int)me, o, m);
+}
+
+void rep_split(torch::Tensor ids, torch::Tensor tab, torch::Tensor cnt, torch::Tensor bc, torch::Tensor cut,
+               torch::Tensor out, int64_t me, int64_t sb) {
+    const int n_rep = (int)tab.size(0) - 256;
+    const int topk = (int)ids.size(1), n_routes = (int)ids.numel();
+    const int nb = (int)((ids.size(0) + sb - 1) / sb);
+    const int smem = n_rep * nb * 4;
+    TORCH_CHECK(tab.scalar_type() == at::kInt && out.scalar_type() == at::kInt && ids.scalar_type() == at::kInt &&
+                cut.scalar_type() == at::kInt && cut.numel() == 256 && cnt.scalar_type() == at::kInt &&
+                cnt.numel() == 256 && bc.scalar_type() == at::kInt && bc.numel() >= n_rep * nb && n_rep >= 0 &&
+                n_rep <= 64 && ids.is_contiguous() && out.is_contiguous() && out.numel() == ids.numel() && me >= 0 &&
+                me < 8 && nb >= 1 && smem <= 48 * 1024,
+                "pg rep_split: int32 ids [T, k], table [256 + n_rep <= 64], cnt / cut [256] (cnt zeroed), "
+                "bc [n_rep x token blocks <= 12288], out like ids, rank < 8");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    pgk::pg_rep_count<<<nb, 256, 0, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(), n_rep,
+                                              (int)sb, nb, cnt.data_ptr<int>(), bc.data_ptr<int>());
+    pgk::pg_rep_cut<<<1, 1024, smem, stream>>>(tab.data_ptr<int>(), n_rep, (int)sb, nb, cnt.data_ptr<int>(),
+                                               bc.data_ptr<int>(), cut.data_ptr<int>());
+    const int grid = (n_routes + 255) / 256 < 4 * pg_num_sms() ? (n_routes + 255) / 256 : 4 * pg_num_sms();
+    pgk::pg_rep_split<<<grid, 256, 0, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(),
+                                                cut.data_ptr<int>(), (int)me, out.data_ptr<int>());
 }
 
 void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::Tensor live, int64_t numel,
@@ -896,15 +1114,15 @@ void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::
 // an empty tensor (ids already local); outputs local_ids [T * 8], sorted_ids [nb_max * 256], block_experts
 // [nb_max], live [nb_max + 1] with nb_max = 32 + ceil(numel / 256).
 void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, torch::Tensor sorted_ids,
-           torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global, int64_t pdl) {
-    TORCH_CHECK(numel <= pgk::RT_MAX && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous(),
-                "pg route: int32 ids, at most 2048 routes");
-    TORCH_CHECK(sorted_ids.numel() >= (pgk::RT_E + (numel + 255) / 256) * 256 &&
-                live.numel() >= pgk::RT_E + (numel + 255) / 256 + 1, "pg route: output sizes");
+           torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global, int64_t nl, int64_t pdl) {
+    TORCH_CHECK(numel <= pgk::RT_MAX && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() &&
+                nl >= 1 && nl <= pgk::RT_E, "pg route: int32 ids, at most 2048 routes, 1..64 local slots");
+    TORCH_CHECK(sorted_ids.numel() >= (nl + (numel + 255) / 256) * 256 &&
+                live.numel() >= nl + (numel + 255) / 256 + 1, "pg route: output sizes");
     const int* em = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
     pg_launch(pgk::pg_route, dim3(1), dim3(1024), 0, pdl != 0, topk_ids.data_ptr<int>(), em, (int)n_global,
-              (int)numel, 3, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(), block_experts.data_ptr<int>(),
-              live.data_ptr<int>());
+              (int)numel, 3, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
+              block_experts.data_ptr<int>(), live.data_ptr<int>());
 }
 
 // Large-T front end: ids [numel] int32 / int64 global ids (emap [n_global] int32, global -> local slot) or local slot ids

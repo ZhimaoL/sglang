@@ -37,19 +37,23 @@ def pg_ext():
                     _CUDA_SRC,
                 )
 
-                # The name differs from the prefill bank's build: the small-T front end (route, gather_norm) and
-                # the PDL launch flags changed the entry points.
+                # The name differs from the prefill bank's build and from the lanes' branches: the small-T front end
+                # (route, gather_norm), the PDL launch flags, the local-slot align, tiles' local-expert count and the
+                # replica balancers (rep_assign, rep_split) changed the entry points.
                 _PG_EXT = load_inline(
-                    name="okc_pg_moe_c350_pdla",
+                    name="okc_pg_moe_c350_int",
                     cpp_sources="void align(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, "
                     "int64_t, int64_t);\n"
                     "void tiles(torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
+                    "torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t);\n"
+                    "void rep_assign(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t);\n"
+                    "void rep_split(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "int64_t, int64_t);\n"
                     "void gather(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "int64_t, int64_t);\n"
                     "void route(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);\n"
+                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
                     "void gather_norm(torch::Tensor, torch::Tensor, double, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, int64_t, int64_t);\n"
                     "void gg1(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
@@ -58,7 +62,8 @@ def pg_ext():
                     "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
                     "void set_snake_max_t(int64_t);",
                     cuda_sources=_CUDA_SRC,
-                    functions=["align", "tiles", "gather", "route", "gather_norm", "gg1", "gg2", "set_snake_max_t"],
+                    functions=["align", "tiles", "gather", "route", "gather_norm", "gg1", "gg2", "set_snake_max_t",
+                               "rep_assign", "rep_split"],
                     extra_cuda_cflags=[
                         "-O3",
                         "--use_fast_math",

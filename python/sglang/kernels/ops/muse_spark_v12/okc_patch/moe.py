@@ -1,7 +1,10 @@
 """The pg chain for the NVFP4 Marlin experts of Muse Spark (prefill chunks only).
 
 At T >= OKC_MOE_PG_MIN_TOKENS a captured layer runs pg_moe.grouped_pg and then the same finalize as
-_forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin.
+_forward_marlin; every other call (follow-up prefills, verify steps) stays on stock Marlin. A pg-only layer (the
+default) runs pg at every T; with hot-expert replicas its forwards of <= OKC_MOE_REP_MAX_TOKENS tokens map the routes
+through pg_moe.assign_replicas instead of the static home map, longer ones (OKC_MOE_REP_PREFILL) through
+pg_moe.split_replicas.
 The pg packs are re-encodings of the raw NVFP4 expert tensors, so maybe_capture_nvfp4_packs must run
 right before prepare_moe_nvfp4_layer_for_marlin repacks them in place.
 """
@@ -111,7 +114,7 @@ def maybe_capture_nvfp4_packs(layer) -> bool:
     if state is None:
         logger.warning("OKC pg pack capture declined (shape/dtype mismatch); layer stays on Marlin.")
         return False
-    state["pg_only"] = _sw.MOE_PG_ONLY and layer.num_local_experts == 32 and layer.top_k == 8
+    state["pg_only"] = _sw.MOE_PG_ONLY and layer.num_local_experts < 255 and layer.top_k == 8
     layer._okc_moe_state = state
     _captured_layers += 1
     if state["pg_only"]:
@@ -181,8 +184,8 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
         return "inside torch.compile"
     if hidden_states.shape[1] != state["H"] or hidden_states.dtype is not torch.bfloat16:
         return f"hidden {tuple(hidden_states.shape)} {hidden_states.dtype}"
-    # The pg kernels hard-code topk 8 and 32 local experts (the TP8/EP8 shape).
-    if topk_ids.shape[1] != 8 or layer.num_local_experts != 32:
+    # The pg kernels hard-code topk 8; local slots are 8-bit in the replica table (255 = not held).
+    if topk_ids.shape[1] != 8 or layer.num_local_experts >= 255:
         return f"topk {topk_ids.shape[1]}, {layer.num_local_experts} local experts"
     if post_expert_norm is None:
         return "no post-expert norm"
@@ -193,27 +196,45 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
     return None
 
 
-def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps):
-    from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
-        fused_post_expert_norm_weighted_sum,
-    )
+def local_routes(layer, topk_ids):
+    """[T, 8] global top-k ids -> [T, 8] int32 local expert slots on this rank, -1 where another rank computes the
+    route: the static home map, or with hot-expert replicas a per-forward balancer that every rank computes alike from
+    the same ids (T and the ids are the same on every rank: a TP batch, or the SP gathered chunk)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
-    num_tokens, size_k = x.shape
+    rep_table = getattr(layer, "_okc_rep_table", None)
+    if rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
+        # verify-sized: each active replicated expert to the holder with fewer active experts
+        return pg_moe.assign_replicas(topk_ids, rep_table, layer.replica_plan["me"])
+    if rep_table is not None and _sw.MOE_REP_PREFILL:
+        # prefill-sized: every expert is active; each replicated expert's routes split to level routed tokens
+        return pg_moe.split_replicas(topk_ids, rep_table, layer.replica_plan["me"])
+    local_ids = topk_ids.to(torch.int32)
+    if layer._expert_map is not None:
+        local_ids = layer._expert_map[local_ids]
+    return local_ids.contiguous()
+
+
+def route_map(layer, topk_ids):
+    """local_routes' decision as a [256] global -> local slot map, for pg_route (which maps the ids itself): the static
+    home map, or at verify sizes with replicas this forward's balancer map."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
+    rep_table = getattr(layer, "_okc_rep_table", None)
+    if rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
+        return pg_moe.replica_map(topk_ids, rep_table, layer.replica_plan["me"])
+    return layer._expert_map
+
+
+def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps):
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
     y, local_ids = pg_moe.grouped_pg_small(
-        x, topk_ids, layer._expert_map,
+        x, topk_ids, route_map(layer, topk_ids),
         norm_weight=norm_weight, norm_eps=norm_eps,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.SW_PDL,
     )
-    return fused_post_expert_norm_weighted_sum(
-        y.view(num_tokens, 8, size_k),
-        topk_scores,
-        norm_weight=layer._post_expert_norm_weight,
-        eps=layer._post_expert_norm_eps,
-        weight_first=layer._post_expert_norm_weight_first,
-        slot_expert_ids=local_ids,
-        min_tokens_for_fused=1,
-    )
+    return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
 
 
 def pg_prep(layer, topk_ids):
@@ -228,11 +249,10 @@ def pg_prep(layer, topk_ids):
             and (emap is None or emap.dtype is torch.int32) and layer.num_local_experts <= 64):
         # Large chunks: one count of the routes into the local-slot counters (map and int32 cast folded in)
         # instead of the cast + map gather + 256-expert moe_align / count_and_sort chain; same values downstream.
+        if getattr(layer, "_okc_rep_table", None) is not None:
+            return pg_moe.align_local(local_routes(layer, topk_ids), None, layer.num_local_experts)
         return pg_moe.align_local(topk_ids, emap, layer.num_local_experts)
-    local_ids = topk_ids.to(torch.int32)
-    if layer._expert_map is not None:
-        local_ids = layer._expert_map[local_ids]
-    local_ids = local_ids.contiguous()
+    local_ids = local_routes(layer, topk_ids)
     # Marlin's alignment convention: global expert count with -1 for non-local routes.
     align_num_experts = layer.global_num_experts if layer._expert_map is not None else layer.num_local_experts
     return (local_ids, *moe_align_block_size(local_ids, pg_moe._BLOCK_M, align_num_experts))
