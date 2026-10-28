@@ -45,6 +45,9 @@ if okc_patch.SW_PROJ:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import proj as okc_proj
 if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
+if okc_patch.SW_MOE_OVL:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_moe_ovl as okc_sp_moe_ovl
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
@@ -775,6 +778,10 @@ class MuseSpark1xMoE(nn.Module):
     def _reduce_and_unpool(
         self, output: torch.Tensor, *, already_reduced: bool = False
     ) -> torch.Tensor:
+        if getattr(self, "_okc_ovl_unpooled", False):
+            # The SP MoE block (okc_patch/sp_moe_ovl.py) ran the unpooler per row slice.
+            self._okc_ovl_unpooled = False
+            return output
         # Expert TP already reduced across ranks, before its post-expert norm.
         if (
             self.tp_size > 1
@@ -862,8 +869,21 @@ class MuseSpark1xMoE(nn.Module):
         side_stream = self._side_stream() if use_side_stream else None
         if use_side_stream:
             side_stream.wait_stream(main_stream)
+        # OKC SP MoE block with the pooler sliced: the router goes first on its side stream and is joined by the
+        # block's comm stream, so the pooler slices run beside it and the first AG pushes follow the first slice.
+        ovl_pool = (
+            sp_active
+            and okc_patch.SW_MOE_OVL
+            and use_side_stream
+            and self.pre_expert_proj is not None
+            and okc_sp_moe_ovl.POOLER
+            and get_global_experts_capturer() is None
+            and self._okc_ovl_eligible(hidden_states.shape[0])
+        )
         # nn.Linear bypasses the bf16 GEMM dispatcher.
-        if self.pre_expert_proj is None:
+        if ovl_pool:
+            expert_input = None
+        elif self.pre_expert_proj is None:
             expert_input = hidden_states
         elif _is_cpu:
             expert_input, _ = self.pre_expert_proj(hidden_states)
@@ -905,6 +925,21 @@ class MuseSpark1xMoE(nn.Module):
             topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
                 None, router_logits, self.top_k, True, want_packed=True
             )
+        if ovl_pool:
+            routed = torch.cuda.Event()
+            routed.record(side_stream)
+            weight = self.pre_expert_proj.weight
+
+            def pooled_rows(a: int, m: int) -> torch.Tensor:
+                rows = bf16_gemm_dispatch(hidden_states[a : a + m], weight, None)
+                return rows if self.pre_expert_norm is None else self.pre_expert_norm(rows)
+
+            shard = self._okc_ovl_run(
+                (pooled_rows, hidden_states.shape[0]), topk_scores, topk_ids, routed
+            )
+            if shard is not None:
+                return shard
+            expert_input = bf16_gemm_dispatch(hidden_states, weight, None)
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -988,6 +1023,47 @@ class MuseSpark1xMoE(nn.Module):
         )
         return self.sp_dispatcher.combine(combine_input)
 
+    def _okc_ovl_eligible(self, num_shard_rows: int) -> bool:
+        """The SP MoE block of this layer runs with its collectives on the copy engines (okc_patch/sp_moe_ovl.py):
+        pg-only NVFP4 experts under OKC Hopper SP, a chunk in the pipeline's token range. Shape-only: all ranks agree."""
+        state = getattr(self.experts, "_okc_moe_state", None)
+        return (
+            okc_patch.SW_MOE_OVL
+            and self.nvfp4_checkpoint
+            and layernorm_sp.okc_hopper_sp()
+            and getattr(self.experts, "use_marlin", False)
+            and state is not None
+            and state["pg_only"]
+            and okc_sp_moe_ovl.eligible(num_shard_rows, get_tp_group().world_size)
+        )
+
+    def _okc_ovl_run(self, x_shard, topk_scores, topk_ids, routed=None):
+        """Run the block on the normed shard (or a (producer, rows) sliced pooler); None = keep the NCCL path."""
+        experts = self.experts
+        post = None
+        if okc_sp_moe_ovl.UNPOOL and self.post_expert_proj is not None:
+            # Per row slice, into the slice's rows of the output: F.linear's cuBLAS call with out=.
+            weight = self.post_expert_proj.weight
+            post = (
+                lambda rows, out: torch.mm(rows, weight.t(), out=out),
+                weight.shape[0],
+            )
+        shard = okc_sp_moe_ovl.run(
+            get_tp_group(),
+            x_shard,
+            topk_scores,
+            topk_ids,
+            lambda ids: okc_moe.pg_prep(experts, ids),
+            lambda x, prep: okc_moe.pg_run(experts, x, prep, experts.post_expert_norm),
+            lambda y, scores, local: okc_moe.finalize_routes(experts, y, scores, local),
+            post=post,
+            rows=self.expert_hidden_size,
+            routed=routed,
+        )
+        if shard is not None:
+            self._okc_ovl_unpooled = post is not None
+        return shard
+
     def _forward_gathered_experts(
         self,
         expert_input: torch.Tensor,
@@ -1006,6 +1082,17 @@ class MuseSpark1xMoE(nn.Module):
             )
         tp_group = get_tp_group()
         world = tp_group.world_size
+        if self._okc_ovl_eligible(expert_input.shape[0]):
+            # The pre-expert norm is per row: run it on the shard, before the gather, instead of on every rank's
+            # copy of the whole chunk.
+            normed = (
+                expert_input
+                if self.pre_expert_norm is None
+                else self.pre_expert_norm(expert_input)
+            )
+            shard = self._okc_ovl_run(normed, topk_scores, topk_ids)
+            if shard is not None:
+                return shard
 
         def gather(shard: torch.Tensor) -> torch.Tensor:
             shard = shard.contiguous()
@@ -1013,6 +1100,17 @@ class MuseSpark1xMoE(nn.Module):
             tp_group.all_gather_into_tensor(full, shard)
             return full
 
+        # The pre-expert RMSNorm is per row: on the shard before the gather it costs 1/tp of normalizing every
+        # rank's copy of the whole chunk (16K chunk: 13 vs 85 us per layer), with the same values. pg-only and BF16
+        # experts apply it as a plain op; the FlashInfer path fuses it into its input quantization, so it keeps it.
+        state = getattr(self.experts, "_okc_moe_state", None)
+        prenorm_shard = (
+            okc_patch.SP_PRENORM_SHARD
+            and self.pre_expert_norm is not None
+            and (not self.nvfp4_checkpoint or (state is not None and state["pg_only"]))
+        )
+        if prenorm_shard:
+            expert_input = self.pre_expert_norm(expert_input)
         full_input = gather(expert_input)
         full_scores = gather(topk_scores)
         full_ids = gather(topk_ids)
@@ -1022,10 +1120,10 @@ class MuseSpark1xMoE(nn.Module):
                 full_scores,
                 full_ids,
                 self.experts.post_expert_norm,
-                pre_expert_norm=self.pre_expert_norm,
+                pre_expert_norm=None if prenorm_shard else self.pre_expert_norm,
             )
         else:
-            if self.pre_expert_norm is not None:
+            if self.pre_expert_norm is not None and not prenorm_shard:
                 full_input = self.pre_expert_norm(full_input)
             output = self.experts(
                 full_input, full_scores, full_ids, self.experts.post_expert_norm

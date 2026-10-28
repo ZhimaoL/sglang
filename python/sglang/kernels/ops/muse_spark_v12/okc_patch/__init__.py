@@ -61,6 +61,11 @@ GEMM_AG_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_MAX_TOKENS", "128"))
 # the 74K first turn -6.0% but cached follow-up TTFT +54 ms (bs 1) / +70 ms (bs 4) with it on every forward.
 SP_SYMM = _flag("OKC_SP_SYMM", "1")
 SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
+# SP prefill MoE block with its collectives on the copy engines (okc_patch/sp_moe_ovl.py): pooled AG and RS move by
+# symm-mem P2P pushes under the row-sliced pooler / finalize / unpooler (pg whole) instead of exposed NCCL collectives.
+SW_MOE_OVL = _flag("OKC_SW_MOE_OVL", "0")
+# NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
+SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
 
 # Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call. Per request:
 # full layers from OKC_PFMHA_MIN_TOKENS new tokens, sliding layers from OKC_PFMHA_SLIDING_MIN_TOKENS (1xH200 over a 75K
@@ -84,4 +89,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT",
-           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]
+           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_MOE_OVL",
+           "SP_PRENORM_SHARD", "ANY_ATTN"]
