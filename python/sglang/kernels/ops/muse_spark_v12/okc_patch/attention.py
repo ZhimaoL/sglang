@@ -3,8 +3,8 @@
 Two env-gated paths, both consuming the FlashAttention backend's per-step metadata
 (page tables, cache_seqlens, SWA write locations) and the paged KV pool directly:
 
-  OKC_SW_ATTN  sliding layers at q_len 8 (TP8 heads): attn-v3's prep + split-with-tail
-               verify, replacing fused QK norm + RoPE + KV store + FA3 + gated output norm.
+  OKC_SW_ATTN  sliding layers at q_len 8 (TP8 heads, FP8 pool, page size 1): the VFG / VP2 kernels (_cuda_src_vfg),
+               replacing fused QK norm + RoPE + KV store + FA3 + gated output norm (OKC_SW_VFG=0: the stock path).
   OKC_SW_WST   full layers at q_len 8, bs >= OKC_WST_MIN_BS: the attention lane's verify-full kernels (wst_ct14 with the
                row-sliced in-kernel merge, wst_ct14b balanced over the batch from OKC_WST_BAL_MIN_BS up), one
                launch per layer for QK norm + new KV rows + FP8 attention + merge + output norm and gate.
@@ -13,17 +13,14 @@ Every eligibility miss returns None and the caller falls through to the stock pa
 Decisions depend only on config, forward mode, and batch shape, so a decision taken
 during CUDA-graph capture holds for every replay of that graph.
 
-Operating points (kernel court, H200): sliding v1/v16/v32 1.25/1.21/1.14x per call. Only
-TARGET_VERIFY dispatches (the target model never decodes under DFLASH); decode steps and
+Only TARGET_VERIFY dispatches (the target model never decodes under DFLASH); decode steps and
 every other shape run the stock path.
 """
 
 import logging
-import math
 from typing import Optional
 
 import torch
-import triton
 
 logger = logging.getLogger(__name__)
 _FIRED = set()
@@ -38,9 +35,6 @@ def log_once(path: str, detail: str = "") -> None:
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN,
-    SW_ATTN_ACC16,
-    SW_ATTN_V3,
-    SW_PDL,
     SW_VFG,
     SW_VFG_FULL1,
     SW_WST,
@@ -49,7 +43,6 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     WST_BAL_MIN_BS,
     WST_MIN_BS,
 )
-from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
 LOG2E = 1.4426950408889634
 
@@ -278,37 +271,11 @@ def _full_rows(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     return None
 
 
-_CNT = {}
-
-
-def _counter(kind, n, S, device):
-    """Persistent int32 ticket counters (attn-v3): allocated zero once per (kind,
-    owners, S). Every sliding call takes exactly S tickets per owner and the last
-    arriver (ticket S - 1) resets its counter to zero in-kernel, so the count is back
-    at zero after every call, eager or graph replay (capture executes nothing), and
-    never wraps. Keyed per (n, S), so each captured decode graph replays against its
-    own counter buffer."""
-    key = (kind, n, S, str(device))
-    c = _CNT.get(key)
-    if c is None:
-        c = _CNT[key] = torch.zeros((n,), dtype=torch.int32, device=device)
-    return c
-
-
-# attn-v3 verify launch knobs per (q_len, bs), bench_v3 sweeps; unlisted bs take the
-# lane defaults (BN 128 / 4 warps / sc 4).
-_V3_TUNE_BY = {
-    (8, 1): (64, 4, 4),
-    (8, 16): (64, 4, 4),
-    (8, 32): (64, 4, 4),
-}
-
-
 def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
              bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
              sm_scale, qk_factor, eps):
     """Sliding dispatch: verify blocks on the bank's VFG / VP2 kernels (FP8 pool, TP8 shape, page size 1), else the
-    attn-v3 fused verify kernels on the TP8 shape, else the stock path."""
+    stock path."""
     if (SW_VFG and q_len == 8 and hq == 16 and hkv == 2 and d == 64 and page_size == 1 and 0 < window <= 2048
             and k_cache.dtype is torch.float8_e4m3fn and page_table.dtype is torch.int32
             and page_table.stride(1) == 1):
@@ -318,75 +285,7 @@ def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             bs=bs, window=window, kv_scale=kv_scale, theta=theta,
             sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
         )
-    if SW_ATTN_V3 and hq == 16 and hkv == 2 and d == 64 and q_len == 8:
-        log_once(f"sliding_v3[q_len={q_len}]", f"(first bs={bs})")
-        return _sliding_v3(
-            qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
-            bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
-            window=window, page_size=page_size, kv_scale=kv_scale, theta=theta,
-            sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
-        )
-    return None   # no v1 fallback: the stock path
-
-
-def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
-                bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
-                sm_scale, qk_factor, eps):
-    """attn-v3 fused sliding verify (q_len 8): prep + split-with-tail (_sl_verify_f2); the
-    last-arriver program folds the combine, output RMSNorm and sigmoid gate into the same
-    launch. Split-KV partials are fp32 unless OKC_SW_ATTN_ACC16=1 (bf16 partials, the
-    combine still in fp32)."""
-    device = qkv.device
-    acc_dtype = torch.bfloat16 if SW_ATTN_ACC16 else torch.float32
-    B, L = bs, q_len
-    group = hq // hkv
-    kc = k_cache.view(k_cache.shape[0], -1)
-    vc = v_cache.view(v_cache.shape[0], -1)
-    out = torch.empty((B * L, hq * d), dtype=torch.bfloat16, device=device)
-    theta_coef = (-2.0 * math.log2(theta) / d) if theta else 0.0
-    alpha = sm_scale * kv_scale * LOG2E
-    gate_col0 = (hq + 2 * hkv) * d
-    # prep (q norm+RoPE -> ws, own k/v -> cache) + split-with-tail.
-    BN, warps, sc = _V3_TUNE_BY.get((8, B), (128, 4, 4))
-    span = window - 1 + L
-    S = max(1, min(math.ceil(span / BN), math.ceil(256 / (B * hkv)), 16))
-    chunk = BN * math.ceil(span / (S * BN))
-    LG = L * group
-    P = B * hkv * S
-    q_ws = torch.empty((B * hkv * LG, d), dtype=torch.bfloat16, device=device)
-    ws_acc = torch.empty((P * LG, d), dtype=acc_dtype, device=device)
-    ws_m = torch.empty((P * LG,), dtype=torch.float32, device=device)
-    ws_l = torch.empty((P * LG,), dtype=torch.float32, device=device)
-    counter = _counter("sv", B * hkv, S, device)
-    br = triton.next_power_of_2(hq + 2 * hkv)
-    ak._sliding_prep[(B * L,)](
-        qkv, q_ws, kc, vc,
-        cache_loc, seq_pre,
-        qkv.stride(0),
-        1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef,
-        EPS=eps,
-        L=L, GROUP=group, HQ=hq, HKV=hkv,
-        GROUP_Q=group, HKV_Q=hkv,
-        HAS_ROPE=bool(theta), D=d, BLOCK_R=br, PDL=SW_PDL,
-        num_warps=4 if br <= 64 else 8, num_stages=1, launch_pdl=SW_PDL,
-    )
-    ak._sl_verify_f2[(P,)](
-        q_ws, kc, vc,
-        seq_pre, page_table,
-        ws_acc, ws_m, ws_l, counter, qkv, out,
-        page_table.stride(0), qkv.stride(0), hq * d, gate_col0,
-        page_table.shape[1] * page_size - L,
-        alpha, kv_scale,
-        EPS=eps,
-        L=L, GROUP=group, HKV=hkv,
-        WINDOW=window, PAGE=page_size,
-        S=S, CHUNK=chunk, SC=sc, ACC16=SW_ATTN_ACC16,
-        D=d,
-        BLOCK_M=max(16, triton.next_power_of_2(LG)),
-        BLOCK_N=BN, PDL=SW_PDL,
-        num_warps=warps, num_stages=3, launch_pdl=SW_PDL,
-    )
-    return out
+    return None
 
 
 _WST_WS = {}
