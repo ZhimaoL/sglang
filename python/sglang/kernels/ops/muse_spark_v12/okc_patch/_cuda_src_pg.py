@@ -9,6 +9,14 @@ Entry points: tiles (live block list), gather (bf16 x rows -> bf16 swizzled toke
 (gate+up GEMM, silu*mul fused, bf16 intermediate), gg2 (down GEMM, scatter by sorted_ids, bf16 rows).
 Weights stay packed NVFP4 (pack_wsf in pg_moe.py: e2m1 codes reordered, e4m3 block scales stored
 exactly as bf16) and are decoded in registers.
+
+Narrow build (cuda_ext.pg_narrow_ext, -DPGN_WSET=17 -DPGN_NST=7: the #ifdef PGN_WSET blocks) for verify steps and
+follow-up extends. At mid T most local experts get few tokens (rank 0 at T 1024: p10 / p50 / p90 = 2 / 16 / 96) and a
+pg item costs about the same whatever share of its token columns is real, so it runs 128-token blocks (XNT 128) with
+item widths 16 / 64 / 128 (PGN_WSET 17; ptxas serializes the wgmmas beyond three width loops, C7512) and PGN_NST = 7
+ring slots (the 16 KB X stage). Same weights and accumulation per output element: real tokens' outputs are
+bit-identical to the shipped build; only padded columns are skipped. Width codes become nv / 16 - 1 (wmask bits 0 = 64,
+1 = 128, 2 = 192, 3 = 32, 4 = 16); items of <= 64 tokens stage two k-tiles per ring slot.
 """
 
 def _wgmma_asm(n):
@@ -109,6 +117,12 @@ DINL void dq3(unsigned t, __nv_bfloat162 d[4]) {
     d[3] = u32b2(((t & 0x001B001Bu) * 0x1084u) & 0x81C081C0u);
 }
 
+#ifdef PGN_WSET
+DINL void stsm_x2_trans(unsigned addr, unsigned r0, unsigned r1) {
+    asm volatile("stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1, %2};"
+                 :: "r"(addr), "r"(r0), "r"(r1) : "memory");
+}
+#endif  // PGN_WSET
 DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, unsigned r3) {
     asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};"
                  :: "r"(addr), "r"(r0), "r"(r1), "r"(r2), "r"(r3) : "memory");
@@ -116,13 +130,23 @@ DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, un
 
 @@WGMMA@@
 
+#ifdef PGN_WSET
+@@WGMMA_N@@
+// ------------------------------------------------------------------ geometry
+constexpr int XNT = 128;                 // tokens per block (narrow build: the widest item)
+#else   // PGN_WSET
 // ------------------------------------------------------------------ geometry
 constexpr int XNT = 256;                 // tokens per tile (wgmma n)
+#endif  // PGN_WSET
 constexpr int BK  = 64;                  // k per stage
 constexpr int NKT = 64;                  // k-tiles (K = 4096 for both GEMMs)
 constexpr int XB  = XNT * BK * 2;        // 32768: one k-tile token image [256 t][128 B], 128B-swizzled K-major
 constexpr int WSB = 5120;                // merged W(4096) + bf16 scale pairs (1024) per (wt, kt)
+#ifdef PGN_WSET
+constexpr int SB  = (16384 + 2 * WSB + 1023) / 1024 * 1024;   // PAIR stage: X 2 x 8 KB + W|sf 2 x WSB
+#else   // PGN_WSET
 constexpr int SB  = 37888;               // stage stride: X 32768 + W|sf 5120 (a whole number of 1024 B atoms)
+#endif  // PGN_WSET
 constexpr int PREGS = 40, CREGS = 232;   // setmaxnreg targets
 static_assert(128 * PREGS + 256 * CREGS <= 384 * 168, "setmaxnreg budget exceeds the launch allocation");
 constexpr int EPI1 = XB / 2;             // gg1 epilogue per WG: its half of the inter tile [256 t][64 B] (SW64)
@@ -152,16 +176,33 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
     const int npm = min(num_pid_m, *n_padded / bm);
     if (tid == 0) total_s = 0;
     __syncthreads();
+#ifdef PGN_WSET
+    const int CLS[6] = {15, 11, 7, 3, 1, 0};
+    const int CLM[6] = {0, 4, 2, 1, 8, 16};
+    for (int ci = 0; ci < 6; ci++) {
+        const int cls = CLS[ci];
+        if (cls != XNT / 16 - 1 && !(wmask & CLM[ci])) continue;   // the full-block class always runs
+#else   // PGN_WSET
     for (int cls = 3; cls >= 0; cls--) {
+#endif  // PGN_WSET
         for (int base = 0; base < npm; base += 1024) {
             const int pm = base + tid;
             const bool live_blk = pm < npm && (unsigned)block_experts[pm] < (unsigned)nle;
+#ifdef PGN_WSET
+            int code = 7;
+            if (live_blk && bm == XNT) {
+                const int* sid = sorted_ids + (size_t)pm * XNT;
+                if ((wmask & 1) && sid[64] >= numel) code = 3;
+                if ((wmask & 8) && sid[32] >= numel) code = 1;
+                if ((wmask & 16) && sid[16] >= numel) code = 0;
+#else   // PGN_WSET
             int code = 3;
             if (live_blk && bm == 256) {
                 const int* sid = sorted_ids + (size_t)pm * 256;
                 if ((wmask & 4) && sid[192] >= numel) code = 2;
                 if ((wmask & 2) && sid[128] >= numel) code = 1;
                 if ((wmask & 1) && sid[64] >= numel) code = 0;
+#endif  // PGN_WSET
             }
             const bool ok = live_blk && code == cls;
             const unsigned bal = __ballot_sync(0xFFFFFFFFu, ok);
@@ -312,10 +353,19 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
 // effective wgmma width of a block: the smallest COMPILED width (WSET bit0 64, bit1 128, bit2 192; 256 always)
 // covering the width code from pg_tiles. Producer and consumers must agree (the producer stages nv columns).
 template <int WSET> DINL int eff_nv(int wcode) {
+#ifdef PGN_WSET
+    const int need = 16 * (wcode + 1);
+    if ((WSET & 16) && need <= 16) return 16;
+    if ((WSET & 8) && need <= 32) return 32;
+    if ((WSET & 1) && need <= 64) return 64;
+    if ((WSET & 2) && need <= 128) return 128;
+    return XNT;
+#else   // PGN_WSET
     if ((WSET & 1) && wcode == 0) return 64;
     if ((WSET & 2) && wcode <= 1) return 128;
     if ((WSET & 4) && wcode <= 2) return 192;
     return 256;
+#endif  // PGN_WSET
 }
 
 // item of CTA b in round j: round-robin, or snake (odd rounds reversed) over the widest-first item list, which
@@ -329,7 +379,13 @@ template <int NV> DINL void wgmma_nv(float* d, unsigned* a, unsigned long long d
     if constexpr (NV == 256) wgmma_n256(d, a, db, accum);
     else if constexpr (NV == 192) wgmma_n192(d, a, db, accum);
     else if constexpr (NV == 128) wgmma_n128(d, a, db, accum);
+#ifdef PGN_WSET
+    else if constexpr (NV == 64) wgmma_n64(d, a, db, accum);
+    else if constexpr (NV == 32) wgmma_n32(d, a, db, accum);
+    else wgmma_n16(d, a, db, accum);
+#else   // PGN_WSET
     else wgmma_n64(d, a, db, accum);
+#endif  // PGN_WSET
 }
 
 // ------------------------------------------------------------------ consumer pieces (force-inlined)
@@ -420,10 +476,17 @@ DINL void release_rest(Ctx& c, int n) {
 // per-width arrays ptxas kept every width's accumulators apart and ran out of the 232 registers (C7512, spills).
 // gsv = the expert's global scale (gg1), rids = the item's 256 route ids in smem (gg2): both staged by the
 // producer with the item's first stage, so no consumer ever waits on a global load.
+#ifdef PGN_WSET
+template <int GATED, int NST, int MODE, int NV, int PAIR64, int ACC = XNT / 2, int N4 = 0>
+DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB)[16], int pm, int wt, float gsv,
+                    const int* rids, void* __restrict__ out, int NWT, int numel) {
+    constexpr int PR = (PAIR64 && NV <= 64) ? 1 : 0;
+#else   // PGN_WSET
 template <int GATED, int NST, int MODE, int NV, int PAIR64, int ACC = 128, int N4 = 0>
 DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB)[16], int pm, int wt, float gsv,
                     const int* rids, void* __restrict__ out, int NWT, int numel) {
     constexpr int PR = (PAIR64 && NV == 64) ? 1 : 0;
+#endif  // PGN_WSET
     for (int kt = 0; kt < NKT; kt += 2) {
         kstep<GATED, NV, NST, MODE, 1, PR, 0, N4>(c, kt, acc, bA);
         kstep<GATED, NV, NST, MODE, 1, PR, 1, N4>(c, kt + 1, acc, bB);
@@ -451,6 +514,20 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
         // stmatrix.trans matrix m of an x4 = i-block 4s+m (tokens 8i..8i+7); lane 8m+j -> token t = 8i+j gets this
         // warp's 8 features = chunk lw of the row, stored at chunk lw ^ ((t >> 1) & 3) (64B swizzle; t & 7 = lane & 7)
         const unsigned lanebase = epi + ((lane >> 3) * 8 + (lane & 7)) * 64 + ((lw ^ (((lane & 7) >> 1) & 3)) << 4);
+#ifdef PGN_WSET
+        if constexpr (NV == 16) {
+            unsigned r[2];
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                float t0, t1;
+                asm("tanh.approx.f32 %0, %1;" : "=f"(t0) : "f"(acc[4 * i] * hgs));
+                asm("tanh.approx.f32 %0, %1;" : "=f"(t1) : "f"(acc[4 * i + 1] * hgs));
+                const float p0 = acc[4 * i] * acc[4 * i + 2] * gus, p1 = acc[4 * i + 1] * acc[4 * i + 3] * gus;
+                r[i] = b2u32(__floats2bfloat162_rn(fmaf(p0, t0, p0), fmaf(p1, t1, p1)));
+            }
+            stsm_x2_trans(lanebase, r[0], r[1]);
+        }
+#endif  // PGN_WSET
 #pragma unroll
         for (int s = 0; s < NV / 32; s++) {
             unsigned r[4];
@@ -476,11 +553,20 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
         const float sc2 = 256.0f;                        // 2^8 decode comp (bf16 intermediate: no headroom)
         __nv_bfloat16* yp = reinterpret_cast<__nv_bfloat16*>(out);
         const char* epp = c.smem + (epi - c.sbase);
+#ifdef PGN_WSET
+        constexpr int NPS = (NV + 63) / 64, NSG = NV >= 64 ? 4 : NV / 16;   // passes, x4 groups per pass
+#pragma unroll
+        for (int p = 0; p < NPS; p++) {                  // 64-token passes (one partial pass below 64)
+            named_bar_sync(bar, 128);                 // previous pass's readers are done
+#pragma unroll
+            for (int s = 0; s < NSG; s++) {              // 4 x4-groups = 16 matrices (8 i-blocks x 2 row halves)
+#else   // PGN_WSET
 #pragma unroll
         for (int p = 0; p < NV / 64; p++) {              // 64-token passes
             named_bar_sync(bar, 128);                 // previous pass's readers are done
 #pragma unroll
             for (int s = 0; s < 4; s++) {                // 4 x4-groups = 16 matrices (8 i-blocks x 2 row halves)
+#endif  // PGN_WSET
                 unsigned r[4];
 #pragma unroll
                 for (int m = 0; m < 4; m++) {
@@ -497,7 +583,11 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
             }
             named_bar_sync(bar, 128);
 #pragma unroll
+#ifdef PGN_WSET
+            for (int cc = 0; cc < NSG; cc++) {
+#else   // PGN_WSET
             for (int cc = 0; cc < 4; cc++) {
+#endif  // PGN_WSET
                 const int idx = cc * 128 + wtid;
                 const int row = idx >> 3, ch = idx & 7;
                 const int rid = rids[64 * p + row];
@@ -697,7 +787,11 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
                 mt[0] = pm; mt[1] = wt; mt[2] = wcode; mt[3] = __float_as_int(gsv);
                 const char* xs = xg + (size_t)pm * NKT * XB;
                 const char* ws = wsf + ((size_t)e * NWT + wt) * (size_t)NKT * WSB;
+#ifdef PGN_WSET
+                const bool pr = PAIR64 && nv <= 64;     // two k-tiles per slot (see kstep)
+#else   // PGN_WSET
                 const bool pr = PAIR64 && nv == 64;     // two k-tiles per slot (see kstep)
+#endif  // PGN_WSET
                 const int nslot = pr ? NKT / 2 : NKT;
                 for (int ks = 0; ks < nslot; ks++) {
                     if (rnd > 0) mbar_wait(mb + NST * 8 + sl * 8, (rnd - 1) & 1);
@@ -720,15 +814,26 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
                         bulk_g2s(st + XB, ws + (size_t)kt * WSB, WSB, mb + sl * 8);
                     } else {
                         const int kt = 2 * ks;
+#ifdef PGN_WSET
+                        mbar_expect_tx(mb + sl * 8, 2 * nv * 128 + 2 * WSB + ridb);
+#else   // PGN_WSET
                         mbar_expect_tx(mb + sl * 8, 2 * 8192 + 2 * WSB + ridb);
+#endif  // PGN_WSET
 #pragma unroll
                         for (int sub = 0; sub < 2; sub++) {
                             const char* xk = xs + (size_t)(kt + sub) * XB;
                             if (GATED) {
+#ifdef PGN_WSET
+                                bulk_g2s(st + sub * 8192, xk, nv * 128, mb + sl * 8);
+                            } else {
+                                bulk_g2s(st + sub * 8192, xk, nv * 64, mb + sl * 8);
+                                bulk_g2s(st + sub * 8192 + 4096, xk + XB / 2, nv * 64, mb + sl * 8);
+#else   // PGN_WSET
                                 bulk_g2s(st + sub * 8192, xk, 8192, mb + sl * 8);
                             } else {
                                 bulk_g2s(st + sub * 8192, xk, 4096, mb + sl * 8);
                                 bulk_g2s(st + sub * 8192 + 4096, xk + XB / 2, 4096, mb + sl * 8);
+#endif  // PGN_WSET
                             }
                         }
                         bulk_g2s(st + 16384, ws + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);   // W|sf kt, kt+1
@@ -775,13 +880,27 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
         const int pm = mt[0], wt = mt[1], wcode = mt[2];
         const float gsv = __int_as_float(mt[3]);
         const int* rids = rid_s + (j & 1) * XNT;
+#ifdef PGN_WSET
+        float acc[XNT / 2];
+#else   // PGN_WSET
         float acc[128];
+#endif  // PGN_WSET
         unsigned bA[16], bB[16];
         if (MODE != 0) {
 #pragma unroll
             for (int i = 0; i < 16; i++) { bA[i] = 0x3F803F80u; bB[i] = 0x3F803F80u; }
         }
         const int nv = eff_nv<WSET>(wcode);
+#ifdef PGN_WSET
+        if ((WSET & 16) && nv == 16)
+            item_body<GATED, NST, MODE, 16, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+        else if ((WSET & 8) && nv == 32)
+            item_body<GATED, NST, MODE, 32, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+        else if ((WSET & 1) && nv == 64)
+            item_body<GATED, NST, MODE, 64, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+        else
+            item_body<GATED, NST, MODE, XNT, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+#else   // PGN_WSET
         if ((WSET & 1) && nv == 64)
             item_body<GATED, NST, MODE, 64, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
         else if ((WSET & 2) && nv == 128)
@@ -790,6 +909,7 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
             item_body<GATED, NST, MODE, 192, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
         else
             item_body<GATED, NST, MODE, 256, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+#endif  // PGN_WSET
     }
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
 }
@@ -1076,7 +1196,11 @@ void tiles(torch::Tensor block_experts, torch::Tensor n_padded, torch::Tensor so
            int64_t num_pid_m, int64_t bm, int64_t numel, int64_t wmask, int64_t nle) {
     pgk::pg_tiles<<<1, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
         block_experts.data_ptr<int>(), n_padded.data_ptr<int>(), sorted_ids.data_ptr<int>(), (int)numel,
+#ifdef PGN_WSET
+        (int)num_pid_m, (int)bm, (int)PGN_WSET, (int)nle, live.data_ptr<int>());
+#else   // PGN_WSET
         (int)num_pid_m, (int)bm, (int)wmask, (int)nle, live.data_ptr<int>());
+#endif  // PGN_WSET
 }
 
 // out: [numel] per-route slots, emap: [256] per-expert map; either may be empty (not written); passes: st weights
@@ -1125,7 +1249,11 @@ void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::
             int64_t pdl) {
     TORCH_CHECK(x.size(1) == pgk::NKT * 64 && numel == x.size(0) * 8, "pg gather: K 4096, topk 8");
     const int npm = live.size(0) - 1;
+#ifdef PGN_WSET
+    pg_launch(pgk::pg_gather<PGN_WSET, 8>, dim3(pgk::NKT / 8, npm), dim3(256), 0, pdl != 0,
+#else   // PGN_WSET
     pg_launch(pgk::pg_gather<3, 8>, dim3(pgk::NKT / 8, npm), dim3(256), 0, pdl != 0,
+#endif  // PGN_WSET
               reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<char*>(xg.data_ptr()),
               sorted_ids.data_ptr<int>(), live.data_ptr<int>(), (int)numel);
 }
@@ -1141,7 +1269,11 @@ void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, 
                 live.numel() >= nl + (numel + pgk::XNT - 1) / pgk::XNT + 1, "pg route: output sizes");
     const int* em = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
     pg_launch(pgk::pg_route, dim3(1), dim3(1024), 0, pdl != 0, topk_ids.data_ptr<int>(), em, (int)n_global,
+#ifdef PGN_WSET
+              (int)numel, (int)PGN_WSET, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
+#else   // PGN_WSET
               (int)numel, 3 /* = _WMASK */, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
+#endif  // PGN_WSET
               block_experts.data_ptr<int>(), live.data_ptr<int>());
 }
 
@@ -1180,7 +1312,11 @@ void gather_norm(torch::Tensor x, torch::Tensor gamma, double eps, torch::Tensor
     TORCH_CHECK(gamma.numel() == pgk::NKT * 64 && gamma.scalar_type() == at::kBFloat16 && gamma.is_contiguous(),
                 "pg gather_norm: bf16 [4096] weight");
     const int npm = live.size(0) - 1;
+#ifdef PGN_WSET
+    pg_launch(pgk::pg_gather_norm<PGN_WSET>, dim3(pgk::NKT / 8, npm), dim3(256), 0, pdl != 0,
+#else   // PGN_WSET
     pg_launch(pgk::pg_gather_norm<3>, dim3(pgk::NKT / 8, npm), dim3(256), 0, pdl != 0,
+#endif  // PGN_WSET
               reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
               reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr()), (float)eps,
               reinterpret_cast<char*>(xg.data_ptr()), sorted_ids.data_ptr<int>(), live.data_ptr<int>(), (int)numel);
@@ -1213,7 +1349,11 @@ void gg1(torch::Tensor xg, torch::Tensor wsf, torch::Tensor gs, torch::Tensor in
          torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl) {
     TORCH_CHECK(cfg == 350, "pg: only cfg 350 is built");
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
+#ifdef PGN_WSET
+    launch<1, PGN_NST, 0, PGN_WSET>(xg, wsf, gs.data_ptr<float>(), inter.data_ptr(), nullptr, block_experts, live, 0, grid,
+#else   // PGN_WSET
     launch<1, 5, 0, 3>(xg, wsf, gs.data_ptr<float>(), inter.data_ptr(), nullptr, block_experts, live, 0, grid,
+#endif  // PGN_WSET
                        snake, pdl != 0);
 }
 
@@ -1221,9 +1361,14 @@ void gg2(torch::Tensor xg, torch::Tensor wsf, torch::Tensor y, torch::Tensor sor
          torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl) {
     TORCH_CHECK(cfg == 350, "pg: only cfg 350 is built");
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
+#ifdef PGN_WSET
+    launch<0, PGN_NST, 0, PGN_WSET>(xg, wsf, nullptr, y.data_ptr(), sorted_ids.data_ptr<int>(), block_experts, live,
+#else   // PGN_WSET
     launch<0, 5, 0, 3>(xg, wsf, nullptr, y.data_ptr(), sorted_ids.data_ptr<int>(), block_experts, live,
+#endif  // PGN_WSET
                        (int)numel, grid, snake, pdl != 0);
 }
 """
 
-_CUDA_SRC = _CUDA_SRC.replace("@@WGMMA@@", "".join(_wgmma_asm(n) for n in (256, 192, 128, 64)))
+_CUDA_SRC = _CUDA_SRC.replace("@@WGMMA@@", "".join(_wgmma_asm(n) for n in (256, 192, 128, 64))).replace(
+    "@@WGMMA_N@@", _wgmma_asm(32) + _wgmma_asm(16))
