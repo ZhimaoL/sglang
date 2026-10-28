@@ -832,7 +832,7 @@ class MuseSpark1xMoE(nn.Module):
                 return output
             comm = get_tp_group().ca_comm if self.tp_size > 1 else None
             if not getattr(get_forward(), "sp_active", False) and gemm_ag_supported(
-                comm, output, self.post_expert_proj.weight
+                comm, output, self.post_expert_proj.weight, okc_patch.GEMM_AG_UNPOOLER_MAX_TOKENS
             ):
                 # Returns this rank's [M, H / world] slice; the FFN boundary gathers it.
                 if self._defers_unpool_gather(comm, output.shape[0]):
@@ -915,8 +915,8 @@ class MuseSpark1xMoE(nn.Module):
             if (
                 self.tp_size in (4, 8)
                 and not sp_active
-                and large_m_capable(hidden_states.device, hidden_states.shape[0])
-                and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
+                and large_m_capable(hidden_states.device, hidden_states.shape[0], okc_patch.GEMM_AG_POOLER_MAX_TOKENS)
+                and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight, okc_patch.GEMM_AG_POOLER_MAX_TOKENS)
             ):
                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
             else:
