@@ -172,11 +172,26 @@ def build_extend_attn_split(
     )
 
 
+# Sliding layers split off the riders only beside a prefill this large: the riders'
+# own FA3 sliding call costs ~160 us, which fmha7's gain on the prefill pays back
+# only on ~16K-token chunks (1xH200: 16K + 32 riders split +98 vs one call +121 us;
+# a 970-token extend + 15 riders split +162 vs one call +21 us).
+_RIDE_SLIDING_SPLIT_MIN_TOKENS = 8192
+
+
 def ride_split_mode(split: ExtendAttnSplit, is_swa_layer: bool, fmha_layer: bool):
-    """How a ride-along layer runs its attention: None = one FA3 call over every row;
+    """How a ride-along layer runs its attention (serving/kernels/ride-along LOG R4):
+    None = one FA3 call over every row (fmha7 declines a batch with 8-row requests);
     True / False = the prefills (fmha7 hook, else FA3) and the riders' blocks (FA3,
-    verify-shaped) as two calls, the riders' on a side stream / after the prefills'."""
-    return True
+    verify-shaped) as two calls, the riders' on a side stream / after the prefills'.
+    Full layers always split (fmha7 keeps the prefill: 970-token extend + 15 riders
+    +242 us vs +545 in one call); the side stream only pays beside a ragged prefill
+    head, whose per-request calls leave the GPU gaps (+224 vs +363 us)."""
+    if is_swa_layer and (
+        not fmha_layer or split.head_tokens < _RIDE_SLIDING_SPLIT_MIN_TOKENS
+    ):
+        return None
+    return split.head_reqs > 1
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -1476,9 +1491,7 @@ class FlashAttentionBackend(AttentionBackend):
                 split.tail_max_q,
                 tail_out,
                 page_table[rows],
-                # A 2,048-key window needs no split-KV; FA3's heuristic over the
-                # 8-row blocks splits anyway (~155 vs ~25 us for 15 riders).
-                1 if window_size != (-1, -1) else self.num_splits,
+                self.num_splits,
             )
 
         if not side_stream:
