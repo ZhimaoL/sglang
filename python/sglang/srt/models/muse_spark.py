@@ -1206,7 +1206,9 @@ class MuseSpark1xMoE(nn.Module):
         prenorm_shard = self._okc_prenorm_shard()
         if prenorm_shard and not prenormed:
             expert_input = self.pre_expert_norm(expert_input)
-        grouped = _okc_grouped_gather(tp_group, (expert_input, topk_scores, topk_ids)) if okc_patch.SP_AG_GROUP else None
+        grouped = _okc_push_gather(tp_group, expert_input, topk_scores, topk_ids)
+        if grouped is None and okc_patch.SP_AG_GROUP:
+            grouped = _okc_grouped_gather(tp_group, (expert_input, topk_scores, topk_ids))
         if grouped is not None:
             full_input, full_scores, full_ids = grouped
         else:
@@ -1231,6 +1233,23 @@ class MuseSpark1xMoE(nn.Module):
         shard = output.new_empty((expert_input.shape[0], *output.shape[1:]))
         tp_group.reduce_scatter_tensor(shard, output)
         return shard
+
+
+def _okc_push_gather(tp_group, x, scores, ids):
+    """OKC_SP_AG_PUSH: the section's three gathers as one push-plane launch (pg_moe.ag_rows) up to
+    OKC_SP_AG_PUSH_MAX_TOKENS gathered rows, else None. The predicate is the same on every rank."""
+    comm = tp_group.ca_comm
+    if not (okc_patch.SP_AG_PUSH and getattr(comm, "has_multicast", False) and not comm.disabled):
+        return None
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
+    s, w = x.shape[0], comm.world_size
+    if not (x.dtype == torch.bfloat16 and tuple(x.shape) == (s, 4096) and scores.dtype == torch.float32
+            and ids.dtype == torch.int32 and tuple(scores.shape) == tuple(ids.shape) == (s, 8)
+            and s * w <= okc_patch.SP_AG_PUSH_MAX_TOKENS and s * 520 * 16 <= comm.max_push_size
+            and comm.config.num_push_blocks >= 2):
+        return None
+    return pg_moe.ag_rows(comm, x.contiguous(), scores.contiguous(), ids.contiguous())
 
 
 def _okc_grouped_gather(tp_group, shards):

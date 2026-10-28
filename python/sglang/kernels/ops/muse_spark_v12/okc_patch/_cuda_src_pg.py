@@ -1146,6 +1146,78 @@ __global__ void __launch_bounds__(256) pg_rep_split(const int* __restrict__ ids,
     }
 }
 
+
+// ------------------------------------------------------------------ SP row gather on the push plane (OKC_SP_AG_PUSH)
+// The SP MoE section's three all-gathers in one launch on CustomAllReduceV2's push plane, with its protocol (+0.0
+// halves mark "not arrived", one phase counter per block): every rank's [S, 4096] bf16 rows, [S, 8] fp32 scores and
+// [S, 8] int32 ids -> [world S, ...] in rank order. A slot row is the row's 512 16 B vectors, then 8 vectors holding the
+// 16 words two per vector as 11 / 11 / 10-bit pieces with 0x8000 in every half. A +0.0 in the rows arrives as -0.0.
+constexpr int AGR_V = NKT * 8 + 8;
+DINL bool agr_ready(uint4 r) {
+    return (r.x & 0xffffu) && (r.x >> 16) && (r.y & 0xffffu) && (r.y >> 16) && (r.z & 0xffffu) && (r.z >> 16) &&
+           (r.w & 0xffffu) && (r.w >> 16);
+}
+__global__ void __launch_bounds__(512) pg_ag_rows(const uint4* __restrict__ x, const unsigned* __restrict__ sc,
+                                                  const unsigned* __restrict__ ids, uint4* __restrict__ out,
+                                                  unsigned* __restrict__ osc, unsigned* __restrict__ oids,
+                                                  unsigned* counter, int nctr, char* ws, char* mc, unsigned half,
+                                                  int rank, int world, int S) {
+    const int bx = blockIdx.x, tx = threadIdx.x;
+    pdl_wait();
+    const unsigned phase = counter[bx] & 1;
+    ws += half * phase;
+    mc += half * phase;
+    if (bx == gridDim.x - 1) {   // the last block flips its own counter and every one past the grid
+        pdl_trigger();
+        __syncthreads();
+        for (int i = bx + tx; i < nctr; i += 512) counter[i] = phase ^ 1;
+        return;
+    }
+    const int stride = (gridDim.x - 1) * 512;
+    for (int v = bx * 512 + tx; v < S * AGR_V; v += stride) {
+        const int row = v / AGR_V, c = v % AGR_V;
+        uint4 r;
+        if (c < NKT * 8) {
+            r = x[row * NKT * 8 + c];
+            unsigned* w = reinterpret_cast<unsigned*>(&r);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (!(w[j] & 0xffffu)) w[j] |= 0x8000u;
+                if (!(w[j] >> 16)) w[j] |= 0x80000000u;
+            }
+        } else {
+            const int k = (c - NKT * 8) * 2;
+            const unsigned b0 = k < 8 ? sc[row * 8 + k] : ids[row * 8 + k - 8];
+            const unsigned b1 = k < 8 ? sc[row * 8 + k + 1] : ids[row * 8 + k - 7];
+            r = make_uint4((b0 & 0x7ffu) | (b0 >> 11 & 0x7ffu) << 16 | 0x80008000u,
+                           b0 >> 22 | (b1 & 0x7ffu) << 16 | 0x80008000u,
+                           (b1 >> 11 & 0x7ffu) | b1 >> 22 << 16 | 0x80008000u, 0x80008000u);
+        }
+        asm volatile("multimem.st.weak.global.v4.f32 [%4], {%0, %1, %2, %3};" ::"r"(r.x), "r"(r.y), "r"(r.z),
+                     "r"(r.w), "l"(mc + ((size_t)(rank * S + row) * AGR_V + c) * 16) : "memory");
+    }
+    pdl_trigger();
+    for (int v = bx * 512 + tx; v < world * S * AGR_V; v += stride) {
+        uint4* src = reinterpret_cast<uint4*>(ws) + v;
+        uint4 r;
+        do {
+            asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z),
+                         "=r"(r.w) : "l"(src));
+        } while (!agr_ready(r));
+        const int g = v / AGR_V, c = v % AGR_V;
+        if (c < NKT * 8) {
+            out[g * NKT * 8 + c] = r;
+        } else {
+            const int k = (c - NKT * 8) * 2;
+            unsigned* o = k < 8 ? osc + g * 8 + k : oids + g * 8 + k - 8;
+            o[0] = (r.x & 0x7ffu) | (r.x >> 16 & 0x7ffu) << 11 | (r.y & 0x3ffu) << 22;
+            o[1] = (r.y >> 16 & 0x7ffu) | (r.z & 0x7ffu) << 11 | (r.z >> 16 & 0x3ffu) << 22;
+        }
+        *src = make_uint4(0u, 0u, 0u, 0u);
+    }
+    __syncthreads();
+    if (tx == 0) counter[bx] = phase ^ 1;
+}
 }  // namespace pgk
 
 // ------------------------------------------------------------------ host
@@ -1255,6 +1327,24 @@ void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, 
               (int)numel, 3 /* = _WMASK */, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
 #endif  // PGN_WSET
               block_experts.data_ptr<int>(), live.data_ptr<int>());
+}
+
+// SP row gather (pg_ag_rows): x [S, 4096] bf16, sc [S, 8] fp32, ids [S, 8] int32 -> out [world S, 4096], osc, oids;
+// counter / ws / mc / half: CustomAllReduceV2's push counter, this rank's push workspace base, its multicast base and
+// world x slot bytes
+void ag_rows(torch::Tensor x, torch::Tensor sc, torch::Tensor ids, torch::Tensor out, torch::Tensor osc,
+             torch::Tensor oids, torch::Tensor counter, int64_t ws, int64_t mc, int64_t half, int64_t rank,
+             int64_t world, int64_t pdl) {
+    const int S = (int)x.size(0);
+    TORCH_CHECK(x.size(1) == pgk::NKT * 64 && sc.size(0) == S && ids.size(0) == S && out.size(0) == S * world &&
+                (int64_t)S * pgk::AGR_V * 16 * world <= half && counter.numel() >= 2, "pg ag_rows: shapes / capacity");
+    const int nctr = (int)counter.numel();
+    const int nb = std::min((int)((world * S * pgk::AGR_V + 511) / 512), nctr - 1);
+    pg_launch(pgk::pg_ag_rows, dim3(nb + 1), dim3(512), 0, pdl != 0, reinterpret_cast<const uint4*>(x.data_ptr()),
+              reinterpret_cast<const unsigned*>(sc.data_ptr()), reinterpret_cast<const unsigned*>(ids.data_ptr()),
+              reinterpret_cast<uint4*>(out.data_ptr()), reinterpret_cast<unsigned*>(osc.data_ptr()),
+              reinterpret_cast<unsigned*>(oids.data_ptr()), reinterpret_cast<unsigned*>(counter.data_ptr()), nctr,
+              reinterpret_cast<char*>(ws), reinterpret_cast<char*>(mc), (unsigned)half, (int)rank, (int)world, S);
 }
 
 // Large-T front end: ids [numel] int32 / int64 global ids (emap [n_global] int32, global -> local slot) or local slot ids
