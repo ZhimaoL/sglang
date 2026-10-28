@@ -748,6 +748,79 @@ __global__ void __launch_bounds__(256) pg_gather_norm(const __nv_bfloat16* __res
     }
 }
 
+// pg_gather_norm with one warp per token row: the same per-token fp32 sequence (bitwise the same images), and the warp
+// that reduced the row stores all 8 of its 512-column chunks (the per-chunk form reads each row once per chunk CTA)
+template <int WSET>
+__global__ void __launch_bounds__(256) pg_gather_norm_row(const __nv_bfloat16* __restrict__ x,
+                                                          const __nv_bfloat16* __restrict__ gamma, float eps,
+                                                          char* __restrict__ xg, const int* __restrict__ sorted_ids,
+                                                          const int* __restrict__ live, int numel) {
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int vy = lane >> 3, vi = lane & 7;
+    pdl_wait();
+    pdl_trigger();
+    const int li = blockIdx.y;
+    const int nlive = live[0];
+    const int ent = live[1 + li];
+    if (li >= nlive) return;
+    const int pm = ent & 0xFFFFF;
+    const int nv = eff_nv<WSET>(ent >> 20);
+    const int* sid = sorted_ids + pm * XNT;
+    char* img = xg + (size_t)pm * NKT * XB;
+    for (int t = w + 8 * blockIdx.z; t < nv; t += 8 * gridDim.z) {
+        const int rid = sid[t];
+        uint2 v[4][8];
+        float rs = 0.f;
+        if (rid < numel) {
+            const uint2* row = reinterpret_cast<const uint2*>(x + (size_t)(rid >> 3) * (NKT * 64));
+#pragma unroll
+            for (int q = 0; q < 4; q++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) v[q][j] = row[128 * j + 32 * vy + vi + 8 * q];
+            float sq[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                float a = 0.f;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float2 lo = __bfloat1622float2(u32b2(v[q][j].x));
+                    const float2 hi = __bfloat1622float2(u32b2(v[q][j].y));
+                    a = __fmaf_rn(lo.x, lo.x, a);
+                    a = __fmaf_rn(lo.y, lo.y, a);
+                    a = __fmaf_rn(hi.x, hi.x, a);
+                    a = __fmaf_rn(hi.y, hi.y, a);
+                }
+                sq[q] = a;
+            }
+            float c = __fadd_rn(__fadd_rn(sq[0], sq[2]), __fadd_rn(sq[1], sq[3]));   // steps 16, 8
+            c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 4));
+            c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 2));
+            c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 1));
+            const float w0 = __shfl_sync(0xFFFFFFFFu, c, 0), w1 = __shfl_sync(0xFFFFFFFFu, c, 8);
+            const float w2 = __shfl_sync(0xFFFFFFFFu, c, 16), w3 = __shfl_sync(0xFFFFFFFFu, c, 24);
+            const float m2 = __fdiv_rn(__fadd_rn(__fadd_rn(w0, w2), __fadd_rn(w1, w3)), 4096.f);
+            rs = rsqrtf(__fadd_rn(m2, eps));
+        }
+#pragma unroll
+        for (int kb = 0; kb < 8; kb++) {
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                uint2 o = make_uint2(0u, 0u);
+                if (rid < numel) {
+                    const uint2 g = reinterpret_cast<const uint2*>(gamma)[128 * kb + 32 * vy + vi + 8 * q];
+                    const float2 xl = __bfloat1622float2(u32b2(v[q][kb].x)), xh = __bfloat1622float2(u32b2(v[q][kb].y));
+                    const float2 gl = __bfloat1622float2(u32b2(g.x)), gh = __bfloat1622float2(u32b2(g.y));
+                    o.x = b2u32(__floats2bfloat162_rn(__fmul_rn(gl.x, __fmul_rn(rs, xl.x)), __fmul_rn(gl.y, __fmul_rn(rs, xl.y))));
+                    o.y = b2u32(__floats2bfloat162_rn(__fmul_rn(gh.x, __fmul_rn(rs, xh.x)), __fmul_rn(gh.y, __fmul_rn(rs, xh.y))));
+                }
+                const int vl = 32 * vy + vi + 8 * q;
+                const int kt = kb * 8 + (vl >> 4), ch = (vl & 15) >> 1;
+                *reinterpret_cast<uint2*>(img + (size_t)kt * XB + t * 128 + ((ch ^ (t & 7)) << 4) + ((vl & 1) << 3)) = o;
+            }
+        }
+    }
+}
+
 // number of live entries before the first 64-wide one (pg_tiles stores the classes widest first)
 DINL int n_wide_entries(const int* __restrict__ live) {
     int lo = 0, hi = live[0];
@@ -1565,11 +1638,13 @@ void gather_norm(torch::Tensor x, torch::Tensor gamma, double eps, torch::Tensor
     TORCH_CHECK(gamma.numel() == pgk::NKT * 64 && gamma.scalar_type() == at::kBFloat16 && gamma.is_contiguous(),
                 "pg gather_norm: bf16 [4096] weight");
     const int npm = live.size(0) - 1;
-    const dim3 grid(pgk::NKT / 8, npm, split > 1 ? (unsigned)split : 1u);   // split: CTAs per block's token rows
+    // split > 0: CTAs per block's token rows, one CTA per 512-column chunk; split < 0: -split CTAs per block, a warp
+    // per token row (pg_gather_norm_row)
+    const dim3 grid(split < 0 ? 1 : pgk::NKT / 8, npm, split > 1 ? (unsigned)split : split < 0 ? (unsigned)-split : 1u);
 #ifdef PGN_WSET
-    pg_launch(pgk::pg_gather_norm<PGN_WSET>, grid, dim3(256), 0, pdl != 0,
+    pg_launch(split < 0 ? pgk::pg_gather_norm_row<PGN_WSET> : pgk::pg_gather_norm<PGN_WSET>, grid, dim3(256), 0, pdl != 0,
 #else   // PGN_WSET
-    pg_launch(pgk::pg_gather_norm<3>, grid, dim3(256), 0, pdl != 0,
+    pg_launch(split < 0 ? pgk::pg_gather_norm_row<3> : pgk::pg_gather_norm<3>, grid, dim3(256), 0, pdl != 0,
 #endif  // PGN_WSET
               reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
               reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr()), (float)eps,

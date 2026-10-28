@@ -16,7 +16,9 @@ replica).
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL
+from sglang.kernels.ops.muse_spark_v12.okc_patch import (
+    PG64_MAX_T, PG_GN_ROW, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL,
+)
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow64_ext, pg_narrow_ext
 
 _BLOCK_M = 256
@@ -255,7 +257,8 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     if norm_weight is None:
         ext.gather(x, xg_t, sorted_ids, live, numel, p)
     else:
-        ext.gather_norm(x, norm_weight, norm_eps, xg_t, sorted_ids, live, numel, p, PG_GN_SPLIT)
+        ext.gather_norm(x, norm_weight, norm_eps, xg_t, sorted_ids, live, numel, p,
+                        -PG_GN_ROW if PG_GN_ROW > 0 else PG_GN_SPLIT)   # PG_GN_ROW: warp-per-row form
     inter_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
     ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, 0, p)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=dev)

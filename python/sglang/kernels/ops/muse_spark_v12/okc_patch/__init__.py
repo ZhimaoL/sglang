@@ -56,6 +56,8 @@ PG64_MAX_T = int(os.environ.get("OKC_PG64_MAX_T", "256"))
 # pg_gather_norm (the small front end's normed token images) splits each block's token rows over this many CTAs: the
 # per-warp row loop was the kernel's latency chain (LOG E21: 11-14 -> 7-10 us at T 96-256, outputs unchanged).
 PG_GN_SPLIT = int(os.environ.get("OKC_PG_GN_SPLIT", "2"))
+# ... or, > 0: this many CTAs per block with one warp per token row, each row read once (extend E37; 0: off)
+PG_GN_ROW = int(os.environ.get("OKC_PG_GN_ROW", "8"))
 # st pair (okc_patch/st_moe.py: the same packs read by mma.sync n8 tiles) on pg-only layers at T <=
 # OKC_MOE_ST_MAX_TOKENS (verify bs 1..9); OKC_MOE_ST_PDL launches its down kernel with PDL.
 SW_MOE_ST = _flag("OKC_SW_MOE_ST", "1")
@@ -284,7 +286,7 @@ RIDE_CORE = _flag("OKC_RIDE_CORE", "1")
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
+           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "PG_GN_ROW", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
