@@ -227,6 +227,8 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
     if (tid == 0) live[0] = total_s;
 }
 
+// the replica balancer (rep_owner, _cuda_src_rep.py, shared with st): pg_route and pg_rep_assign
+@@REP@@
 // ------------------------------------------------------------------ routing front end (verify / decode / extends)
 // One CTA in place of topk_ids -> local ids (expert map), moe_align_block_size and pg_tiles, for numel <= RT_MAX
 // routes (up to 3072-token extends): local slot e < nl <= RT_E (32 home + replicas) gets ceil(count_e / XNT)
@@ -258,8 +260,10 @@ DINL int route_cls(int i) { return RT_N16 ? (i < 4 ? 15 - 4 * i : 1 - (i - 4)) :
 __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_ids, const int* __restrict__ emap,
                                                  int n_global, int numel, int wmask, int nl,
                                                  int* __restrict__ local_ids, int* __restrict__ sorted_ids,
-                                                 int* __restrict__ block_experts, int* __restrict__ live) {
+                                                 int* __restrict__ block_experts, int* __restrict__ live,
+                                                 const int* __restrict__ rtab, int n_rep, int me) {
     __shared__ int wc[32][RT_E + 1];   // per (warp, slot): count -> base (row pad: the scan reads columns)
+    __shared__ int r_tabs[256], r_cnt[256], r_own[256], r_ord[256], r_load[8], r_map[256];
     __shared__ int cnt[RT_E], bstart[RT_E], bexp[RT_NB], ltot[2 * RT_NCLS], nblk;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const unsigned lt = (1u << lane) - 1u;
@@ -268,6 +272,14 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
     __syncwarp();
     pdl_wait();
     pdl_trigger();
+    if (rtab != nullptr) {   // the replica balancer here (rep_owner, pg_rep_assign's decision, passes 0): this call's map
+        rep_owner<2>(topk_ids, numel, rtab, n_rep, 0, r_tabs, r_cnt, r_own, r_ord, r_load);
+        if (tid < 256) {
+            const int v = r_tabs[tid];
+            r_map[tid] = (r_own[tid] == me && (v & 0xFF) != 0xFF) ? (v & 0xFF) : -1;
+        }
+        __syncthreads();
+    }
     const int ng = (numel + 1023) / 1024;   // 32-route groups per warp
     const int r0 = w * ng * 32;
     int er[RT_G];
@@ -277,7 +289,8 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         int e = -1;
         if (k < ng && r < numel) {
             const int g = topk_ids[r];
-            if ((unsigned)g < (unsigned)n_global) e = emap ? emap[g] : g;
+            if (rtab != nullptr) e = (unsigned)g < 256u ? r_map[g] : -1;
+            else if ((unsigned)g < (unsigned)n_global) e = emap ? emap[g] : g;
             if ((unsigned)e >= (unsigned)nl) e = -1;
             local_ids[r] = e;
         }
@@ -1018,8 +1031,7 @@ __global__ void __launch_bounds__(256) align_scatter(const int* __restrict__ lid
 }
 
 // ------------------------------------------------------------------ replica balancer (small-T forwards)
-// rep_owner (_cuda_src_rep.py, shared with st); out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
-@@REP@@
+// rep_owner (pasted above the route front end); out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
 template <typename IdT>
 __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids, int n_routes,
                                                      const int* __restrict__ tab, int n_rep, int me, int passes,
@@ -1453,21 +1465,26 @@ void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::
 
 // small-T front end: topk_ids [T, 8] int32 (global ids), emap [n_global] int32 global -> local (-1 = remote) or
 // an empty tensor (ids already local); outputs local_ids [T * 8], sorted_ids [nb_max * 256], block_experts
-// [nb_max], live [nb_max + 1] with nb_max = 32 + ceil(numel / 256).
-void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, torch::Tensor sorted_ids,
-           torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global, int64_t nl, int64_t pdl) {
+// [nb_max], live [nb_max + 1] with nb_max = 32 + ceil(numel / 256). rtab non-empty (a replica table): the balancer
+// runs in the kernel (rep_owner, as pg_rep_assign) and emap is not read; me = this rank.
+void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor rtab, torch::Tensor local_ids,
+           torch::Tensor sorted_ids, torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global,
+           int64_t nl, int64_t pdl, int64_t me) {
     TORCH_CHECK(numel <= pgk::RT_MAX && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() &&
                 nl >= 1 && nl <= pgk::RT_E, "pg route: int32 ids, at most 24576 routes, 1..64 local slots");
     TORCH_CHECK(sorted_ids.numel() >= (nl + (numel + pgk::XNT - 1) / pgk::XNT) * pgk::XNT &&
                 live.numel() >= nl + (numel + pgk::XNT - 1) / pgk::XNT + 1, "pg route: output sizes");
     const int* em = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
+    const int* rt = rtab.numel() > 0 ? rtab.data_ptr<int>() : nullptr;
+    TORCH_CHECK(!rt || (rtab.scalar_type() == at::kInt && rtab.numel() >= 256 && rtab.numel() <= 512 && me >= 0 &&
+                        me < 8), "pg route: replica table");
     pg_launch(pgk::pg_route, dim3(1), dim3(1024), 0, pdl != 0, topk_ids.data_ptr<int>(), em, (int)n_global,
 #ifdef PGN_WSET
               (int)numel, (int)PGN_WSET, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
 #else   // PGN_WSET
               (int)numel, 3 /* = _WMASK */, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
 #endif  // PGN_WSET
-              block_experts.data_ptr<int>(), live.data_ptr<int>());
+              block_experts.data_ptr<int>(), live.data_ptr<int>(), rt, rt ? (int)rtab.numel() - 256 : 0, (int)me);
 }
 
 // SP row gather (pg_ag_rows): x [S, 4096] bf16, sc [S, 8] fp32, ids [S, 8] int32 -> out [world S, 4096], osc, oids;
