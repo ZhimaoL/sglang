@@ -30,8 +30,8 @@ def _streams():
 
 def build_resident(build) -> dict:
     """Run build() -> {name: tensor} on the side stream and copy each result into a block of its own on the
-    keep-stream: the allocator discipline of _build_packs, for the load-time packs of the dense projections and the
-    router (proj.prepare_weight, router.prepare_gate). Temporaries never share a segment with a resident copy."""
+    keep-stream: the allocator discipline of _build_packs, for the router's load-time hi / lo copies
+    (router.prepare_gate). Temporaries never share a segment with a resident copy."""
     side, keep = _streams()
     cur = torch.cuda.current_stream()
     side.wait_stream(cur)
