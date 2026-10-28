@@ -40,7 +40,7 @@ SW_PROJ_MMA = _flag("OKC_SW_PROJ_MMA", "1")
 # (OKC_SW_PROJ_MMA's 2.2 GiB per rank is then not built).
 SW_SMALLM = _flag("OKC_SW_SMALLM", "1")
 SW_ROUTER = _flag("OKC_SW_ROUTER", "1")
-# Kill switches of the v1 attention paths (default on; "0" falls back to the older chain).
+# Kill switch of the attn-v3 sliding verify kernels (default on; "0" runs the stock path for the sliding layers).
 SW_ATTN_V3 = _flag("OKC_SW_ATTN_V3", "1")
 # Split-KV partial accumulators of the attn-v3 sliding kernels: "0" (default) keeps them fp32 like FA3; "1" stores
 # them bf16 (the certified attn-v3 setting: half the last-arriver combine's reads).

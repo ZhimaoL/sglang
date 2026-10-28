@@ -3,9 +3,8 @@
 Two env-gated paths, both consuming the FlashAttention backend's per-step metadata
 (page tables, cache_seqlens, SWA write locations) and the paged KV pool directly:
 
-  OKC_SW_ATTN  sliding layers at q_len <= 8: the certified 2-launch decode split
-               (q_len == 1) or prep + per-head split + combine (q_len 2..8), replacing
-               fused QK norm + RoPE + KV store + FA3 + gated output norm.
+  OKC_SW_ATTN  sliding layers at q_len 8 (TP8 heads): attn-v3's prep + split-with-tail
+               verify, replacing fused QK norm + RoPE + KV store + FA3 + gated output norm.
   OKC_SW_WST   full layers at q_len 8, bs >= OKC_WST_MIN_BS: the attention lane's verify-full kernels (wst_ct14 with the
                row-sliced in-kernel merge, wst_ct14b balanced over the batch from OKC_WST_BAL_MIN_BS up), one
                launch per layer for QK norm + new KV rows + FP8 attention + merge + output norm and gate.
@@ -14,8 +13,9 @@ Every eligibility miss returns None and the caller falls through to the stock pa
 Decisions depend only on config, forward mode, and batch shape, so a decision taken
 during CUDA-graph capture holds for every replay of that graph.
 
-Operating points (kernel court, H200): sliding d1/d16/d32 1.48/1.44/1.45x, v1/v16/v32
-1.25/1.21/1.14x per call; decode-full stays on FA3.
+Operating points (kernel court, H200): sliding v1/v16/v32 1.25/1.21/1.14x per call. Only
+TARGET_VERIFY dispatches (the target model never decodes under DFLASH); decode steps and
+every other shape run the stock path.
 """
 
 import logging
@@ -137,12 +137,8 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
     """Dispatch gated_attention to an OKC path; None = stock path."""
     if torch.compiler.is_compiling():
         return None
-    mode = forward_batch.forward_mode
-    if mode.is_decode():
-        q_len = 1
-    elif mode.is_target_verify():
-        q_len = -1  # resolved from metadata below
-    else:
+    # Verify blocks only: under DFLASH the target model runs TARGET_VERIFY and EXTEND, never DECODE.
+    if not forward_batch.forward_mode.is_target_verify():
         return None
     eps = _layer_eps(attn)
     if eps is None:
@@ -173,11 +169,8 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
         return None
     tokens = qkv.shape[0]
     bs = forward_batch.batch_size
-    if q_len < 0:
-        q_len = meta.max_seq_len_q
-        if not q_len or q_len > 8 or tokens != bs * q_len:
-            return None
-    elif tokens != bs:
+    q_len = meta.max_seq_len_q
+    if not q_len or q_len > 8 or tokens != bs * q_len:
         return None
 
     pool = get_token_to_kv_pool()
@@ -292,12 +285,9 @@ def _counter(kind, n, S, device):
     return c
 
 
-# attn-v3 launch knobs per (q_len, bs), bench_v3 sweeps; unlisted shapes take the
-# lane defaults (BN 128 / 4 warps / sc 8 decode, sc 4 verify).
+# attn-v3 verify launch knobs per (q_len, bs), bench_v3 sweeps; unlisted bs take the
+# lane defaults (BN 128 / 4 warps / sc 4).
 _V3_TUNE_BY = {
-    (1, 1): (128, 8, 16),
-    (1, 16): (64, 8, 16),
-    (1, 32): (128, 8, 8),
     (8, 1): (64, 4, 4),
     (8, 16): (64, 4, 4),
     (8, 32): (64, 4, 4),
@@ -309,7 +299,7 @@ def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
              sm_scale, qk_factor, eps):
     """Sliding dispatch: the attn-v3 fused kernels on the TP8 shape (judge-checked
     sliding decode 1.73-1.92x, verify above the v1 3-launch chain), v1 otherwise."""
-    if SW_ATTN_V3 and hq == 16 and hkv == 2 and d == 64 and q_len in (1, 8):
+    if SW_ATTN_V3 and hq == 16 and hkv == 2 and d == 64 and q_len == 8:
         log_once(f"sliding_v3[q_len={q_len}]", f"(first bs={bs})")
         return _sliding_v3(
             qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
@@ -317,22 +307,16 @@ def _sliding(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             window=window, page_size=page_size, kv_scale=kv_scale, theta=theta,
             sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
         )
-    log_once(f"sliding_v1[q_len={q_len}]", f"(first bs={bs})")
-    return _sliding_v1(
-        qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
-        bs=bs, q_len=q_len, hq=hq, hkv=hkv, d=d,
-        window=window, page_size=page_size, kv_scale=kv_scale, theta=theta,
-        sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
-    )
+    return None   # no v1 fallback: the stock path
 
 
 def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
                 bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
                 sm_scale, qk_factor, eps):
-    """attn-v3 fused sliding: single-launch decode (_sl_decode_f) or prep +
-    split-with-tail verify (_sl_verify_f2); the last-arriver program folds the
-    combine, output RMSNorm and sigmoid gate into the same launch. Split-KV partials
-    are fp32 unless OKC_SW_ATTN_ACC16=1 (bf16 partials, the combine still in fp32)."""
+    """attn-v3 fused sliding verify (q_len 8): prep + split-with-tail (_sl_verify_f2); the
+    last-arriver program folds the combine, output RMSNorm and sigmoid gate into the same
+    launch. Split-KV partials are fp32 unless OKC_SW_ATTN_ACC16=1 (bf16 partials, the
+    combine still in fp32)."""
     device = qkv.device
     acc_dtype = torch.bfloat16 if SW_ATTN_ACC16 else torch.float32
     B, L = bs, q_len
@@ -343,34 +327,7 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     theta_coef = (-2.0 * math.log2(theta) / d) if theta else 0.0
     alpha = sm_scale * kv_scale * LOG2E
     gate_col0 = (hq + 2 * hkv) * d
-    if L == 1:
-        BN, warps, sc = _V3_TUNE_BY.get((1, B), (128, 4, 8))
-        S = max(1, min(math.ceil(window / BN), math.ceil(256 / B), 16))
-        chunk = BN * math.ceil(window / (S * BN))
-        P = B * S
-        ws_acc = torch.empty((P * hq, d), dtype=acc_dtype, device=device)
-        ws_m = torch.empty((P * hq,), dtype=torch.float32, device=device)
-        ws_l = torch.empty((P * hq,), dtype=torch.float32, device=device)
-        counter = _counter("sd", B, S, device)
-        ak._sl_decode_f[(P,)](
-            qkv, kc, vc,
-            cache_loc, seq_pre, page_table,
-            ws_acc, ws_m, ws_l, counter, out,
-            qkv.stride(0), page_table.stride(0), hq * d, gate_col0,
-            page_table.shape[1] * page_size,
-            alpha, 1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef, kv_scale,
-            EPS=eps,
-            GROUP=group, HQ=hq, HKV=hkv,
-            WINDOW=window, PAGE=page_size, HAS_ROPE=bool(theta),
-            S=S, CHUNK=chunk, SC=sc, ACC16=SW_ATTN_ACC16,
-            D=d,
-            BLOCK_M=max(16, triton.next_power_of_2(hq)),
-            BLOCK_N=BN,
-            BLOCK_H=triton.next_power_of_2(hkv),
-            num_warps=warps, num_stages=3,
-        )
-        return out
-    # L == 8 verify: prep (q norm+RoPE -> ws, own k/v -> cache) + split-with-tail.
+    # prep (q norm+RoPE -> ws, own k/v -> cache) + split-with-tail.
     BN, warps, sc = _V3_TUNE_BY.get((8, B), (128, 4, 4))
     span = window - 1 + L
     S = max(1, min(math.ceil(span / BN), math.ceil(256 / (B * hkv)), 16))
@@ -409,89 +366,6 @@ def _sliding_v3(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         BLOCK_M=max(16, triton.next_power_of_2(LG)),
         BLOCK_N=BN, PDL=SW_PDL,
         num_warps=warps, num_stages=3, launch_pdl=SW_PDL,
-    )
-    return out
-
-
-def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
-                bs, q_len, hq, hkv, d, window, page_size, kv_scale, theta,
-                sm_scale, qk_factor, eps):
-    """muse_attention_decode v1 sliding path (lane TUNE_BY winners: BN 128, 4 warps)."""
-    device = qkv.device
-    B, L = bs, q_len
-    group = hq // hkv
-    kc = k_cache.view(k_cache.shape[0], -1)
-    vc = v_cache.view(v_cache.shape[0], -1)
-    out = torch.empty((B * L, hq * d), dtype=torch.bfloat16, device=device)
-    decode2 = L == 1 and hkv * d <= 128 and hq <= 128
-    group_l, hkv_l = (hq, 1) if decode2 else (group, hkv)
-    LG = L * group_l
-    BN = 128
-    span = window - 1 + L
-    S = max(1, min(math.ceil(span / BN), math.ceil(256 / (B * hkv_l)), 16))
-    chunk = BN * math.ceil(span / (S * BN))
-    P = B * hkv_l * S
-    ws_acc = torch.empty((P * LG, d), dtype=torch.float32, device=device)
-    ws_m = torch.empty((P * LG,), dtype=torch.float32, device=device)
-    ws_l = torch.empty((P * LG,), dtype=torch.float32, device=device)
-    theta_coef = (-2.0 * math.log2(theta) / d) if theta else 0.0
-    alpha = sm_scale * kv_scale * LOG2E
-    if decode2:
-        ak._sliding_decode_split[(P,)](
-            qkv, kc, vc,
-            cache_loc, seq_pre, page_table,
-            ws_acc, ws_m, ws_l,
-            qkv.stride(0), page_table.stride(0),
-            page_table.shape[1] * page_size,
-            alpha, 1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef,
-            EPS=eps,
-            GROUP=group, HQ=hq, HKV=hkv,
-            WINDOW=window, PAGE=page_size, HAS_ROPE=bool(theta),
-            S=S, CHUNK=chunk,
-            D=d,
-            BLOCK_M=max(16, triton.next_power_of_2(hq)),
-            BLOCK_N=BN,
-            BLOCK_H=triton.next_power_of_2(hkv),
-            num_warps=4, num_stages=3,
-        )
-    else:
-        q_ws = torch.empty((B * hkv_l * LG, d), dtype=torch.bfloat16, device=device)
-        br = triton.next_power_of_2(hq + 2 * hkv)
-        ak._sliding_prep[(B * L,)](
-            qkv, q_ws, kc, vc,
-            cache_loc, seq_pre,
-            qkv.stride(0),
-            1.0 / kv_scale, 1.0 / kv_scale, qk_factor, theta_coef,
-            EPS=eps,
-            L=L, GROUP=group, HQ=hq, HKV=hkv,
-            GROUP_Q=group_l, HKV_Q=hkv_l,
-            HAS_ROPE=bool(theta), D=d, BLOCK_R=br,
-            num_warps=4 if br <= 64 else 8, num_stages=1,
-        )
-        ak._sliding_split[(P,)](
-            q_ws, kc, vc,
-            seq_pre, page_table,
-            ws_acc, ws_m, ws_l,
-            page_table.stride(0),
-            page_table.shape[1] * page_size - L,
-            alpha,
-            L=L, GROUP=group, HKV=hkv,
-            WINDOW=window, PAGE=page_size,
-            S=S, CHUNK=chunk,
-            D=d,
-            BLOCK_M=max(16, triton.next_power_of_2(LG)),
-            BLOCK_N=BN,
-            num_warps=4, num_stages=3,
-        )
-    cm = 16
-    tiles = math.ceil(LG / cm)
-    ak._sliding_combine[(B * hkv_l * tiles,)](
-        ws_acc, ws_m, ws_l, qkv, out,
-        qkv.stride(0), hq * d, (hq + 2 * hkv) * d, kv_scale,
-        EPS=eps, L=L, GROUP=group_l, HKV=hkv_l,
-        S=S, BLOCK_S=triton.next_power_of_2(S), TILES=tiles,
-        D=d, BLOCK_M=cm,
-        num_warps=4, num_stages=1,
     )
     return out
 
