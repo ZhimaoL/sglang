@@ -335,7 +335,7 @@ DINL bool softmax_sch_a1(unsigned (&s)[32], float (&m)[2], float (&al)[2], __hal
 // release covers the copy and the m / l stores through bar.sync); the epoch is old / S, the launch's last increment makes the counter
 // (epoch + 1) * S. Each WG then waits for that value (ld.acquire poll) and folds rows r = s + k * S (16 threads per row, 4 dims per
 // thread) over all S partials, applying RMSNorm x sigmoid(gate). No reset: graph-safe. Needs all S x B CTAs co-resident (host guard).
-template <int SC>
+template <int SC, int CORE = 0>
 __device__ __forceinline__ void eng_kw_row(const float* __restrict__ ws_acc, const float* __restrict__ ws_m, const float* __restrict__ ws_l,
                                            long recb, int LG, int r, int dq, int S, float vsc, uint2 graw, float eps,
                                            __nv_bfloat16* __restrict__ op, unsigned hmask) {
@@ -371,6 +371,14 @@ __device__ __forceinline__ void eng_kw_row(const float* __restrict__ ws_acc, con
     }
     const float inv = vsc / Ls;
     a0 *= inv; a1 *= inv; a2 *= inv; a3 *= inv;
+    if constexpr (CORE) {   // serving: the riders' pre-norm attention output (no RMSNorm, no gate)
+        const __nv_bfloat162 c01 = __floats2bfloat162_rn(a0, a1), c23 = __floats2bfloat162_rn(a2, a3);
+        uint2 cr;
+        cr.x = *reinterpret_cast<const uint32_t*>(&c01);
+        cr.y = *reinterpret_cast<const uint32_t*>(&c23);
+        *reinterpret_cast<uint2*>(op) = cr;
+        return;
+    }
     float ss = a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3;
 #pragma unroll
     for (int o2 = 1; o2 < 16; o2 <<= 1) ss += __shfl_xor_sync(hmask, ss, o2);   // the row's 16 lanes only (odd row counts)
@@ -385,6 +393,7 @@ __device__ __forceinline__ void eng_kw_row(const float* __restrict__ ws_acc, con
     rr.y = *reinterpret_cast<const uint32_t*>(&r23);
     *reinterpret_cast<uint2*>(op) = rr;
 }
+template <int CORE = 0>
 __device__ __forceinline__ void eng_wst_kwait(int* __restrict__ tickets, const float* __restrict__ ws_acc, const float* __restrict__ ws_m,
                                               const float* __restrict__ ws_l, const __nv_bfloat16* __restrict__ qkv, int qkv_stride,
                                               int gate_col0, __nv_bfloat16* __restrict__ out, const float* __restrict__ v_scale, float eps,
@@ -400,9 +409,13 @@ __device__ __forceinline__ void eng_wst_kwait(int* __restrict__ tickets, const f
         const int r = s + k * S;
         const long tok_r = (long)b * L + (r >> 3);
         const int qcol = (wg * 8 + (r & 7)) * 64 + dq;
-        const __nv_bfloat16* gp = qkv + tok_r * qkv_stride + gate_col0 + qcol;
-        if (k == kk) { graw0 = *reinterpret_cast<const uint2*>(gp); op0 = out + tok_r * (16 * 64) + qcol; }
-        else asm volatile("prefetch.global.L2 [%0];" :: "l"(gp));
+        if constexpr (CORE) {   // serving: no gate
+            if (k == kk) op0 = out + tok_r * (16 * 64) + qcol;
+        } else {
+            const __nv_bfloat16* gp = qkv + tok_r * qkv_stride + gate_col0 + qcol;
+            if (k == kk) { graw0 = *reinterpret_cast<const uint2*>(gp); op0 = out + tok_r * (16 * 64) + qcol; }
+            else asm volatile("prefetch.global.L2 [%0];" :: "l"(gp));
+        }
     }
     const float vsc = nk > 0 ? v_scale[0] : 0.f;
     asm volatile("bar.sync %0, 128;" :: "r"(4 + wg) : "memory");   // the WG's copy and m / l stores are issued
@@ -428,15 +441,15 @@ __device__ __forceinline__ void eng_wst_kwait(int* __restrict__ tickets, const f
         if (!first) {
             const long tok_r = (long)b * L + (r >> 3);
             const int qcol = (wg * 8 + (r & 7)) * 64 + dq;
-            graw = *reinterpret_cast<const uint2*>(qkv + tok_r * qkv_stride + gate_col0 + qcol);
+            if constexpr (!CORE) graw = *reinterpret_cast<const uint2*>(qkv + tok_r * qkv_stride + gate_col0 + qcol);
             op = out + tok_r * (16 * 64) + qcol;
         }
-        if (S == 8) eng_kw_row<8>(ws_acc, ws_m, ws_l, recb, LG, r, dq, S, vsc, graw, eps, op, hm);
-        else eng_kw_row<0>(ws_acc, ws_m, ws_l, recb, LG, r, dq, S, vsc, graw, eps, op, hm);
+        if (S == 8) eng_kw_row<8, CORE>(ws_acc, ws_m, ws_l, recb, LG, r, dq, S, vsc, graw, eps, op, hm);
+        else eng_kw_row<0, CORE>(ws_acc, ws_m, ws_l, recb, LG, r, dq, S, vsc, graw, eps, op, hm);
     }
 }
 template <int NST, int MODE, int PF = 2, int NPW = 2, int RR = 1, int DEC = 0, int PFL2 = 0, int ABL = 0, int FQ = 0,
-          int PBF = 0>
+          int PBF = 0, int CORE = 0>
 __global__ void __launch_bounds__(256 + 128 * NPW, 1) wst_ct14(
     const __grid_constant__ CUtensorMap kmap,
     const __grid_constant__ CUtensorMap vmap,
@@ -875,7 +888,7 @@ __global__ void __launch_bounds__(256 + 128 * NPW, 1) wst_ct14(
         }
 #endif
         if (tickets)   // attn-engine protocol 3: every WG folds LG/S rows after the (b, kv head) epoch completes
-            eng_wst_kwait(tickets, ws_acc, ws_m, ws_l, qkv, qkv_stride, gate_col0, out, v_scale, eps, b, wg, s, S, L, t128);
+            eng_wst_kwait<CORE>(tickets, ws_acc, ws_m, ws_l, qkv, qkv_stride, gate_col0, out, v_scale, eps, b, wg, s, S, L, t128);
         return;
     }
     if (ABL & 2048) {   // timing: every value kept live, one 4-B store per thread
@@ -938,6 +951,7 @@ __global__ void __launch_bounds__(256 + 128 * NPW, 1) wst_ct14(
 }
 
 // ---- attn-engine bal: wst_ct14b = wst_ct14 (FQ, PBF, in-kernel merge) with the work balanced over the batch (stream-K over requests) ----
+template <int CORE = 0>
 __device__ __forceinline__ void eng_bal_row(const float* __restrict__ ws_acc, const float* __restrict__ ws_m, const float* __restrict__ ws_l,
                                             long recb, int pst, int r, int dq, int np, float vsc, uint4 graw, float eps,
                                             __nv_bfloat16* __restrict__ op, unsigned gmask) {
@@ -984,6 +998,17 @@ __device__ __forceinline__ void eng_bal_row(const float* __restrict__ ws_acc, co
     float ss = 0.f;
 #pragma unroll
     for (int i = 0; i < 8; i++) { a[i] *= inv; ss += a[i] * a[i]; }
+    if constexpr (CORE) {   // serving: the riders' pre-norm attention output (no RMSNorm, no gate)
+        uint4 c;
+        unsigned* cu = reinterpret_cast<unsigned*>(&c);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const __nv_bfloat162 rr = __floats2bfloat162_rn(a[2 * i], a[2 * i + 1]);
+            cu[i] = *reinterpret_cast<const unsigned*>(&rr);
+        }
+        *reinterpret_cast<uint4*>(op) = c;
+        return;
+    }
 #pragma unroll
     for (int o2 = 1; o2 < 8; o2 <<= 1) ss += __shfl_xor_sync(gmask, ss, o2);   // the row's 8 lanes only
     const float rn = rsqrtf(ss * (1.0f / 64.f) + eps);
@@ -999,6 +1024,7 @@ __device__ __forceinline__ void eng_bal_row(const float* __restrict__ ws_acc, co
     *reinterpret_cast<uint4*>(op) = o;
 }
 // one WG: wait until every piece of request fb arrived (its counter is a multiple of 256), then fold rows j + k * nb (16 rows per pass)
+template <int CORE = 0>
 __device__ __forceinline__ void eng_bal_fold(const int* __restrict__ ctr, const float* __restrict__ ws_acc, const float* __restrict__ ws_m,
                                              const float* __restrict__ ws_l, const __nv_bfloat16* __restrict__ qkv, int qkv_stride,
                                              int gate_col0, __nv_bfloat16* __restrict__ out, float vsc, float eps,
@@ -1017,12 +1043,13 @@ __device__ __forceinline__ void eng_bal_fold(const int* __restrict__ ctr, const 
         const int r = j + k * nb;
         const long tok_r = (long)fb * L + (r >> 3);
         const int qcol = (wg * 8 + (r & 7)) * 64 + dq;
-        const uint4 graw = *reinterpret_cast<const uint4*>(qkv + tok_r * qkv_stride + gate_col0 + qcol);
+        uint4 graw = make_uint4(0u, 0u, 0u, 0u);
+        if constexpr (!CORE) graw = *reinterpret_cast<const uint4*>(qkv + tok_r * qkv_stride + gate_col0 + qcol);
         __nv_bfloat16* op = out + tok_r * (16 * 64) + qcol;
-        eng_bal_row(ws_acc, ws_m, ws_l, recb, 2 * LG, r, dq, np, vsc, graw, eps, op, gm);
+        eng_bal_row<CORE>(ws_acc, ws_m, ws_l, recb, 2 * LG, r, dq, np, vsc, graw, eps, op, gm);
     }
 }
-template <int NST, int PF, int NPW, int RR, int DEC>
+template <int NST, int PF, int NPW, int RR, int DEC, int CORE = 0>
 __global__ void __launch_bounds__(256 + 128 * NPW, 1) wst_ct14b(
     const __grid_constant__ CUtensorMap kmap,
     const __grid_constant__ CUtensorMap vmap,
@@ -1038,7 +1065,7 @@ __global__ void __launch_bounds__(256 + 128 * NPW, 1) wst_ct14b(
     const float* __restrict__ v_scale = nullptr, const unsigned char* __restrict__ kc_ = nullptr,
     const long long* __restrict__ cache_loc = nullptr, float rcp_k = 1.f, float rcp_v = 1.f, float eps = 1e-5f)
 {
-    constexpr int PDL = 0, FUSE = 0, EX = 0, MODE = 0, PFL2 = 0, ABL = 0, FQ = 1, PBF = 1;
+    constexpr int PDL = 0, FUSE = 0, EX = 0, MODE = 0, PFL2 = 0, ABL = 0, FQ = CORE ? 0 : 1, PBF = 1;
     constexpr int NPT = 128 * NPW;               // producer threads
     constexpr int NWP = 4 * NPW;                 // producer warps
     constexpr int VP = (128 + 4 * NWP - 1) / (4 * NWP);   // cp.async passes per tile (4 rows per warp per pass; K + V)
@@ -1110,7 +1137,7 @@ __global__ void __launch_bounds__(256 + 128 * NPW, 1) wst_ct14b(
         const int ptid = tid - 256;
         const int pw = ptid >> 5, pl = ptid & 31;
         const int vsub = pl >> 3, vch = pl & 7;     // 4 rows per instruction, 8 lanes per row
-        if (ptid < 32 * L) {   // q rows of the later pieces (their q build follows a drain) + gate rows of every piece (fold) -> L2
+        if (!CORE && ptid < 32 * L) {   // q rows of the later pieces (their q build follows a drain) + gate rows of every piece (fold) -> L2
             const int isg = ptid >= 16 * L, tq = (isg ? ptid - 16 * L : ptid) >> 4, ln_ = ptid & 15;
 #pragma unroll 1
             for (int pb = isg ? b0 : b0 + 1; pb < B && VV(pb) + bw < v1; pb++)
@@ -1200,7 +1227,7 @@ __global__ void __launch_bounds__(256 + 128 * NPW, 1) wst_ct14b(
             for (int u = 0; u < PF; u++) {
                 const int kt = kt0 + u;
                 if (kt < ntl) {
-                    if (!nrdone && sbs + st_ * 128 + 127 >= sseq) { newrows(sb); nrdone = true; }   // this piece holds new positions
+                    if (!CORE && !nrdone && sbs + st_ * 128 + 127 >= sseq) { newrows(sb); nrdone = true; }   // this piece holds new positions
                     stage(kt, pvs[u]);
                     if (kt + PF < ntl) fetch(pvs[u]);
                     if (++st_ == snt) {
@@ -1503,18 +1530,18 @@ __global__ void __launch_bounds__(256 + 128 * NPW, 1) wst_ct14b(
         const int nb = cl - cf + 1, j = c - cf;
         const int jlo = nb >= 3 ? 1 : 0, jhi = nb >= 3 ? nb - 2 : nb - 1;
         if (j < jlo || j > jhi) continue;
-        eng_bal_fold(tickets + fb * 2 + wg, ws_acc, ws_m, ws_l, qkv, qkv_stride, gate_col0, out, vsc, eps, fb, wg, j - jlo, jhi - jlo + 1, nb,
+        eng_bal_fold<CORE>(tickets + fb * 2 + wg, ws_acc, ws_m, ws_l, qkv, qkv_stride, gate_col0, out, vsc, eps, fb, wg, j - jlo, jhi - jlo + 1, nb,
                      ((long)(cf + fb) * 2 + wg) * LG, L, t128);
     }
 }
 
-template <int NST, int PF = 2, int NPW = 4, int RR = 1>
+template <int NST, int PF = 2, int NPW = 4, int RR = 1, int CORE = 0>
 static void launch_ct14b(int G, cudaStream_t stream, const CUtensorMap& km, const CUtensorMap& vm,
                          const unsigned char* vcp, const unsigned char* kcp, const int* pt, const int* lens,
                          float* wa, float* wm, float* wl, const float* ks, float smqk, int B, int L, int maxP, int window, int bw,
                          const __nv_bfloat16* qkv, int qkv_stride, const long long* cache_loc, float rcp_k, float rcp_v, float eps,
-                         __nv_bfloat16* out, int* tick, const float* vs) {
-    auto f0 = wst_ct14b<NST, PF, NPW, RR, 0>;
+                         __nv_bfloat16* out, int* tick, const float* vs, const unsigned char* q8 = nullptr) {
+    auto f0 = wst_ct14b<NST, PF, NPW, RR, 0, CORE>;
     TORCH_CHECK(L > 1, "wst_attn_bal: q_len 1 is not built");
     const int smem = NST * STG2 + 4 * VIMG9 + 2 * NST * 8 + 64 + ((4 * (B + 1) + 15) & ~15);
     static int set = 0;
@@ -1532,20 +1559,21 @@ static void launch_ct14b(int G, cudaStream_t stream, const CUtensorMap& km, cons
     attr[0].val.cooperative = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaError_t e = cudaLaunchKernelEx(&cfg, f0, km, vm, (const unsigned char*)nullptr, vcp, pt, lens, wa, wm, wl, ks, smqk,
+    cudaError_t e = cudaLaunchKernelEx(&cfg, f0, km, vm, q8, vcp, pt, lens, wa, wm, wl, ks, smqk,
                                        B, L, maxP, bw, G, window, qkv, qkv_stride, (16 + 2 * 2) * 64, out, tick, vs, kcp, cache_loc,
                                        rcp_k, rcp_v, eps);
     if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
 }
 
-template <int NST, int PF = 2, int NPW = 4, int RR = 1, int PBF = 0>
+template <int NST, int PF = 2, int NPW = 4, int RR = 1, int PBF = 0, int CORE = 0>
 static void launch_ct14fq(dim3 grid, cudaStream_t stream, const CUtensorMap& km, const CUtensorMap& vm,
                           const unsigned char* vcp, const unsigned char* kcp, const int* pt, const int* lens,
                           float* wa, float* wm, float* wl, const float* ks, float smqk, int B, int L, int maxP,
                           int spl, int S, int window, const __nv_bfloat16* qkv, int qkv_stride,
                           const long long* cache_loc, float rcp_k, float rcp_v, float eps,
-                          __nv_bfloat16* eng_out = nullptr, int* eng_tickets = nullptr, const float* eng_vs = nullptr) {
-    auto f0 = wst_ct14<NST, 0, PF, NPW, RR, 0, 0, 0, 1, PBF>;
+                          __nv_bfloat16* eng_out = nullptr, int* eng_tickets = nullptr, const float* eng_vs = nullptr,
+                          const unsigned char* q8 = nullptr) {
+    auto f0 = wst_ct14<NST, 0, PF, NPW, RR, 0, 0, 0, CORE ? 0 : 1, PBF, CORE>;
     TORCH_CHECK(L > 1, "wst_attn_fqbt: q_len 1 is not built");
     const int smem = NST * STG2 + 4 * VIMG9 + 2 * NST * 8 + 64;
     static bool set = false;
@@ -1563,7 +1591,7 @@ static void launch_ct14fq(dim3 grid, cudaStream_t stream, const CUtensorMap& km,
     attr[0].val.cooperative = 1;
     cfg.attrs = attr;
     cfg.numAttrs = eng_tickets ? 1 : 0;
-    cudaError_t e = cudaLaunchKernelEx(&cfg, f0, km, vm, (const unsigned char*)nullptr, vcp, pt, lens, wa, wm, wl, ks, smqk, B,
+    cudaError_t e = cudaLaunchKernelEx(&cfg, f0, km, vm, q8, vcp, pt, lens, wa, wm, wl, ks, smqk, B,
                                        L, maxP, spl, S, window, qkv, qkv_stride, eng_out ? (16 + 2 * 2) * 64 : 0, eng_out,
                                        eng_tickets, eng_vs, kcp, cache_loc, rcp_k, rcp_v, eps);
     if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
@@ -1606,5 +1634,38 @@ void wst_attn_fqbt(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cac
                               reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr()), (int)qkv.stride(0),
                               reinterpret_cast<const long long*>(cache_loc.data_ptr()), (float)rcp_k, (float)rcp_v, (float)eps,
                               reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tickets.data_ptr<int>(), v_scale.data_ptr<float>());
+}
+// serving: the ride-along riders' core entries. q8 = the riders' normed e4m3 q [B*L, 16, 64] (no qk factor folded in),
+// their k / v rows already in the cache, out = the pre-norm attention output [B*L, 16, 64] bf16 (O / l x v_scale).
+void wst_core_fqbt(torch::Tensor q8, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table, torch::Tensor seq_lens,
+                   torch::Tensor ws_acc, torch::Tensor ws_m, torch::Tensor ws_l, torch::Tensor k_scale, double smqk_log2e,
+                   int64_t B, int64_t L, int64_t maxP, int64_t S, torch::Tensor out, torch::Tensor tickets, torch::Tensor v_scale) {
+    TORCH_CHECK(S >= 1 && S <= 256, "wst_core_fqbt: the +256 ticket epoch needs S <= 256");
+    const long rows = k_cache.numel() / 128;
+    CUtensorMap km = row_map(k_cache.data_ptr(), rows);
+    CUtensorMap vm = row_map(v_cache.data_ptr(), rows);
+    dim3 grid((int)S, (int)B);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_ct14fq<4, 2, 4, 1, 1, 1>(grid, stream, km, vm, reinterpret_cast<const unsigned char*>(v_cache.data_ptr()),
+                                    reinterpret_cast<const unsigned char*>(k_cache.data_ptr()), page_table.data_ptr<int>(),
+                                    seq_lens.data_ptr<int>(), reinterpret_cast<float*>(ws_acc.data_ptr()), ws_m.data_ptr<float>(),
+                                    ws_l.data_ptr<float>(), k_scale.data_ptr<float>(), (float)smqk_log2e, (int)B, (int)L, (int)maxP,
+                                    0, (int)S, 0, nullptr, 0, nullptr, 1.f, 1.f, 1e-5f,
+                                    reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tickets.data_ptr<int>(), v_scale.data_ptr<float>(),
+                                    reinterpret_cast<const unsigned char*>(q8.data_ptr()));
+}
+void wst_core_bal(torch::Tensor q8, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table, torch::Tensor seq_lens,
+                  torch::Tensor ws_acc, torch::Tensor ws_m, torch::Tensor ws_l, torch::Tensor k_scale, double smqk_log2e,
+                  int64_t B, int64_t L, int64_t maxP, int64_t G, torch::Tensor out, torch::Tensor tickets, torch::Tensor v_scale) {
+    const long rows = k_cache.numel() / 128;
+    CUtensorMap km = row_map(k_cache.data_ptr(), rows);
+    CUtensorMap vm = row_map(v_cache.data_ptr(), rows);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_ct14b<4, 2, 4, 1, 1>((int)G, stream, km, vm, reinterpret_cast<const unsigned char*>(v_cache.data_ptr()),
+                                reinterpret_cast<const unsigned char*>(k_cache.data_ptr()), page_table.data_ptr<int>(),
+                                seq_lens.data_ptr<int>(), reinterpret_cast<float*>(ws_acc.data_ptr()), ws_m.data_ptr<float>(),
+                                ws_l.data_ptr<float>(), k_scale.data_ptr<float>(), (float)smqk_log2e, (int)B, (int)L, (int)maxP,
+                                0, 3, nullptr, 0, nullptr, 1.f, 1.f, 1e-5f, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+                                tickets.data_ptr<int>(), v_scale.data_ptr<float>(), reinterpret_cast<const unsigned char*>(q8.data_ptr()));
 }
 """
