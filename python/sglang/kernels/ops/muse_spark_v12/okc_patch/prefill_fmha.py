@@ -55,7 +55,7 @@ _DEFERRED = None  # (output, blocks, run)
 
 @contextlib.contextmanager
 def defer_row_blocks(rows: int, blocks: int):
-    """A one-request sliding call of exactly rows * blocks tokens inside gathers and leaves its output unwritten;
+    """A one-request call of exactly rows * blocks tokens inside gathers and leaves its output unwritten;
     take_deferred(output) gives run(j, n): fmha7 at the whole call's (nc, split) over rows [j rows, (j + n) rows) with
     that range's length. Blocks are whole 8 * nc query tiles, so every CTA computes as in the whole call (bit-equal)."""
     global _DEFER
@@ -186,8 +186,8 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     ext = fmha_ext(PFMHA_EXACT)
     win = window_size[0] + 1 if is_swa else 0
     usable = out is not None and out.dtype is torch.bfloat16 and out.is_contiguous() and out.numel() == tokens * HQ * D
-    # row blocks: one sliding request of exactly the blocks, and no caller copy of an unwritten result (out is used)
-    R = _DEFER[0] if bs == 1 and win and tokens == _DEFER[0] * _DEFER[1] > 0 and (out is None or usable) else 0
+    # row blocks: one request of exactly the blocks, and no caller copy of an unwritten result (out is used)
+    R = _DEFER[0] if bs == 1 and tokens == _DEFER[0] * _DEFER[1] > 0 and (out is None or usable) else 0
     if not usable:
         out = torch.empty((tokens, HQ, D), dtype=torch.bfloat16, device=device)
     o = out.view(tokens, HQ, D)
