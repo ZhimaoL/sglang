@@ -290,6 +290,12 @@ except Exception:
     _HAS_TORCH_SYMM_MEM_FUSED = False
 
 
+def _okc_ce_tp() -> bool:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import SP_CE_TP
+
+    return SP_CE_TP
+
+
 def _okc_symm_selected(num_tokens: Optional[int]) -> bool:
     return (
         _okc_hopper.symm
@@ -338,6 +344,12 @@ def column_parallel_g_matmul(
                 linear.weight,
                 get_parallel().tp_group.device_group,
             )[:num_tokens]
+        if _okc_hopper.active and _okc_ce_tp():
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_tp_ce
+
+            out = sp_tp_ce.ag_matmul(get_parallel().tp_group, input_parallel, linear.weight)
+            if out is not None:
+                return out[:num_tokens]
         group_name = get_parallel().tp_group.device_group.group_name
         _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
             input_parallel.contiguous(),
@@ -372,6 +384,12 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
             return matmul_reduce_scatter(
                 x, linear.weight, get_parallel().tp_group.device_group
             )
+        if _okc_hopper.active and _okc_ce_tp():
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_tp_ce
+
+            out = sp_tp_ce.matmul_rs(get_parallel().tp_group, x, linear.weight)
+            if out is not None:
+                return out
         group_name = get_parallel().tp_group.device_group.group_name
         return torch.ops.symm_mem.fused_matmul_reduce_scatter(
             x,
