@@ -154,6 +154,9 @@ SW_DFLASH_CONV_AG = _flag("OKC_SW_DFLASH_CONV_AG", "1")
 # BF16 expert layers (0 and 61 of the NVFP4 export): local ids by one table lookup and the fused finalize kernel at
 # every token count (the wrapper's torch chain below 32 tokens is 11 launches).
 SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
+# Their Triton fused_moe configs (okc_patch/moe_configs, E=32 N=4096 H200), retuned at EP routing (one local route per
+# token): T 8 -7.5 %, 16 -11 %, 4096..16384 -12..-24 % per layer, bit-identical outputs (smallt-moe LOG E19).
+SW_BF16_MOE_CFG = _flag("OKC_SW_BF16_MOE_CFG", "1")
 # The last layer's FFN boundary (post-FFN norm, gated residual) + the model's final norm as one bit-identical kernel
 # (okc_patch.glue.tail_boundary) instead of 9 torch launches.
 SW_TAIL_NORM = _flag("OKC_SW_TAIL_NORM", "1")
@@ -196,7 +199,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_VFG_FULL1",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
            "SW_MOE_OVL",
-           "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE",
+           "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
