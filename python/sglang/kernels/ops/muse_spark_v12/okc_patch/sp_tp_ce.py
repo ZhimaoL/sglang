@@ -59,6 +59,19 @@ def defer_slot_sum(on: bool = True):
         _defer = False
 
 
+def defer_slots(out, slots=None):
+    """out stands for `slots` (default: the pending ones) whose sum is never taken (rsfold O1)."""
+    global _deferred
+    _deferred = (out, _deferred[1] if slots is None else slots)
+
+
+class RowBlocks:
+    """o-proj input as W blocks of R rows made on demand, block(j) -> [R, K] once per j in matmul_rs's order."""
+
+    def __init__(self, W, R, K, dtype, device, block):
+        self.shape, self.dtype, self.device, self.block = (W * R, K), dtype, device, block
+
+
 def take_slots(out):
     """The [W, S, N] slots whose dim-0 sum `out` stands for (a deferred matmul_rs output), else None."""
     global _deferred
@@ -166,10 +179,14 @@ def matmul_rs_steps(st, x, weight):
     X = st.streams[0]
     for s in st.streams:
         s.wait_stream(cur)
-    x = x.contiguous()
+    if isinstance(x, RowBlocks):
+        rows = x.block
+    else:
+        x = x.contiguous()
+        rows = lambda j: x[j * S:(j + 1) * S]   # noqa: E731
     keep = []
     for j, dest in enumerate(_order(me, W)):
-        part = torch.mm(x[dest * S:(dest + 1) * S], wt)
+        part = torch.mm(rows(dest), wt)
         keep.append(part)
         ev = torch.cuda.Event()
         ev.record(cur)
@@ -177,7 +194,7 @@ def matmul_rs_steps(st, x, weight):
         s.wait_event(ev)
         with torch.cuda.stream(s):
             st.o[dest][me * S * N:(me + 1) * S * N].copy_(part.view(-1))
-    torch.mm(x[me * S:(me + 1) * S], wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
+    torch.mm(rows(me), wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
     ev = torch.cuda.Event()
     ev.record(cur)
     X.wait_event(ev)

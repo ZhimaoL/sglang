@@ -46,8 +46,14 @@ if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
 if okc_patch.SW_AR_NORM:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import ar_norm as okc_ar_norm
-if okc_patch.SW_RS_NORM_FOLD:
+if okc_patch.SW_RS_NORM_FOLD or okc_patch.SW_RS_ATTN_BLOCKS:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_tp_ce as okc_sp_tp_ce
+if okc_patch.SW_RS_ATTN_BLOCKS:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import prefill_fmha as okc_prefill_fmha
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        eager_on_graph,
+        is_in_breakable_cuda_graph,
+    )
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
@@ -308,6 +314,43 @@ class MuseSpark1xRouter(nn.Module):
         return F.linear(hidden_states, self.weight)
 
 
+_OKC_ATTN = {}
+
+
+def _okc_attn_rs(q, k, v, o_gate, attn_out, layer_id, rows, fold, save_kv_cache, fb=None):
+    """OKC rsfold O1, SP sliding layers: attention (per-destination row blocks), output gate and o-proj RS in one call,
+    each GEMM + push as soon as its rows exist. One eager break under the breakable prefill graph (fb None: the live
+    batch is the forward context's). Returns the RS output, or None when the RS norm fold reads the slots. Calls that
+    are not exactly the blocks (padded, ragged) run whole."""
+    m = _OKC_ATTN[layer_id]
+    a = m.attn
+    with okc_prefill_fmha.defer_row_blocks(rows, attn_out.shape[0] // rows):
+        if fb is None:
+            from sglang.srt.layers.radix_attention import unified_attention_with_output
+
+            unified_attention_with_output(q, k.view(-1, a.tp_k_head_num, a.qk_head_dim),
+                                          v.view(-1, a.tp_v_head_num, a.v_head_dim), attn_out, save_kv_cache, layer_id)
+        else:
+            attn_out = a(q, k, v, fb, save_kv_cache=save_kv_cache)
+    run = okc_prefill_fmha.take_deferred(attn_out)
+    x = m._okc_blocks(attn_out, o_gate, run, rows) if run is not None else m._fused_o_norm_gate(attn_out, o_gate)
+    with okc_sp_tp_ce.defer_slot_sum(fold):
+        out = okc_sp_tp_ce.matmul_rs(get_parallel().tp_group, x, m.o_proj.weight)
+    if out is None:   # matmul_rs declined (gates pre-checked): the stock route
+        if not isinstance(x, torch.Tensor):
+            x = torch.cat([x.block(j) for j in range(x.shape[0] // rows)])
+        return m.o_proj(x)[0]
+    slots = okc_sp_tp_ce.take_slots(out)
+    if slots is None:
+        return out
+    okc_sp_tp_ce.defer_slots(None, slots)   # the caller binds its placeholder output to them
+    return None
+
+
+if okc_patch.SW_RS_ATTN_BLOCKS:
+    _okc_attn_rs_break = eager_on_graph(True)(_okc_attn_rs)
+
+
 class MuseSpark1xAttention(nn.Module):
     def __init__(self, config: MuseSpark1xTextConfig, layer_idx: int, prefix: str):
         super().__init__()
@@ -465,17 +508,67 @@ class MuseSpark1xAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
+        rows = okc_patch.SW_RS_ATTN_BLOCKS and self._okc_block_rows(qkv.shape[0])
+        if rows:   # OKC rsfold O1: attention through the o-proj RS (okc_attn_rs)
+            return self.gated_attention(positions, qkv, forward_batch, okc_rows=rows)
         output, _ = self.o_proj(self.gated_attention(positions, qkv, forward_batch))
         return output
+
+    def _okc_block_rows(self, num_tokens: int) -> int:
+        """Rows per destination when o_proj takes sp_tp_ce.matmul_rs on a sliding layer (row_parallel_gbar_matmul's
+        gates, shape-only), eager or in a breakable-graph capture; else 0."""
+        from sglang.srt.layers import layernorm_sp
+
+        tp = self.o_proj.tp_group.world_size if self.o_proj.tp_group is not None else 1
+        if (self.attn.sliding_window_size <= 0 or tp <= 1 or num_tokens % tp or not get_forward().sp_active
+                or num_tokens // tp < okc_patch.RS_ATTN_BLOCKS_MIN_ROWS or tp != get_parallel().tp_group.world_size
+                or (torch.cuda.is_current_stream_capturing() and not is_in_breakable_cuda_graph())
+                or getattr(self.o_proj, "_sp_use_cutlass", False) or not layernorm_sp.okc_hopper_sp()
+                or not okc_patch.SP_CE_TP or not layernorm_sp.sp_fused_matmul_eligible(self.o_proj, num_tokens)):
+            return 0
+        return num_tokens // tp
+
+    def _okc_blocks(self, output, o_gate, run, R):
+        # block j: the fmha + gate of j and the next unmade blocks (<= GROUP; matmul_rs asks me+1..W-1, 0..me)
+        nb, G = output.shape[0] // R, max(1, okc_patch.RS_ATTN_BLOCKS_GROUP)
+        made, ready = set(), {}
+
+        def block(j):
+            if j not in made:
+                n = 1
+                while n < G and j + n < nb and j + n not in made:
+                    n += 1
+                run(j, n)
+                r = slice(j * R, (j + n) * R)
+                y = self._fused_o_norm_gate(output[r], o_gate[r] if o_gate is not None else None)
+                for i in range(n):
+                    made.add(j + i)
+                    ready[j + i] = y[i * R:(i + 1) * R]
+            return ready.pop(j)
+
+        return okc_sp_tp_ce.RowBlocks(nb, R, output.numel() // output.shape[0], output.dtype, output.device, block)
+
+    def _okc_attn_rs_call(self, q, k, v, o_gate, forward_batch, save_kv_cache, rows):
+        _OKC_ATTN[self.attn.layer_id] = self
+        a = self.attn
+        attn_out = q.new_empty((q.shape[0], a.tp_q_head_num * a.v_head_dim), dtype=torch.bfloat16)
+        args = (q, k, v, o_gate, attn_out, a.layer_id, rows, okc_sp_tp_ce._defer, save_kv_cache)
+        capturing = torch.cuda.is_current_stream_capturing()
+        out = _okc_attn_rs_break(*args) if capturing else _okc_attn_rs(*args, forward_batch)
+        if out is None:   # the RS norm fold reads the slots: a placeholder stands for them
+            out = q.new_empty((q.shape[0] // get_parallel().tp_group.world_size, self.o_proj.weight.shape[0]))
+            okc_sp_tp_ce.defer_slots(out)
+        return out
 
     def gated_attention(
         self,
         positions: torch.Tensor,
         qkv: torch.Tensor,
         forward_batch: ForwardBatch,
+        okc_rows: int = 0,
     ) -> torch.Tensor:
         """Everything between the QKV and output projections: QK norm (and RoPE)
-        with the KV store, attention, then the output norm and gate."""
+        with the KV store, attention, then the output norm and gate (OKC okc_rows: and o_proj)."""
         if okc_patch.ANY_ATTN:
             okc_out = okc_attention.try_attention(self, qkv, forward_batch)
             if okc_out is not None:
@@ -501,6 +594,8 @@ class MuseSpark1xAttention(nn.Module):
             q, k = self._fused_qk_norm(qkv, kv_store=kv_store)
         if self.rotary_emb is not None and not fuse_rope:
             q, k = self.rotary_emb(positions, q, k)
+        if okc_rows:
+            return self._okc_attn_rs_call(q, k, v, o_gate, forward_batch, kv_store is None, okc_rows)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
         return self._fused_o_norm_gate(output, o_gate)
 
