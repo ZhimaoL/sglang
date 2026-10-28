@@ -43,6 +43,11 @@ MAX_TOKENS = int(os.environ.get("OKC_SP_CE_MAX_TOKENS", "16384"))
 # The AG side with a readiness flag per push (sp_ag_flags.py: stream memops, no barriers) instead of a barrier per
 # GROUP push steps.
 AG_FLAGS = os.environ.get("OKC_SP_CE_AG_FLAGS", "0") == "1"
+# matmul_rs: a destination block of >= this many rows runs as two half-row GEMMs (0 = off). At 2048 rows (16K chunks)
+# torch.mm's nvjet 256x128 coopA puts a 4-byte memset before each call, and in the first-turn graph that node waits
+# ~15 us beside the pushes (S10 C10: 33.7 ms of gaps per first turn; the 9K chunk's memset-free GEMMs run 0.3 us apart).
+# At 1024 rows the same kernel runs without one; bit-equal (split-K 1), +2..4 us per block.
+HALVES_MIN_ROWS = int(os.environ.get("OKC_RS_GEMM_HALVES_MIN_ROWS", "0"))
 
 _state = None
 _failed = False
@@ -170,6 +175,17 @@ def ag_matmul_steps(st, x_shard, weight):
     return out
 
 
+def _mm(a, wt, out=None):
+    if HALVES_MIN_ROWS <= 0 or a.shape[0] < HALVES_MIN_ROWS:
+        return torch.mm(a, wt) if out is None else torch.mm(a, wt, out=out)
+    if out is None:
+        out = torch.empty((a.shape[0], wt.shape[1]), dtype=a.dtype, device=a.device)
+    h = a.shape[0] // 2
+    torch.mm(a[:h], wt, out=out[:h])
+    torch.mm(a[h:], wt, out=out[h:])
+    return out
+
+
 def matmul_rs_steps(st, x, weight):
     """Generator (yields the stream that needs a barrier; returns [S, N]): x [W*S, K] @ weight [N, K]^T, reduce-scattered
     over the ranks. st: rank, world, o (flat views of every rank's receive buffer), streams."""
@@ -189,7 +205,7 @@ def matmul_rs_steps(st, x, weight):
         rows = lambda j: x[j * S:(j + 1) * S]   # noqa: E731
     keep = []
     for j, dest in enumerate(_order(me, W)):
-        part = torch.mm(rows(dest), wt)
+        part = _mm(rows(dest), wt)
         keep.append(part)
         ev = torch.cuda.Event()
         ev.record(cur)
@@ -197,7 +213,7 @@ def matmul_rs_steps(st, x, weight):
         s.wait_event(ev)
         with torch.cuda.stream(s):
             st.o[dest][me * S * N:(me + 1) * S * N].copy_(part.view(-1))
-    torch.mm(rows(me), wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
+    _mm(rows(me), wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
     ev = torch.cuda.Event()
     ev.record(cur)
     X.wait_event(ev)
