@@ -28,7 +28,15 @@ _is_hip = is_hip()
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
-_WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+def _okc_staging_pages() -> int:
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    return okc_patch.HICACHE_STAGING_PAGES
+
+
+# Pages per staged write-back call (upstream 64). OKC: see okc_patch.HICACHE_STAGING_PAGES.
+_WRITE_BACK_STAGING_PAGE_CHUNK = _okc_staging_pages()
 
 
 _host_memory_budget: ContextVar[Optional[int]] = ContextVar(

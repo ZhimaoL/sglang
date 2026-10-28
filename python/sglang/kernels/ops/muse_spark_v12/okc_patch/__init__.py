@@ -183,6 +183,13 @@ SW_FA3_FUSED_KV = _flag("OKC_SW_FA3_FUSED_KV", "1")
 # in-place 2-shot pull (configs/custom_all_reduce_v2.py, SI vg-micro). Upstream 524288.
 AR_TP8_GRAPH_MC_MIN_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_MC_MIN_BYTES", str(2 << 20)))
 
+# HiCache staged write-back: pages per relayout + DtoH call (upstream 64; pool_host/base.py). At page_size 1 that is
+# tokens: 64 made a 16K-token prefill chunk 256 Python iterations x 3 host pools on the scheduler thread (1,792 CUDA
+# calls, ~15 ms before the next chunk or the first decode step launches; SI arm A trace). 1024: ~1 ms of CPU and the
+# copies at ~48 GB/s instead of ~19 (serving/tests/bench_staged_chunk.py), 17.6 MB of staging per rank taken before
+# KV sizing. Same bytes to host; "64" restores upstream.
+HICACHE_STAGING_PAGES = max(1, int(os.environ.get("OKC_HICACHE_STAGING_PAGES", "1024")))
+
 # The running batch's DFLASH verify rides along in prefill / extend forwards (srt/managers/ride_along.py): its 8-row
 # blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
 # "1" one merged forward, "2" diagnostic (same scheduling, the two ordinary forwards back to back).
@@ -203,4 +210,4 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
-           "AR_TP8_GRAPH_MC_MIN_BYTES", "RIDE_ALONG", "ANY_ATTN"]
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "HICACHE_STAGING_PAGES", "RIDE_ALONG", "ANY_ATTN"]
