@@ -2380,6 +2380,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         forward_batch.extend_logits_rows = ride_along_logits_rows(
             prefill_batch.extend_lens, bs, block_size, device=self.device
         )
+        forward_batch.extend_attn_split = len(prefill_batch.reqs)
         self.target_worker.set_hicache_consumer(prefill_batch.hicache_consumer_index)
         target_out = self.target_worker.forward_batch_generation(
             batch=None, forward_batch=forward_batch, is_verify=True
