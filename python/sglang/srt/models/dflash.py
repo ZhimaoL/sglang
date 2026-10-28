@@ -68,25 +68,44 @@ def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
     return torch.topk(scores, k, dim=-1)
 
 
-def _okc_fc_column_split(weight: torch.Tensor, x: torch.Tensor) -> Optional[torch.Tensor]:
-    """The replicated context projection as a column-parallel GEMM + the multicast all-gather (gemm_ag): each TP
-    rank reads its 1 / tp row block of fc.weight (80 of 640 MiB at TP8) instead of all of it. target_hidden is the
-    replicated residual stream, identical on every rank, and every rank takes the same branch (shape-only test).
-    None = not applicable (the caller runs the replicated nn.Linear)."""
+def _okc_column_split(weight: torch.Tensor, x: torch.Tensor, switch: bool) -> Optional[torch.Tensor]:
+    """A replicated draft projection (fc, the grouped convs' kernel_projection) as a column-parallel GEMM + the
+    multicast all-gather the pooler uses (gemm_ag): each TP rank reads its 1 / tp row block of the weight instead of
+    all of it. x is replicated (the residual stream / the draft's hidden states), identical on every rank, and every
+    rank takes the same branch (shape-only tests). None = not applicable (the caller runs the replicated nn.Linear).
+    gemm_ag_supported allows N 4096 / 8192 only above 8 tokens; the gather kernel itself needs N / tp to be whole
+    16-byte vectors and the rows to fit the push slot, which is what is checked here up to GEMM_AG_MAX_TOKENS."""
     from sglang.kernels.ops.muse_spark_v12 import okc_patch
 
-    if not okc_patch.SW_DFLASH_FC_AG or x.dim() != 2 or not x.is_cuda:
+    if not switch or x.dim() != 2 or not x.is_cuda:
         return None
     from sglang.kernels.ops.muse_spark_v12.gemm_ag import gemm_ag, gemm_ag_supported
     from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import CustomAllReduceV2
 
     tp = get_tp_group()
     if tp.world_size < 2:
         return None
+    comm = tp.ca_comm
     x = x.contiguous()
-    if not gemm_ag_supported(tp.ca_comm, x, weight):
-        return None
-    return gemm_ag(tp.ca_comm, x, weight)
+    if not gemm_ag_supported(comm, x, weight):
+        m, k = x.shape
+        n = weight.shape[0]
+        if not (
+            isinstance(comm, CustomAllReduceV2)
+            and not comm.disabled
+            and comm.has_multicast
+            and x.dtype is torch.bfloat16
+            and weight.dtype is torch.bfloat16
+            and weight.is_contiguous()
+            and weight.shape[1] == k
+            and 1 <= m <= okc_patch.GEMM_AG_MAX_TOKENS
+            and n % (comm.world_size * 8) == 0
+            and m * n * 2 <= comm.max_push_size
+            and comm.config.num_push_blocks >= 2
+        ):
+            return None
+    return gemm_ag(comm, x, weight)
 
 
 def _logical_linear_weight_shape(
@@ -549,7 +568,14 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor):
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        coefficients = _okc_column_split(
+            self.kernel_projection.weight, hidden_states, okc_patch.SW_DFLASH_CONV_AG
+        )
+        if coefficients is None:
+            coefficients = self.kernel_projection(hidden_states)
+        coefficients = coefficients.reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (
@@ -801,7 +827,13 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = None if self.quantizable else _okc_fc_column_split(self.fc.weight, target_hidden)
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        projected = (
+            None
+            if self.quantizable
+            else _okc_column_split(self.fc.weight, target_hidden, okc_patch.SW_DFLASH_FC_AG)
+        )
         if projected is None:
             projected = self.fc(target_hidden)
             if self.quantizable:

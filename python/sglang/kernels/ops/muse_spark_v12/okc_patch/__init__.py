@@ -72,6 +72,9 @@ SW_PDL = _flag("OKC_SW_PDL", "1")
 # DFlash context projection fc (5 x 8192 -> 8192, replicated 640 MiB bf16, 159 us per verify step) as a column-split
 # GEMM + the multicast all-gather (gemm_ag) at <= GEMM_AG_MAX_TOKENS tokens.
 SW_DFLASH_FC_AG = _flag("OKC_SW_DFLASH_FC_AG", "1")
+# The same column split for the DFlash grouped convs' kernel_projection (replicated nn.Linear, 2 per draft layer, ~11 us
+# each per verify step); off until the 8-GPU check of its gather width (N = 2 * taps * groups) has run.
+SW_DFLASH_CONV_AG = _flag("OKC_SW_DFLASH_CONV_AG", "0")
 # BF16 expert layers (0 and 61 of the NVFP4 export): local ids by one table lookup and the fused finalize kernel at
 # every token count (the wrapper's torch chain below 32 tokens is 11 launches).
 SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
@@ -94,5 +97,5 @@ ANY_ATTN = SW_ATTN or SW_FS
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS",
-           "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
+           "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV", "ANY_ATTN"]
