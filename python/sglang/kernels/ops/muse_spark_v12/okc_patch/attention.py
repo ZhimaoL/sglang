@@ -6,6 +6,9 @@ Two env-gated paths, both consuming the FlashAttention backend's per-step metada
   OKC_SW_ATTN  sliding layers at q_len <= 8: the certified 2-launch decode split
                (q_len == 1) or prep + per-head split + combine (q_len 2..8), replacing
                fused QK norm + RoPE + KV store + FA3 + gated output norm.
+  OKC_SW_WST   full layers at q_len 8, bs >= 2: the attention lane's verify-full kernels (wst_ct14 with the
+               row-sliced in-kernel merge, wst_ct14b balanced over the batch from OKC_WST_BAL_MIN_BS up), one
+               launch per layer for QK norm + new KV rows + FP8 attention + merge + output norm and gate.
   OKC_SW_FS    full layers: physical-order streaming over counting-sorted rows. The
                sort metadata depends only on (page_table, seq_lens), so the FIRST full
                layer of a forward builds it IN-GRAPH and stores it on the ForwardBatch
@@ -20,8 +23,8 @@ Decisions depend only on config, forward mode, and batch shape, so a decision ta
 during CUDA-graph capture holds for every replay of that graph.
 
 Operating points (kernel court, H200): sliding d1/d16/d32 1.48/1.44/1.45x, v1/v16/v32
-1.25/1.21/1.14x per call; fs full d32 1.203x, v1-full 1.138x. d16-full and verify-full
-bs > 1 measured at or below FA3, so they stay on FA3 (OKC_FS_SORT_MIN_BS, default 24).
+1.25/1.21/1.14x per call; fs full d32 1.203x, v1-full 1.138x. d16-full stays on FA3
+(OKC_FS_SORT_MIN_BS, default 24); verify-full bs > 1 goes to wst (OKC_SW_WST).
 """
 
 import logging
@@ -48,6 +51,8 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN_ACC16,
     SW_ATTN_V3,
     SW_FS,
+    SW_WST,
+    WST_BAL_MIN_BS,
 )
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
@@ -210,7 +215,18 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
             window=window + 1, page_size=backend.page_size,
             kv_scale=kv_scale, theta=theta, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
         )
-    if not SW_FS or theta is not None or backend.page_size != 1:
+    if theta is not None or backend.page_size != 1:
+        return None
+    if q_len == 8 and bs >= 2:
+        # The wst kernels hard-code the TP8 head layout (16 q / 2 kv heads of 64) and read e4m3 cache bytes.
+        if not (SW_WST and is_fp8 and hq == 16 and hkv == 2 and d == 64):
+            return None
+        log_once(f"wst_full[q_len={q_len}]", f"(first bs={bs})")
+        return _wst_full(
+            qkv, k_cache, v_cache, cache_loc, seq_pre, page_table,
+            bs=bs, q_len=q_len, kv_scale=kv_scale, sm_scale=sm_scale, qk_factor=qk_factor, eps=eps,
+        )
+    if not SW_FS:
         return None
     if q_len == 1:
         if bs != 1 and bs < FS_SORT_MIN_BS:
@@ -443,6 +459,64 @@ def _sliding_v1(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
         D=d, BLOCK_M=cm,
         num_warps=4, num_stages=1,
     )
+    return out
+
+
+_WST_WS = {}
+_SMS = {}
+
+
+def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
+              bs, q_len, kv_scale, sm_scale, qk_factor, eps):
+    """Full-layer verify on the attention lane's wst kernels (bank v16c_m7g_rlx3 `_full_wst`, wst_cfg 54, no RoPE):
+    every CTA builds its e4m3 q fragments from qkv (RMSNorm), the split holding the block's new positions writes their
+    k (RMSNorm) / v rows to the cache before staging them, and the (b, kv head) partials (bf16 O, fp32 m / l) are folded
+    in-kernel with RMSNorm x sigmoid(gate). Splits come from the device-side lengths only (never the table width).
+
+      bs < WST_BAL_MIN_BS: wst_ct14, grid (SMs // bs, bs), uniform split of the batch's longest span, row-sliced
+                           K-waiter merge (all CTAs co-resident: SMs // bs * bs <= SMs at 1 CTA / SM).
+      otherwise          : wst_ct14b, SM-count CTAs (cooperative launch), all tiles of the batch balanced over them.
+
+    Workspaces and ticket counters persist per (route, bs): every launch moves each counter by exactly 256 (both
+    routes), so the counters are graph-safe without a reset and wrap harmlessly."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import wst_ext
+
+    device = qkv.device
+    B, L = bs, q_len
+    LG = L * 8
+    dkey = str(device)
+    G = _SMS.get(dkey)
+    if G is None:
+        G = _SMS[dkey] = torch.cuda.get_device_properties(device).multi_processor_count
+    bal = B >= WST_BAL_MIN_BS and G <= 256
+    S = 0 if bal else G // B
+    key = (bal, B, L, S, dkey)
+    st = _WST_WS.get(key)
+    if st is None:
+        nrow = (G + B) * 2 * LG if bal else B * 2 * S * LG   # partial slots: bal c + b, fqbt (b, kv head, split)
+        st = _WST_WS[key] = {
+            "acc": torch.empty((nrow, 64), dtype=torch.bfloat16, device=device),
+            "m": torch.empty((nrow,), dtype=torch.float32, device=device),
+            "l": torch.empty((nrow,), dtype=torch.float32, device=device),
+            "tick": torch.zeros((2 * B,), dtype=torch.int32, device=device),   # per (b, kv head), +256 per launch
+        }
+    skey = ("scale", float(kv_scale), dkey)
+    vs = _WST_WS.get(skey)
+    if vs is None:
+        vs = _WST_WS[skey] = torch.tensor([float(kv_scale)], dtype=torch.float32, device=device)
+    if cache_loc.dtype != torch.int64:
+        cache_loc = cache_loc.to(torch.int64)
+    out = torch.empty((B * L, 16 * 64), dtype=torch.bfloat16, device=device)
+    smqk = sm_scale * qk_factor * LOG2E
+    ext = wst_ext()
+    kc, vc = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
+    pt_pitch = page_table.stride(0)
+    if bal:
+        ext.wst_attn_bal(qkv, kc, vc, page_table, seq_pre, cache_loc, st["acc"], st["m"], st["l"], vs, smqk,
+                         B, L, pt_pitch, G, 0, 3, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, st["tick"], vs)
+    else:
+        ext.wst_attn_fqbt(qkv, kc, vc, page_table, seq_pre, cache_loc, st["acc"], st["m"], st["l"], vs, smqk,
+                          B, L, pt_pitch, 0, S, 0, 1.0 / kv_scale, 1.0 / kv_scale, eps, out, st["tick"], vs)
     return out
 
 

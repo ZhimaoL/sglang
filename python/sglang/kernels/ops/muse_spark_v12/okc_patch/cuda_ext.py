@@ -1,5 +1,5 @@
 """Lazy loaders for the OKC inline CUDA extensions, each built once per box (~1-2 min of nvcc at first use).
-pg carries hand wgmma PTX, which needs the sm_90a feature target."""
+pg and wst carry hand wgmma PTX, which needs the sm_90a feature target."""
 
 import os
 import threading
@@ -7,6 +7,7 @@ import threading
 _lock = threading.Lock()
 _PG_EXT = None
 _PROJ_EXT = None
+_WST_EXT = None
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -86,3 +87,42 @@ def proj_ext():
                     verbose=False,
                 )
     return _PROJ_EXT
+
+
+_WST_CPP = """
+void wst_attn_fqbt(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                   torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, double, int64_t, int64_t, int64_t,
+                   int64_t, int64_t, int64_t, double, double, double, torch::Tensor, torch::Tensor, torch::Tensor);
+void wst_attn_bal(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                  torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, double, int64_t, int64_t, int64_t,
+                  int64_t, int64_t, int64_t, double, double, double, torch::Tensor, torch::Tensor, torch::Tensor);
+"""
+
+
+def wst_ext():
+    """Verify-full attention (attention lane's wst_ct14 / wst_ct14b, q_len 8): see _cuda_src_wst.py."""
+    global _WST_EXT
+    if _WST_EXT is None:
+        with _lock:
+            if _WST_EXT is None:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_wst import (
+                    _CUDA_SRC,
+                )
+
+                # The bank's flags (v16c_m7g_rlx3 _wst_ext); a name of our own so the lane's cache is never reused.
+                _WST_EXT = load_inline(
+                    name="okc_wst_verify_v1",
+                    cpp_sources=[_WST_CPP],
+                    cuda_sources=[_CUDA_SRC],
+                    functions=["wst_attn_fqbt", "wst_attn_bal"],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        "--use_fast_math",
+                        "-gencode=arch=compute_90a,code=sm_90a",
+                    ],
+                    verbose=False,
+                )
+    return _WST_EXT
