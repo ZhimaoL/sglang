@@ -84,6 +84,10 @@ HOPPER_NORM_MAX_CLUSTER = int(os.environ.get("OKC_HOPPER_NORM_MAX_CLUSTER", "1")
 # unpooler's column slices are gathered inside the boundary kernel instead of a separate all_gather launch (upstream
 # gates it to capability >= 10). Cluster size follows the Hopper rule above.
 SW_AG_NORM_HOPPER = _flag("OKC_SW_AG_NORM_HOPPER", "0")
+# FA3 backend (the DFlash draft's attention; the target's full-attention layers at bs >= 2): FP8 casts of q / k / v and
+# the paged KV write as one fused_fp8_qkv_kv_cache launch (the TRT-LLM backend's kernel) instead of three casts +
+# store_kvcache, unscaled FP8 pools only.
+SW_FA3_FUSED_KV = _flag("OKC_SW_FA3_FUSED_KV", "0")
 
 ANY_ATTN = SW_ATTN or SW_FS
 
@@ -91,4 +95,4 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS",
            "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
-           "SW_AG_NORM_HOPPER", "ANY_ATTN"]
+           "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV", "ANY_ATTN"]
