@@ -43,6 +43,8 @@ if okc_patch.ANY_ATTN:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import attention as okc_attention
 if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
+if okc_patch.SW_AR_NORM:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import ar_norm as okc_ar_norm
 if okc_patch.SW_MOE_OVL:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
     from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_moe_ovl as okc_sp_moe_ovl
@@ -1292,14 +1294,15 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
             if result is not None:
                 return result
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
+        okc_f = okc_patch.SW_AR_NORM and okc_ar_norm.fused(self, attn_input)
+        attn_output = (okc_f.attn if okc_f else self.self_attn)(positions, attn_input, forward_batch)
         router_dtype = self._router_dtype
         if router_dtype is not None and (
             _use_split_bf16_router(attn_output.shape[0])
             or (okc_patch.SW_ROUTER and attn_output.shape[0] <= okc_router.MAX_TOKENS)
         ):
             router_dtype = None
-        ffn_input, stream, router_input = self._fused_attn_boundary(
+        ffn_input, stream, router_input = (okc_f or self._fused_attn_boundary)(
             stream,
             attn_output,
             branch_dtype=self.operator_dtype,

@@ -22,6 +22,7 @@ def _flag(name: str, default: str) -> bool:
     return os.environ.get(name, default) == "1"
 
 
+SW_AR_NORM = _flag("OKC_SW_AR_NORM", "0")  # o-proj AR + post-attention norm in one kernel (ar_norm.py)
 SW_MOE_PG = _flag("OKC_SW_MOE_PG", "1")
 # Measured on 8x H200: the pg pair beats Marlin on 16K-token chunks; Marlin keeps smaller prefills.
 MOE_PG_MIN_TOKENS = int(os.environ.get("OKC_MOE_PG_MIN_TOKENS", "1536"))
