@@ -56,7 +56,7 @@ def pg_ext():
 
                 # The name differs from the prefill bank's build and from the lanes' branches: the small-T front end,
                 # the PDL launch flags, the local-slot align, tiles' local-slot count and the replica balancers.
-                _PG_EXT = _pg_load("okc_pg_moe_c350_int", _CUDA_SRC, _PG_SIG)
+                _PG_EXT = _pg_load("okc_pg_moe_c350_int_d3", _CUDA_SRC, _PG_SIG)
     return _PG_EXT
 
 
@@ -69,7 +69,7 @@ def pg_narrow_ext():
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pgn import narrow_source
 
                 _PG_NARROW_EXT = _pg_load(
-                    "okc_pg_moe_n17x128s7_int", narrow_source(),
+                    "okc_pg_moe_n17x128s7_int_d3", narrow_source(),
                     ["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
                     ["-DPGN_WSET=17", "-DPGN_NST=7"],
                 )
@@ -89,7 +89,7 @@ def st_ext():
 
                 # bf16 scales and the 64-slot table (the lane's okc_st_moe_c1 reads 8-bit codes, 32 slots)
                 _ST_EXT = load_inline(
-                    name="okc_st_moe_c1_s16_e64",
+                    name="okc_st_moe_c2_s16_e64",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, int64_t);",
                     cuda_sources=_st_src._CUDA_SRC,

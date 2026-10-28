@@ -94,18 +94,19 @@ DINL void fence_acc(float* d, int n) {
 DINL __nv_bfloat162 u32b2(unsigned v) { return *reinterpret_cast<__nv_bfloat162*>(&v); }
 DINL unsigned b2u32(__nv_bfloat162 v) { return *reinterpret_cast<unsigned*>(&v); }
 
-// bf16 weight word (pack_wsf): codes c0..c7 (A-fragment order: c0 / c4 -> register 0 lo / hi, c1 / c5 -> 1, c2 / c6
-// -> 2, c3 / c7 -> 3) with magnitude bits at m and sign bit at s:
-//   c0 m 6-8   s 15 | c4 m 22-24 s 31 -> o0 = t & 0x81C081C0                                  (in place)
-//   c1 m 0-2   s 9  | c5 m 16-18 s 25 -> o1 = (t << 6) & 0x81C081C0
-//   c2 m 3-5   s 10 | c6 m 19-21 s 26 -> o2 = ((t << 3) & 0x01C001C0) | ((t << 5) & 0x80008000)
-//   c3 m 11-13 s 14 | c7 m 27-29 s 30 -> o3 = ((t >> 5) & 0x01C001C0) | ((t << 1) & 0x80008000)
-// = e2m1 x 2^-126 as bf16 (magnitude to bf16 bits 6-8, sign to 15; e = 0, m = 1 is the subnormal 2^-127): 11 ops.
-DINL void dq8r(unsigned t, __nv_bfloat162 d[4]) {
+// bf16 weight word (pack_wsf, DQ3 placement _B3): codes c0..c7 (A-fragment order: c0 / c4 -> register 0 lo / hi,
+// c1 / c5 -> 1, c2 / c6 -> 2, c3 / c7 -> 3) with magnitude bits m and sign bit s at:
+//   c0 m 6-8      s 15 | c4 m 22-24    s 31 -> o0 = t & 0x81C081C0                              (in place)
+//   c1 m 28-30    s 5  | c5 m 12-14    s 21 -> o1 = rotl(t, 10) & 0x81C081C0
+//   c2 m 25-27    s 2  | c6 m 9-11     s 18 -> o2 = rotl(t, 13) & 0x81C081C0
+//   c3 m 4, 0, 1  s 3  | c7 m 20,16,17 s 19 -> o3 = ((t & 0x001B001B) * 0x1084) & 0x81C081C0  (copies << 2, 7, 12)
+// = e2m1 x 2^-126 as bf16 (magnitude to bf16 bits 6-8, sign to 15; e = 0, m = 1 is the subnormal 2^-127): 8 ops
+// (5 LOP3 + 2 SHF + 1 IMAD; the kernel lane's rd_pack_codes_k dq=3 bit layout; the bank's v7 layout took 11).
+DINL void dq3(unsigned t, __nv_bfloat162 d[4]) {
     d[0] = u32b2(t & 0x81C081C0u);
-    d[1] = u32b2((t << 6) & 0x81C081C0u);
-    d[2] = u32b2(((t << 3) & 0x01C001C0u) | ((t << 5) & 0x80008000u));
-    d[3] = u32b2(((t >> 5) & 0x01C001C0u) | ((t << 1) & 0x80008000u));
+    d[1] = u32b2(__funnelshift_l(t, t, 10) & 0x81C081C0u);
+    d[2] = u32b2(__funnelshift_l(t, t, 13) & 0x81C081C0u);
+    d[3] = u32b2(((t & 0x001B001Bu) * 0x1084u) & 0x81C081C0u);
 }
 
 DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, unsigned r3) {
@@ -363,7 +364,7 @@ DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
 #pragma unroll
         for (int q = 0; q < 4; q++) {
             __nv_bfloat162 d[4];
-            dq8r(wq[q], d);
+            dq3(wq[q], d);
             const __nv_bfloat162 sf2 = u32b2(sfq[q]);
             const __nv_bfloat162 s0 = __bfloat162bfloat162(__low2bfloat16(sf2));
             const __nv_bfloat162 s1 = __bfloat162bfloat162(__high2bfloat16(sf2));
