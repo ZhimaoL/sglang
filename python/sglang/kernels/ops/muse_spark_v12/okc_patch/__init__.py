@@ -190,6 +190,13 @@ AR_TP8_GRAPH_MC_MIN_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_MC_MIN_BYTES", 
 # KV sizing. Same bytes to host; "64" restores upstream.
 HICACHE_STAGING_PAGES = max(1, int(os.environ.get("OKC_HICACHE_STAGING_PAGES", "1024")))
 
+# DFLASH prefill -> verify hand-off without a host sync: the extend branch's extend / prefix lengths go to the device
+# from pinned memory (dflash_worker_v2.host_ints_to_device) instead of torch.tensor(..., device=cuda), whose pageable
+# copy synchronized the stream after every extend and prefill chunk (SI arm A: 18.2 ms blocked at a bs1 follow-up,
+# ~400 ms per first-turn chunk; the GPU then idles behind each later launch: ~7.4 ms post-extend + ~3 ms in verify
+# step 1 at bs1, serving/score/HOST-OVERHEAD.md). Same values. Default off until measured on 8xH200.
+SW_PREFILL_HANDOFF = _flag("OKC_SW_PREFILL_HANDOFF", "0")
+
 # The running batch's DFLASH verify rides along in prefill / extend forwards (srt/managers/ride_along.py): its 8-row
 # blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
 # "1" one merged forward, "2" diagnostic (same scheduling, the two ordinary forwards back to back).
@@ -210,4 +217,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
-           "AR_TP8_GRAPH_MC_MIN_BYTES", "HICACHE_STAGING_PAGES", "RIDE_ALONG", "ANY_ATTN"]
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "RIDE_ALONG",
+           "ANY_ATTN"]

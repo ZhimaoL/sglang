@@ -226,6 +226,23 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+def _prefill_handoff() -> bool:
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    return okc_patch.SW_PREFILL_HANDOFF
+
+
+def host_ints_to_device(values, device) -> torch.Tensor:
+    """int32 device copy of a host int list with no stream sync.
+
+    torch.tensor(values, device=cuda) copies from pageable memory and synchronizes the stream, so after a prefill the
+    scheduler thread waits for the whole target forward and every later launch (draft-KV write, result copy, the
+    first verify step) runs behind an idle GPU. A pinned source copies in stream order and returns at once; the
+    caching host allocator keeps the pinned block until the copy has run.
+    """
+    return torch.tensor(values, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+
+
 def _commit_accept(candidates, accept_len, bonus_tokens):
     """The committed block: drafted tokens shifted left, the bonus at the accept
     boundary. Returns it with the commit lengths."""
@@ -2528,10 +2545,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
+            if _prefill_handoff():
+                ctx_lens = host_ints_to_device(batch.extend_lens, device)
+                draft_seq_lens = host_ints_to_device(batch.prefix_lens, device)
+            else:
+                ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(
