@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -530,6 +531,29 @@ class MuseSpark1xMLP(nn.Module):
         return output
 
 
+# Diagnostic (never on in serving): OKC_TOPK_DUMP_DIR keeps, on EP rank 0, the top-k ids of every eager forward of
+# <= 256 tokens (run with --disable-decode-cuda-graph so verify steps run eager), per layer and token count, in
+# <dir>/topk_rank0.pt: {T: {layer: int16 [forwards, T, 8]}} (<= 3000 forwards per T). Feeds the EP-placement fit
+# (muse-opt serving/kernels/moe-int/topk_capture_read.py).
+_OKC_TOPK_DUMP_DIR = os.environ.get("OKC_TOPK_DUMP_DIR")
+_okc_topk: dict = {}
+
+
+def _okc_dump_topk(layer_idx: int, topk_ids: torch.Tensor, save: bool) -> None:
+    n = topk_ids.shape[0]
+    if n > 256 or torch.cuda.is_current_stream_capturing():
+        return
+    rows = _okc_topk.setdefault(n, {}).setdefault(layer_idx, [])
+    if len(rows) >= 3000:
+        return
+    rows.append(topk_ids.to(torch.int16).cpu())
+    if save and layer_idx == min(_okc_topk[n]) and len(rows) % 50 == 0:
+        out = {t: {li: torch.stack(v) for li, v in d.items()} for t, d in _okc_topk.items()}
+        path = os.path.join(_OKC_TOPK_DUMP_DIR, "topk_rank0.pt")
+        torch.save(out, path + ".tmp")
+        os.replace(path + ".tmp", path)
+
+
 class MuseSpark1xMoE(nn.Module):
     def __init__(
         self,
@@ -964,6 +988,8 @@ class MuseSpark1xMoE(nn.Module):
                 if tensor is not None:
                     tensor.record_stream(main_stream)
 
+        if _OKC_TOPK_DUMP_DIR:
+            _okc_dump_topk(self.layer_idx, topk_ids, self.ep_rank == 0)
         if (capturer := get_global_experts_capturer()) is not None:
             # Capture on main after the router join, in full unpadded token order.
             # SP experts below still consume the local ids.
