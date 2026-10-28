@@ -22,17 +22,19 @@ import triton
 import triton.language as tl
 from triton.language.extra import cuda as tlc
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL, SW_PROJ_MMA
+from sglang.kernels.ops.muse_spark_v12.okc_patch import PDL_DOT_TRIGGER, SW_PDL, SW_PROJ_MMA
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import proj_ext
 
 
 @triton.jit
 def _dot(x_ptr, w_ptr, out_ptr, M, N,
          K: tl.constexpr, BLOCK_M: tl.constexpr,
-         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, PDL: tl.constexpr = False):
+         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, PDL: tl.constexpr = False,
+         PDL_TRIGGER: tl.constexpr = False):
     if PDL:   # programmatic dependent launch: wait for the producer of x before any load or store
         tlc.gdc_wait()
-        tlc.gdc_launch_dependents()
+        if PDL_TRIGGER:   # OKC_PDL_DOT_TRIGGER: let the next kernel (the o-proj all-reduce) launch right away
+            tlc.gdc_launch_dependents()
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_m = tl.arange(0, BLOCK_M)
@@ -148,7 +150,7 @@ def small_m_gemm(x, weight):
             out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
             _dot[(n // BN,)](x2, weight, out, m, n, K=k,
                              BLOCK_M=max(16, triton.next_power_of_2(m)),
-                             BLOCK_N=BN, BLOCK_K=BK, PDL=SW_PDL,
+                             BLOCK_N=BN, BLOCK_K=BK, PDL=SW_PDL, PDL_TRIGGER=PDL_DOT_TRIGGER,
                              num_warps=warps, num_stages=stages, launch_pdl=SW_PDL)
             return out.view(out_shape)
     return None
