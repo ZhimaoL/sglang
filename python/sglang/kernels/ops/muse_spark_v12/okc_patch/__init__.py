@@ -121,6 +121,16 @@ SP_CE_TP = _flag("OKC_SP_CE_TP", "1")
 # post-attention norm instead, in torch's fp32 order (bit-equal): the summed branch is never written or re-read and
 # one kernel goes (serving/kernels/rsfold).
 SW_RS_NORM_FOLD = _flag("OKC_SW_RS_NORM_FOLD", "1")
+# Sliding layers there: the attention (fmha7) and output gate per destination's row block, each block's o-proj GEMM and
+# push as soon as it exists, so the pushes run under the attention (S9 C9: ~79-90 ms of pushes after the last GEMM
+# per first turn; serving/kernels/rsfold R4 / R5). Bit-equal blocks. Off until an 8-GPU arm prices it: the pushes only
+# hide on the node, and the extra launches cost host time (dev2: ~85 us per extra attention + gate launch).
+SW_RS_ATTN_BLOCKS = _flag("OKC_SW_RS_ATTN_BLOCKS", "0")
+# From this many rows per block (destination shard): each block issues an fmha, a norm_gate, a GEMM and a push from
+# the host, so short blocks would turn the loop host-bound.
+RS_ATTN_BLOCKS_MIN_ROWS = int(os.environ.get("OKC_RS_ATTN_BLOCKS_MIN_ROWS", "2048"))
+# Up to this many consecutive destinations' rows per attention + gate launch (fewer host launches per destination).
+RS_ATTN_BLOCKS_GROUP = int(os.environ.get("OKC_RS_ATTN_BLOCKS_GROUP", "2"))
 # NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
 SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
 # pg calls of >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS tokens align their routes with the prefill bank's local-slot align
@@ -245,7 +255,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
-           "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
+           "SW_RS_NORM_FOLD", "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_AR_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",

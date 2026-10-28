@@ -46,8 +46,10 @@ if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
 if okc_patch.SW_AR_NORM:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import ar_norm as okc_ar_norm
-if okc_patch.SW_RS_NORM_FOLD:
+if okc_patch.SW_RS_NORM_FOLD or okc_patch.SW_RS_ATTN_BLOCKS:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_tp_ce as okc_sp_tp_ce
+if okc_patch.SW_RS_ATTN_BLOCKS:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import prefill_fmha as okc_prefill_fmha
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
@@ -465,17 +467,47 @@ class MuseSpark1xAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
+        rows = okc_patch.SW_RS_ATTN_BLOCKS and self._okc_block_rows(qkv.shape[0])
+        if rows:
+            # OKC rsfold O1: per-destination row blocks (sliding attention under SP + copy-engine o-proj RS)
+            with okc_prefill_fmha.defer_row_blocks(rows):
+                x = self.gated_attention(positions, qkv, forward_batch, okc_rows=rows)
+            if isinstance(x, okc_sp_tp_ce.RowBlocks):
+                out = okc_sp_tp_ce.matmul_rs(get_parallel().tp_group, x, self.o_proj.weight)
+                if out is not None:
+                    return out
+                x = x.materialize()
+            output, _ = self.o_proj(x)
+            return output
         output, _ = self.o_proj(self.gated_attention(positions, qkv, forward_batch))
         return output
+
+    def _okc_block_rows(self, num_tokens: int) -> int:
+        """Rows per destination block when this forward's o_proj takes sp_tp_ce.matmul_rs on a sliding layer (the
+        gates of row_parallel_gbar_matmul, all shape-only so every rank agrees), else 0."""
+        from sglang.srt.layers import layernorm_sp
+
+        tp = self.o_proj.tp_group.world_size if self.o_proj.tp_group is not None else 1
+        if (self.attn.sliding_window_size <= 0 or tp <= 1 or num_tokens % tp or not get_forward().sp_active
+                or num_tokens // tp < okc_patch.RS_ATTN_BLOCKS_MIN_ROWS
+                or tp != get_parallel().tp_group.world_size
+                or getattr(self.o_proj, "_sp_use_cutlass", False) or not layernorm_sp.okc_hopper_sp()
+                or not okc_patch.SP_CE_TP or not layernorm_sp.sp_fused_matmul_eligible(self.o_proj, num_tokens)):
+            return 0
+        return num_tokens // tp
 
     def gated_attention(
         self,
         positions: torch.Tensor,
         qkv: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        okc_rows: int = 0,
+    ):
         """Everything between the QKV and output projections: QK norm (and RoPE)
-        with the KV store, attention, then the output norm and gate."""
+        with the KV store, attention, then the output norm and gate.
+
+        OKC: with okc_rows (inside prefill_fmha.defer_row_blocks) a deferred fmha comes back as RowBlocks: block j is
+        the attention of rows [j R, (j + 1) R) and their output norm + gate, made when matmul_rs asks for it."""
         if okc_patch.ANY_ATTN:
             okc_out = okc_attention.try_attention(self, qkv, forward_batch)
             if okc_out is not None:
@@ -502,6 +534,28 @@ class MuseSpark1xAttention(nn.Module):
         if self.rotary_emb is not None and not fuse_rope:
             q, k = self.rotary_emb(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
+        run = okc_prefill_fmha.take_deferred(output) if okc_rows else None
+        if run is not None:
+            R, nb, G = okc_rows, output.shape[0] // okc_rows, max(1, okc_patch.RS_ATTN_BLOCKS_GROUP)
+            gate = self._fused_o_norm_gate
+            made, ready = set(), {}
+
+            def block(j):
+                # j and the next not-yet-made blocks (up to G) in one attention + gate launch; matmul_rs asks in
+                # ascending runs (me + 1 .. W - 1, then 0 .. me), so they are the next ones it needs
+                if j not in made:
+                    n = 1
+                    while n < G and j + n < nb and j + n not in made:
+                        n += 1
+                    run(j, n)
+                    r = slice(j * R, (j + n) * R)
+                    y = gate(output[r], o_gate[r] if o_gate is not None else None)
+                    for i in range(n):
+                        made.add(j + i)
+                        ready[j + i] = y[i * R:(i + 1) * R]
+                return ready.pop(j)
+
+            return okc_sp_tp_ce.RowBlocks(nb, R, output.numel() // output.shape[0], output.dtype, output.device, block)
         return self._fused_o_norm_gate(output, o_gate)
 
 

@@ -154,9 +154,34 @@ def ag_matmul_steps(st, x_shard, weight):
     return out
 
 
+class RowBlocks:
+    """The o-proj input as W blocks of R rows made on demand (OKC rsfold O1): block(j) -> contiguous [R, K], called
+    once per j in matmul_rs's order (peers rank-staggered, own last), so each destination's GEMM and push start as soon
+    as its rows exist (MuseSpark1xAttention: the attention + output gate of those rows)."""
+
+    def __init__(self, W, R, K, dtype, device, block):
+        self.W, self.R, self.K, self.dtype, self.device, self.block = W, R, K, dtype, device, block
+        self.shape = (W * R, K)
+
+    def materialize(self):
+        out = torch.empty(self.shape, dtype=self.dtype, device=self.device)
+        for j in range(self.W):
+            out[j * self.R:(j + 1) * self.R].copy_(self.block(j))
+        return out
+
+
+def _loop_state(st, S, N):
+    """Per (S, N): this rank's slot view in every receive buffer, and reusable events (host cost of the push loop)."""
+    c = st.__dict__.setdefault("_okc_loop", {})
+    if (S, N) not in c:
+        me, W = st.rank, st.world
+        c[(S, N)] = ([st.o[d][me * S * N:(me + 1) * S * N] for d in range(W)], [torch.cuda.Event() for _ in range(W + 1)])
+    return c[(S, N)]
+
+
 def matmul_rs_steps(st, x, weight):
-    """Generator (yields the stream that needs a barrier; returns [S, N]): x [W*S, K] @ weight [N, K]^T, reduce-scattered
-    over the ranks. st: rank, world, o (flat views of every rank's receive buffer), streams."""
+    """Generator (yields the stream that needs a barrier; returns [S, N]): x [W*S, K] (or RowBlocks) @ weight [N, K]^T,
+    reduce-scattered over the ranks. st: rank, world, o (flat views of every rank's receive buffer), streams."""
     global _deferred
     M, K = x.shape
     W, me = st.world, st.rank
@@ -166,25 +191,31 @@ def matmul_rs_steps(st, x, weight):
     X = st.streams[0]
     for s in st.streams:
         s.wait_stream(cur)
-    x = x.contiguous()
+    if isinstance(x, RowBlocks):
+        rows = x.block
+    else:
+        x = x.contiguous()
+        rows = lambda j: x[j * S:(j + 1) * S]   # noqa: E731
+    slot, evs = _loop_state(st, S, N)
     keep = []
     for j, dest in enumerate(_order(me, W)):
-        part = torch.mm(x[dest * S:(dest + 1) * S], wt)
+        part = torch.mm(rows(dest), wt)
         keep.append(part)
-        ev = torch.cuda.Event()
+        ev = evs[j]
         ev.record(cur)
         s = st.streams[j % len(st.streams)]
         s.wait_event(ev)
-        with torch.cuda.stream(s):
-            st.o[dest][me * S * N:(me + 1) * S * N].copy_(part.view(-1))
-    torch.mm(x[me * S:(me + 1) * S], wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
-    ev = torch.cuda.Event()
+        torch.cuda.set_stream(s)
+        slot[dest].copy_(part.view(-1))
+        torch.cuda.set_stream(cur)
+    torch.mm(rows(me), wt, out=slot[me].view(S, N))
+    ev = evs[W - 1]
     ev.record(cur)
     X.wait_event(ev)
     for s in st.streams[1:]:
         X.wait_stream(s)
     yield X
-    ev = torch.cuda.Event()
+    ev = evs[W]
     ev.record(X)
     cur.wait_event(ev)
     slots = st.o[me][:W * S * N].view(W, S, N)
@@ -226,7 +257,7 @@ def ag_matmul(tp_group, x_shard, weight):
 
 
 def matmul_rs(tp_group, x, weight):
-    """[W*S, K] @ weight [N, K]^T reduce-scattered -> [S, N], or None (keep torch's fused op)."""
+    """[W*S, K] (or RowBlocks) @ weight [N, K]^T reduce-scattered -> [S, N], or None (keep torch's fused op)."""
     W = tp_group.world_size
     if x.shape[0] % W:
         return None

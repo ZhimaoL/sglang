@@ -18,8 +18,15 @@ Kernel (okc_patch/_cuda_src_fmha.py): gather_kp copies the request's paged K/V r
 consumer warpgroups (f16 QK, lazy-max hybrid exp2, e4m3 P, fp8 PV, tensor-core row sums), split-KV + combine
 when one request's grid under-fills the GPU (pick_cfg below = the bank's pick_cfg4). OKC_PREFILL_FMHA_EXACT=1 runs
 every exp2 on MUFU (no piecewise-linear exp).
+
+Row blocks (OKC rsfold O1, MuseSpark1xAttention under SP + copy-engine TP): inside defer_row_blocks(R) a one-request
+sliding call gathers its stage images and returns its output unwritten; take_deferred(output) hands back run(j),
+which launches the same kernel config (nc, split) over rows [j R, (j + n) R) with that range's length, so the o-proj
+GEMM and push of each destination start under the rest of the attention. Blocks are whole 8 * nc query tiles, so
+every CTA computes the rows and key range it would in the whole call (bit-equal, serving/kernels/rsfold).
 """
 
+import contextlib
 import logging
 import os
 from typing import Optional
@@ -48,6 +55,34 @@ PATH_STATS = os.environ.get("OKC_PATH_STATS", "0") == "1"
 HITS = {"fmha": 0, "fmha_tokens": 0, "fa3": 0}
 _FIRED = set()
 _SCALES = {}
+_DEFER_ROWS = 0   # > 0 inside defer_row_blocks
+_DEFERRED = None  # (output, rows, blocks, run) of the deferred call
+_BLOCK_OFFS = {}
+
+
+@contextlib.contextmanager
+def defer_row_blocks(rows: int):
+    global _DEFER_ROWS
+    _DEFER_ROWS = rows
+    try:
+        yield
+    finally:
+        _DEFER_ROWS = 0
+
+
+def take_deferred(output: torch.Tensor):
+    """run(j) for the deferred call whose output `output` is, else None. Another deferred call has all its blocks run
+    here, so nothing reads it unwritten."""
+    global _DEFERRED
+    d, _DEFERRED = _DEFERRED, None
+    if d is None:
+        return None
+    o, rows, blocks, run = d
+    if output.data_ptr() == o.data_ptr() and output.numel() == o.numel():
+        return run
+    for j in range(blocks):
+        run(j)
+    return None
 
 
 def _log_once(path: str, detail: str) -> None:
@@ -157,7 +192,10 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
 
     ext = fmha_ext(PFMHA_EXACT)
     win = window_size[0] + 1 if is_swa else 0
-    if out is None or out.dtype is not torch.bfloat16 or not out.is_contiguous() or out.numel() != tokens * HQ * D:
+    usable = out is not None and out.dtype is torch.bfloat16 and out.is_contiguous() and out.numel() == tokens * HQ * D
+    # row blocks: one sliding request in whole blocks, and no caller copy of an unwritten result (a given out is used)
+    defer = _DEFER_ROWS > 0 and bs == 1 and win and tokens % _DEFER_ROWS == 0 and (out is None or usable)
+    if not usable:
         out = torch.empty((tokens, HQ, D), dtype=torch.bfloat16, device=device)
     o = out.view(tokens, HQ, D)
     smqk = float(layer.scaling) * LOG2E
@@ -165,6 +203,10 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     kc = key_cache.view(torch.uint8)
     vc = value_cache.view(torch.uint8)
     for i, (off, L, max_len) in enumerate(reqs):
+        if defer:
+            nc, split = _defer_blocks(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o,
+                                      device, _DEFER_ROWS)
+            continue
         nc, split = _one(ext, q8[off:off + L], kc, vc, page_table[i:i + 1], cache_seqlens[i:i + 1], L, max_len,
                          win, ks, vs, smqk, o[off:off + L], device)
     HITS["fmha"] += 1
@@ -178,6 +220,35 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
 
 def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device):
     """One request: gather its keys into stage images, then fmha7 (+ combine). Returns (nc, split)."""
+    kvt, lens, capblks, nc, split = _gather(ext, kc, vc, page_table, cache_seqlens, L, max_len, win, device)
+    _attend(ext, q8, kvt, o, lens, ks, vs, smqk, L, capblks, win, nc, split, device)
+    return nc, split
+
+
+def _defer_blocks(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device, R):
+    """The gather now, fmha7 per R-row block later (take_deferred). Whole-call fallback when R is not a whole number
+    of the config's query tiles."""
+    global _DEFERRED
+    kvt, lens, capblks, nc, split = _gather(ext, kc, vc, page_table, cache_seqlens, L, max_len, win, device)
+    if R % (8 * nc):
+        _attend(ext, q8, kvt, o, lens, ks, vs, smqk, L, capblks, win, nc, split, device)
+        return nc, split
+    nb = L // R
+    key = (nb, R, device)
+    if key not in _BLOCK_OFFS:
+        _BLOCK_OFFS[key] = torch.arange(nb - 1, -1, -1, dtype=torch.int32, device=device) * R
+    blens = lens - _BLOCK_OFFS[key]   # block j ends (nb - 1 - j) R rows before the request: its length
+
+    def run(j, n=1):   # blocks j .. j + n - 1 in one launch (the length is that of the last)
+        r = slice(j * R, (j + n) * R)
+        _attend(ext, q8[r], kvt, o[r], blens[j + n - 1:j + n], ks, vs, smqk, n * R, capblks, win, nc, split, device)
+        return o[r]
+
+    _DEFERRED = (o, R, nb, run)
+    return nc, split
+
+
+def _gather(ext, kc, vc, page_table, cache_seqlens, L, max_len, win, device):
     cap = ((min(win - 1 + L, max_len) if win else max_len) + 255) & ~255
     capblks = cap // 128
     kvt = torch.empty((2 * capblks, 16384), dtype=torch.uint8, device=device)
@@ -192,6 +263,10 @@ def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, sm
         ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, none, none, page_table.stride(0), 0, capblks, 1, L, 0)
         ntf = capblks
     nc, split = pick_cfg(L, ntf)
+    return kvt, lens, capblks, nc, split
+
+
+def _attend(ext, q8, kvt, o, lens, ks, vs, smqk, L, capblks, win, nc, split, device):
     if split <= 1:
         ext.fmha4n_split(q8, kvt, o, o, o, lens, ks, vs, smqk, 1, L, capblks, 1, win, nc)
     else:
@@ -200,4 +275,3 @@ def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, sm
         pml = torch.empty((split, rows, 2), dtype=torch.float32, device=device)
         ext.fmha4n_split(q8, kvt, o, po, pml, lens, ks, vs, smqk, 1, L, capblks, split, win, nc)
         ext.combine(po, pml, o, rows, split)
-    return nc, split
