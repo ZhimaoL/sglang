@@ -156,6 +156,7 @@ constexpr int SB  = (16384 + 2 * WSB + 1023) / 1024 * 1024;   // PAIR stage: X 2
 constexpr int SB  = 37888;               // stage stride: X 32768 + W|sf 5120 (a whole number of 1024 B atoms)
 #endif  // PGN_WSET
 constexpr int SB4 = 16384 + 4 * WSB;     // pg_n4 PAIR stage: X 2 x 8 KB + W|sf (kt, kt + 1) of two w-tiles
+constexpr int SB4S = XB + 2 * WSB;       // pg_n4 single stage: X one k-tile + W|sf kt of two w-tiles
 constexpr int PREGS = 40, CREGS = 232;   // setmaxnreg targets
 static_assert(128 * PREGS + 256 * CREGS <= 384 * 168, "setmaxnreg budget exceeds the launch allocation");
 constexpr int EPI1 = XB / 2;             // gg1 epilogue per WG: its half of the inter tile [256 t][64 B] (SW64)
@@ -444,7 +445,7 @@ template <int GATED, int NV, int NST, int MODE, int LAG, int PAIR = 0, int SUB =
 DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
     constexpr unsigned XOFF = PAIR ? SUB * 8192 : 0;
     constexpr unsigned WOFF = PAIR ? 16384 + SUB * WSB : XB;
-    constexpr int SBK = N4 ? SB4 : SB;                  // pg_n4's slot: two w-tiles' W|sf
+    constexpr int SBK = N4 ? (PAIR ? SB4 : SB4S) : SB;   // pg_n4's slot: two w-tiles' W|sf
     if (!PAIR || SUB == 0) mbar_wait(c.mb + c.sl * 8, c.cph);
     if (MODE == 0) {
         const char* stp = c.smem + c.sl * SBK + (N4 ? c.woff : 0);
@@ -958,12 +959,17 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
 // PAIR item (nv <= 64 at XNT 64): slot = token k-tiles kt / kt + 1 at 0 / 8 KB, W|sf (kt, kt + 1) of w-tile 2 wp at
 // 16 KB and of 2 wp + 1 at 16 KB + 2 WSB. Twice the consumer warps per scheduler on the one ring (the narrow k-loop is
 // latency-bound at 2 consumer warpgroups); 640 threads, setmaxnreg 24 / 112 (32 accumulators at nv <= 64).
+// N4P = 0: single slots (one k-tile of X + W|sf kt of both w-tiles, 18 KB): 11 fit beside the epilogue buffers vs 5
+// PAIR slots of 36 KB.
+#ifndef PGN_N4P
+#define PGN_N4P 1
+#endif
 constexpr int N4_PREGS = 24, N4_CREGS = 112;
 static_assert(128 * N4_PREGS + 512 * N4_CREGS <= 640 * 96, "n4 setmaxnreg budget exceeds the launch allocation");
-static_assert(SB4 % 1024 == 0 && XNT == 64, "n4: 64-token blocks, 1024 B aligned slots");
-constexpr int n4_smem_bytes(int nst) { return nst * SB4 + BAR_BYTES + 4 * EPI1; }
+static_assert(SB4 % 1024 == 0 && SB4S % 1024 == 0 && XNT == 64, "n4: 64-token blocks, 1024 B aligned slots");
+constexpr int n4_smem_bytes(int nst, int pair) { return nst * (pair ? SB4 : SB4S) + BAR_BYTES + 4 * EPI1; }
 
-template <int NST, int WSET>
+template <int NST, int WSET, int N4P>
 __global__ void __launch_bounds__(640, 1) pg_n4(
     const char* __restrict__ xg, const char* __restrict__ wsf, const float* __restrict__ gs,
     void* __restrict__ out, const int* __restrict__ block_experts, const int* __restrict__ live, int NWT, int snake)
@@ -972,8 +978,9 @@ __global__ void __launch_bounds__(640, 1) pg_n4(
     const int tid = threadIdx.x;
     const unsigned sbase = smem_u32(smem);
     if (sbase & 1023) __trap();
-    const unsigned mb = sbase + NST * SB4;              // full[NST] | empty[NST] | meta[2][4]
-    int* meta = reinterpret_cast<int*>(smem + NST * SB4 + 2 * NST * 8);
+    constexpr int SBN = N4P ? SB4 : SB4S;
+    const unsigned mb = sbase + NST * SBN;              // full[NST] | empty[NST] | meta[2][4]
+    int* meta = reinterpret_cast<int*>(smem + NST * SBN + 2 * NST * 8);
     const unsigned ebase = mb + BAR_BYTES;              // 4 consumer epilogue buffers
     if (tid < NST) {
         mbar_init(mb + tid * 8, 1);
@@ -1007,19 +1014,27 @@ __global__ void __launch_bounds__(640, 1) pg_n4(
                 const char* xs = xg + (size_t)pm * NKT * XB;
                 const char* ws0 = wsf + ((size_t)e * NWT + 2 * wp) * (size_t)NKT * WSB;
                 const char* ws1 = ws0 + (size_t)NKT * WSB;
-                for (int ks = 0; ks < NKT / 2; ks++) {
+                for (int ks = 0; ks < (N4P ? NKT / 2 : NKT); ks++) {
                     if (rnd > 0) mbar_wait(mb + NST * 8 + sl * 8, (rnd - 1) & 1);
-                    const unsigned st = sbase + sl * SB4;
-                    const int kt = 2 * ks;
-                    mbar_expect_tx(mb + sl * 8, 2 * nv * 128 + 4 * WSB);
+                    const unsigned st = sbase + sl * SBN;
+                    if (N4P) {
+                        const int kt = 2 * ks;
+                        mbar_expect_tx(mb + sl * 8, 2 * nv * 128 + 4 * WSB);
 #pragma unroll
-                    for (int sub = 0; sub < 2; sub++)
-                        bulk_g2s(st + sub * 8192, xs + (size_t)(kt + sub) * XB, nv * 128, mb + sl * 8);
-                    bulk_g2s(st + 16384, ws0 + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);
-                    bulk_g2s(st + 16384 + 2 * WSB, ws1 + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);
+                        for (int sub = 0; sub < 2; sub++)
+                            bulk_g2s(st + sub * 8192, xs + (size_t)(kt + sub) * XB, nv * 128, mb + sl * 8);
+                        bulk_g2s(st + 16384, ws0 + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);
+                        bulk_g2s(st + 16384 + 2 * WSB, ws1 + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);
+                    } else {
+                        const int kt = ks;
+                        mbar_expect_tx(mb + sl * 8, nv * 128 + 2 * WSB);
+                        bulk_g2s(st, xs + (size_t)kt * XB, nv * 128, mb + sl * 8);
+                        bulk_g2s(st + XB, ws0 + (size_t)kt * WSB, WSB, mb + sl * 8);
+                        bulk_g2s(st + XB + WSB, ws1 + (size_t)kt * WSB, WSB, mb + sl * 8);
+                    }
                     if (++sl == NST) { sl = 0; rnd++; }
-                    if (ks == 8 && nxt < n_items) e_n = block_experts[ent_n & 0xFFFFF];
-                    if (ks == 16 && nxt < n_items) g_n = gs[e_n];
+                    if (ks == (N4P ? 8 : 16) && nxt < n_items) e_n = block_experts[ent_n & 0xFFFFF];
+                    if (ks == (N4P ? 16 : 32) && nxt < n_items) g_n = gs[e_n];
                 }
                 item = nxt;
             }
@@ -1034,7 +1049,7 @@ __global__ void __launch_bounds__(640, 1) pg_n4(
     c.sbase = sbase;
     c.mb = mb;
     c.cw = cw4 & 1;                         // row half of the w-tile (W stage index, scales, rows)
-    c.bar = 1 + cw4; c.hf = cw4 & 1; c.woff = (cw4 >> 1) * 2 * WSB;
+    c.bar = 1 + cw4; c.hf = cw4 & 1; c.woff = (cw4 >> 1) * (N4P ? 2 : 1) * WSB;
     c.ctid = c.cw * 128 + (tid & 127);
     c.wtid = tid & 127;
     c.lw = (tid >> 5) & 3;
@@ -1057,11 +1072,11 @@ __global__ void __launch_bounds__(640, 1) pg_n4(
         unsigned bA[16], bB[16];
         const int nv = eff_nv<WSET>(wcode);
         if ((WSET & 16) && nv == 16)
-            item_body<1, NST, 0, 16, 1, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
+            item_body<1, NST, 0, 16, N4P, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
         else if ((WSET & 8) && nv == 32)
-            item_body<1, NST, 0, 32, 1, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
+            item_body<1, NST, 0, 32, N4P, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
         else
-            item_body<1, NST, 0, XNT, 1, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
+            item_body<1, NST, 0, XNT, N4P, XNT / 2, 1>(c, acc, bA, bB, pm, wt, gsv, nullptr, out, NWT, 0);
     }
     if (wtid == 0) bulk_wait0();
 }
@@ -1724,8 +1739,8 @@ void gg1(torch::Tensor xg, torch::Tensor wsf, torch::Tensor gs, torch::Tensor in
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
 #if defined(PGN_WSET) && defined(PGN_N4)
     {
-        auto fn = pgk::pg_n4<PGN_N4, PGN_WSET>;
-        constexpr int smem = pgk::n4_smem_bytes(PGN_N4);
+        auto fn = pgk::pg_n4<PGN_N4, PGN_WSET, PGN_N4P>;
+        constexpr int smem = pgk::n4_smem_bytes(PGN_N4, PGN_N4P);
         static bool set = false;
         if (!set) {
             cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
