@@ -40,8 +40,11 @@ def pg_ext():
                 # The name differs from the prefill bank's build: the small-T front end (route, gather_norm) and
                 # the PDL launch flags changed the entry points.
                 _PG_EXT = load_inline(
-                    name="okc_pg_moe_c350_pdl",
-                    cpp_sources="void tiles(torch::Tensor, torch::Tensor, torch::Tensor, "
+                    name="okc_pg_moe_c350_pdla",
+                    cpp_sources="void align(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, "
+                    "int64_t, int64_t);\n"
+                    "void tiles(torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
                     "void gather(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "int64_t, int64_t);\n"
@@ -55,7 +58,7 @@ def pg_ext():
                     "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
                     "void set_snake_max_t(int64_t);",
                     cuda_sources=_CUDA_SRC,
-                    functions=["tiles", "gather", "route", "gather_norm", "gg1", "gg2", "set_snake_max_t"],
+                    functions=["align", "tiles", "gather", "route", "gather_norm", "gg1", "gg2", "set_snake_max_t"],
                     extra_cuda_cflags=[
                         "-O3",
                         "--use_fast_math",
