@@ -9,8 +9,9 @@
   OKC_MOE_PG_ONLY=1  (default) packed layers drop their Marlin copy and run pg at every token count
                      (verify steps included), so every layer fits: +0.1 GiB per layer over Marlin.
                      0 keeps Marlin and uses pg on the prefill chunks of the first N layers only.
-  OKC_MOE_REPLICAS=2 hot-expert replicas per rank per pg-only layer (0, 1, 2 or 4; the choice per layer is
-                     layers/muse_spark_expert_replicas.json): 27 MiB each. Forwards of at most
+  OKC_MOE_REPLICAS=1 hot-expert replicas per rank per pg-only layer (0, 1, 2 or 4; the choice per layer is
+                     layers/muse_spark_expert_replicas.json): 30 MiB each, 1.8 GiB per rank per replica over 62
+                     layers (R = 2 leaves the c32 KV pool ~2.85M tokens: tight). Forwards of at most
                      OKC_MOE_REP_MAX_TOKENS tokens (256: every verify graph) give each active replicated expert to
                      the less loaded of its two holders; longer ones leave the replicas idle.
 
@@ -32,7 +33,7 @@ MOE_PG_ONLY = _flag("OKC_MOE_PG_ONLY", "1")
 _pack_layers = os.environ.get("OKC_MOE_PACK_MAX_LAYERS", "all" if MOE_PG_ONLY else "16")
 MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 # EP straggler at verify: every rank waits at the MoE all-reduce for the one with the most active experts.
-MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "2"))
+MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "1"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
 
 

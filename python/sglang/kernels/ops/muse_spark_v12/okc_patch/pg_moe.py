@@ -10,7 +10,7 @@ This replaces the v10 wg pair (wg_moe.py), which stages the token rows and the i
 Scale handling (as in the bank): gg1 applies the expert's w13 global scale (and the 2^8 decode
 compensation) before silu; the intermediate carries 2^-6 and gg2's rows keep a per-route positive constant
 (2^-6 / the expert's w2 global scale) that the caller's post-expert RMSNorm cancels, as for the wg pair.
-Memory per captured layer per rank (32 local experts, I = H = 4096): 576 + 288 MiB of W|sf blocks (27 MiB per
+Memory per captured layer per rank (32 local experts, I = H = 4096): 640 + 320 MiB of W|sf blocks (30 MiB per
 expert); a layer with replicas packs 32 + R experts (moe.py, rep_table / assign_replicas below).
 """
 
