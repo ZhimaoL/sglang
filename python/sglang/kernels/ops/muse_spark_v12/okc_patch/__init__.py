@@ -36,6 +36,10 @@ SW_ATTN = _flag("OKC_SW_ATTN", "1")
 SW_FS = _flag("OKC_SW_FS", "1")
 SW_PROJ = _flag("OKC_SW_PROJ", "1")
 SW_PROJ_MMA = _flag("OKC_SW_PROJ_MMA", "1")
+# Small-m dense GEMMs at verify m (okc_patch/smallm.py): TMA + wgmma straight off the resident row-major bf16 weight
+# for qkv_gate (m <= 16) and the gemm_ag pooler / unpooler slices (m <= 64 / 32); claims replace the qkv_gate MMA pack
+# (OKC_SW_PROJ_MMA's 2.2 GiB per rank is then not built).
+SW_SMALLM = _flag("OKC_SW_SMALLM", "1")
 SW_ROUTER = _flag("OKC_SW_ROUTER", "1")
 # Kill switches of the v1 attention paths (default on; "0" falls back to the older chain).
 SW_ATTN_V3 = _flag("OKC_SW_ATTN_V3", "1")
@@ -137,7 +141,7 @@ RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
-           "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
+           "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_SMALLM", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
