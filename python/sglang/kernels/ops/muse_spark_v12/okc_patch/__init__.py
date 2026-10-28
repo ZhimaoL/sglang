@@ -216,8 +216,8 @@ HICACHE_STAGING_PAGES = max(1, int(os.environ.get("OKC_HICACHE_STAGING_PAGES", "
 # from pinned memory (dflash_worker_v2.host_ints_to_device) instead of torch.tensor(..., device=cuda), whose pageable
 # copy synchronized the stream after every extend and prefill chunk (SI arm A: 18.2 ms blocked at a bs1 follow-up,
 # ~400 ms per first-turn chunk; the GPU then idles behind each later launch: ~7.4 ms post-extend + ~3 ms in verify
-# step 1 at bs1, serving/score/HOST-OVERHEAD.md). Same values. Default off until measured on 8xH200.
-SW_PREFILL_HANDOFF = _flag("OKC_SW_PREFILL_HANDOFF", "0")
+# step 1 at bs1, serving/score/HOST-OVERHEAD.md). Same values. On in every confirmed 8xH200 arm since S8 C.
+SW_PREFILL_HANDOFF = _flag("OKC_SW_PREFILL_HANDOFF", "1")
 # Between-chunk admission (srt/managers/small_prefill_first.py): at low load (running + waiting <=
 # OKC_BETWEEN_CHUNK_MAX_REQS) a follow-up that arrives while a first turn is being chunked is prefilled on its own between
 # two full-size chunks, then gets the decode steps that show its first token. The scheduler picks what follows a chunk
