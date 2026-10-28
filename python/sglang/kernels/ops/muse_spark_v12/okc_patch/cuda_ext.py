@@ -6,6 +6,7 @@ import threading
 
 _lock = threading.Lock()
 _PG_EXT = None
+_PG_NARROW_EXT = None
 _PROJ_EXT = None
 
 _PROJ_CPP = """
@@ -56,6 +57,45 @@ def pg_ext():
                     verbose=False,
                 )
     return _PG_EXT
+
+
+_PG_CPP = (
+    "void tiles(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
+    "void gather(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t);\n"
+    "void gg1(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, "
+    "int64_t, int64_t);\n"
+    "void gg2(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, "
+    "int64_t, int64_t);\n"
+    "void set_snake_max_t(int64_t);"
+)
+
+
+def pg_narrow_ext():
+    """The narrow build of pg (_cuda_src_pgn: 128-token blocks, widths 16 / 64 / 128) for mid-T calls."""
+    global _PG_NARROW_EXT
+    if _PG_NARROW_EXT is None:
+        with _lock:
+            if _PG_NARROW_EXT is None:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pgn import narrow_source
+
+                _PG_NARROW_EXT = load_inline(
+                    name="okc_pg_moe_n17x128s7",
+                    cpp_sources=_PG_CPP,
+                    cuda_sources=narrow_source(),
+                    functions=["tiles", "gather", "gg1", "gg2", "set_snake_max_t"],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        "--use_fast_math",
+                        "-gencode=arch=compute_90a,code=sm_90a",
+                        "-DPGN_WSET=17",
+                        "-DPGN_NST=7",
+                    ],
+                    verbose=False,
+                )
+    return _PG_NARROW_EXT
 
 
 def proj_ext():
