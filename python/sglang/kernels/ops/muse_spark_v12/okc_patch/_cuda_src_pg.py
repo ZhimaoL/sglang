@@ -882,8 +882,7 @@ __global__ void __launch_bounds__(256) align_scatter(const int* __restrict__ lid
 // replica's rank; tab[256 + j] = the j-th replicated expert in balancing order. Same decision on every rank from the
 // same ids. An active expert weighs 1, or with passes its st passes ceil(routes / 8) (st's time is c0 + c1 x passes);
 // load[r] = weight of the active non-replicated experts homed on r; each active replicated expert, in order, goes to
-// the holder with the lower load (tie: home); then two sweeps move a replicated expert off the most loaded rank when
-// its other holder stays below. out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
+// the holder with the lower load (tie: home). out[i] = route i's slot here or -1; emap_out[e] = the same per expert.
 template <typename IdT>
 __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids, int n_routes,
                                                      const int* __restrict__ tab, int n_rep, int me, int passes,
@@ -906,28 +905,24 @@ __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids
     if (w && !((v >> 11) & 1)) atomicAdd(&load[(v >> 8) & 7], w);
     __syncthreads();
     if (t == 0) {
-        int ld[8];
+        // 16 bits per rank in two registers (a passes-weighted load stays below 2^16); no local-memory arrays: this
+        // serial loop sits on every rank's critical path
+        unsigned long long L0 = 0, L1 = 0;
 #pragma unroll
-        for (int r = 0; r < 8; r++) ld[r] = load[r];
+        for (int r = 0; r < 4; r++) {
+            L0 |= (unsigned long long)load[r] << (16 * r);
+            L1 |= (unsigned long long)load[4 + r] << (16 * r);
+        }
         for (int j = 0; j < n_rep; j++) {
             const int e = ord[j], c = cnt[e];
             if (!c) continue;
             const int ve = tabs[e], h = (ve >> 8) & 7, r = (ve >> 12) & 7;
-            const int pick = ld[r] < ld[h] ? r : h;
+            const unsigned lh = (unsigned)(((h & 4) ? L1 : L0) >> (16 * (h & 3))) & 0xFFFFu;
+            const unsigned lr = (unsigned)(((r & 4) ? L1 : L0) >> (16 * (r & 3))) & 0xFFFFu;
+            const int pick = lr < lh ? r : h;
             owner[e] = pick;
-            ld[pick] += passes ? (c + 7) >> 3 : 1;
-        }
-        for (int sweep = 0; sweep < 2; sweep++) {
-            for (int j = 0; j < n_rep; j++) {
-                const int e = ord[j], c = cnt[e];
-                if (!c) continue;
-                const int ve = tabs[e], h = (ve >> 8) & 7, r = (ve >> 12) & 7, we = passes ? (c + 7) >> 3 : 1;
-                const int o = owner[e], q = o == h ? r : h;
-                int mx = ld[0];
-#pragma unroll
-                for (int k = 1; k < 8; k++) mx = max(mx, ld[k]);
-                if (ld[o] == mx && ld[q] + we < ld[o]) { owner[e] = q; ld[o] -= we; ld[q] += we; }
-            }
+            const unsigned long long add = (unsigned long long)(passes ? (c + 7) >> 3 : 1) << (16 * (pick & 3));
+            if (pick & 4) L1 += add; else L0 += add;
         }
     }
     __syncthreads();

@@ -81,7 +81,7 @@ def pg_ext():
 
                 # The name differs from the prefill bank's build and from the lanes' branches: the small-T front end,
                 # the PDL launch flags, the local-slot align, tiles' local-slot count and the replica balancers.
-                _PG_EXT = _pg_load("okc_pg_moe_c350_int_d3_b2", _CUDA_SRC, _PG_SIG)
+                _PG_EXT = _pg_load("okc_pg_moe_c350_int_d3_b3", _CUDA_SRC, _PG_SIG)
     return _PG_EXT
 
 
