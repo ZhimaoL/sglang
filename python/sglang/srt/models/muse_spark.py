@@ -1105,6 +1105,9 @@ class MuseSpark1xDecoderLayer(nn.Module):
         )
         self._fused_ffn_boundary = None
         self._next_layer = None
+        # OKC: the model's final norm, bound on the last layer only (not a submodule: the model owns it).
+        object.__setattr__(self, "_okc_final_norm", None)
+        object.__setattr__(self, "_okc_tail_used", False)
         # (forward batch, QKV) the previous layer's Helion verify tail computed.
         self._verify_qkv = None
         # The checkpoint keeps the first and last layers' experts in BF16; those
@@ -1176,6 +1179,15 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
             return stream, next_attn_input
         if self._fused_ffn_boundary is None:
+            okc_tail = None
+            if self._okc_final_norm is not None and not getattr(get_forward(), "sp_active", False):
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import glue as okc_glue
+
+                okc_tail = okc_glue.tail_boundary(self, stream, ffn_output, self._okc_final_norm)
+            # set on every call: MuseSpark1xModel reads it right after this layer to skip its own final norm
+            object.__setattr__(self, "_okc_tail_used", okc_tail is not None)
+            if okc_tail is not None:
+                return okc_tail   # (stream.to(bf16), the model's final norm of it)
             return self.post_feedforward_residual_gate(
                 stream, self.post_feedforward_layernorm(ffn_output)
             ), None
@@ -1341,6 +1353,8 @@ class MuseSpark1xModel(nn.Module):
         )
         # Layer indices whose output residual stream feeds the DFLASH draft context.
         self.layers_to_capture: List[int] = []
+        if self.layers and okc_patch.SW_TAIL_NORM:
+            object.__setattr__(self.layers[-1], "_okc_final_norm", self.norm)
 
     def forward(
         self,
@@ -1383,8 +1397,12 @@ class MuseSpark1xModel(nn.Module):
             if layer_idx in self.layers_to_capture:
                 # Draft context projection reads operator dtype, not residual_dtype.
                 aux_hidden_states.append(stream.to(self.operator_dtype))
-        norm_input = stream.to(self.operator_dtype)
-        hidden_states = self.norm(norm_input).to(self.operator_dtype)
+        if self.layers and getattr(self.layers[-1], "_okc_tail_used", False):
+            # The last layer's OKC tail boundary returned (stream.to(bf16), self.norm of it).
+            hidden_states = attn_input
+        else:
+            norm_input = stream.to(self.operator_dtype)
+            hidden_states = self.norm(norm_input).to(self.operator_dtype)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

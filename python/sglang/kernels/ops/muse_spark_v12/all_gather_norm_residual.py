@@ -104,6 +104,13 @@ def all_gather_norm_residual_supported(
         return False
     if not _supports_clusters():
         return False
+    if torch.cuda.get_device_capability()[0] == 9:
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        # H200 x8 (session SI vg-micro, us per boundary fused vs separate): cap 16 M 8 / 16 / 32 -0.15 / -0.16 /
+        # -0.85, M 64 +0.45, M 128 -0.87; with the row kernel (cap 1) M 16 / 32 / 64 lose (+0.4 / +1.0 / +0.3).
+        if not ((num_tokens <= 32 and okc_patch.HOPPER_NORM_MAX_CLUSTER > 1) or num_tokens >= 128):
+            return False
     try:
         cluster_size, _, _ = _launch_config(hidden_size, num_tokens)
     except RuntimeError:

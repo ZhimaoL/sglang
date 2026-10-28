@@ -228,6 +228,57 @@ def _softcap_row_argmax_kernel(
     tl.store(out_ptr + row * 2 + 1, (best_idx + col_offset).to(tl.float32))
 
 
+@triton.jit
+def _softcap_row_argmax_split_kernel(
+    logits_ptr,
+    out_ptr,
+    row_stride,
+    valid_width,
+    col_offset,
+    softcapping_value,
+    num_blocks,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # One program per (row, BLOCK_SIZE block): the per-block step of _softcap_row_argmax_kernel, unchanged.
+    row = tl.program_id(0).to(tl.int64)
+    blk = tl.program_id(1)
+    start = blk * BLOCK_SIZE
+    cols = start + tl.arange(0, BLOCK_SIZE)
+    mask = cols < valid_width
+    x = tl.load(logits_ptr + row * row_stride + cols, mask=mask, other=0.0)
+    x = x / softcapping_value
+    x = libdevice.tanh(x)
+    x = x * softcapping_value
+    x = tl.where(mask, x, -float("inf"))
+    block_val, block_idx = tl.max(
+        x, axis=0, return_indices=True, return_indices_tie_break_left=True
+    )
+    base = (row * num_blocks + blk) * 2
+    tl.store(out_ptr + base, block_val)
+    tl.store(out_ptr + base + 1, (start + block_idx + col_offset).to(tl.float32))
+
+
+def softcap_row_argmax_split(logits, final_logit_softcapping, valid_width, col_offset, num_blocks):
+    """softcap_row_argmax with the row loop spread over one program per 4096-column block: fp32 [rows, num_blocks, 2]
+    per-block (max, first argmax + col_offset). The first maximum over the blocks in order (strictly greater wins, as
+    the loop does) is softcap_row_argmax's result; the caller reduces after the TP gather. OKC verify glue."""
+    assert logits.dtype == torch.float32 and logits.stride(1) == 1
+    assert col_offset + logits.shape[1] < 2**24
+    out = torch.empty(logits.shape[0], num_blocks, 2, dtype=torch.float32, device=logits.device)
+    _softcap_row_argmax_split_kernel[(logits.shape[0], num_blocks)](
+        logits,
+        out,
+        logits.stride(0),
+        valid_width,
+        col_offset,
+        final_logit_softcapping,
+        num_blocks,
+        BLOCK_SIZE=4096,
+        num_warps=8,
+    )
+    return out
+
+
 def softcap_row_argmax(logits, final_logit_softcapping, valid_width, col_offset):
     """Per row of a vocab shard: ``(max, first argmax + col_offset)`` of the
     softcapped logits over the first ``valid_width`` columns, as fp32 ``[rows, 2]``."""

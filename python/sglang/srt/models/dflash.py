@@ -181,9 +181,32 @@ def candidate_topk(
         vals, ids = _radix_topk(logits, k)
     if tp:
         return ids.long(), vals, lse
-    global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    if okc_patch.SW_CAND_AG_MERGE and lse is None:
+        # OKC: one gather of [fp32 value bits | int32 global ids] instead of two ring all-gathers; one reorder copy
+        # puts the same values in the same [rank-major] order the two gathers produce.
+        from sglang.srt.distributed import get_tp_group
+
+        group = get_tp_group()
+        world = group.world_size
+        n_rows, kk = vals.shape
+        packed = torch.cat(
+            [
+                vals.float().contiguous().view(torch.int32),
+                (ids.to(torch.int32) + int(lm_head.shard_indices.org_vocab_start_index)),
+            ],
+            dim=-1,
+        )
+        out = torch.empty((world * n_rows, 2 * kk), dtype=torch.int32, device=packed.device)
+        group.all_gather_into_tensor(out, packed)
+        both = out.view(world, n_rows, 2, kk).permute(2, 1, 0, 3).reshape(2, n_rows, world * kk)
+        gathered_vals = both[0].view(torch.float32)   # contiguous [rows, world * k], as the separate gather's
+        gathered_ids = both[1]
+    else:
+        global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
+        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
         lse = torch.logsumexp(

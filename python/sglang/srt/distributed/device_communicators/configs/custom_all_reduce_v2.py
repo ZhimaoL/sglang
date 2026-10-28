@@ -289,10 +289,20 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         8: config(
             8,
-            graph=(128.0 * KB, 128.0 * KB, 32.00 * MB, Range(512 * KB, 128 * MB)),
+            graph=(128.0 * KB, 128.0 * KB, 32.00 * MB, Range(_okc_tp8_graph_mc_min(), 128 * MB)),
             eager=(128.0 * KB, 128.0 * KB, 128.0 * MB, Range(0, 128 * MB)),
         ),
     }
+
+
+def _okc_tp8_graph_mc_min() -> int:
+    """OKC (verify-glue): first size the TP8 graph-mode all-reduce runs as multicast 2-shot. Below it the in-place
+    2-shot pull on the registered graph buffers runs instead (no copy into / out of the workspace): H200 x8, us per
+    all-reduce heuristic vs in-place, bs 4 .. 32 verify rows (session SI vg-micro): 512 KB 9.92 / 8.28, 768 KB 10.43 /
+    9.80, 1 MB 11.94 / 11.23, 1.5 MB 15.03 / 14.42, 2 MB 16.79 / 17.07, 3 MB 21.99 / 23.31. Upstream: 512 KB."""
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    return okc_patch.AR_TP8_GRAPH_MC_MIN_BYTES
 
 
 @cache

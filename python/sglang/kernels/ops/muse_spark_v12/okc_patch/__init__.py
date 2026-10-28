@@ -73,29 +73,43 @@ SW_PDL = _flag("OKC_SW_PDL", "1")
 # GEMM + the multicast all-gather (gemm_ag) at <= GEMM_AG_MAX_TOKENS tokens.
 SW_DFLASH_FC_AG = _flag("OKC_SW_DFLASH_FC_AG", "1")
 # The same column split for the DFlash grouped convs' kernel_projection (replicated nn.Linear, 2 per draft layer, ~11 us
-# each per verify step); off until the 8-GPU check of its gather width (N = 2 * taps * groups) has run.
-SW_DFLASH_CONV_AG = _flag("OKC_SW_DFLASH_CONV_AG", "0")
+# each per verify step); 8-GPU check (session SI vg-micro): slices bit-identical, [3072, 8192] 16.5 -> 10.4 us at m 8.
+SW_DFLASH_CONV_AG = _flag("OKC_SW_DFLASH_CONV_AG", "1")
 # BF16 expert layers (0 and 61 of the NVFP4 export): local ids by one table lookup and the fused finalize kernel at
 # every token count (the wrapper's torch chain below 32 tokens is 11 launches).
 SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
+# The last layer's FFN boundary (post-FFN norm, gated residual) + the model's final norm as one bit-identical kernel
+# (okc_patch.glue.tail_boundary) instead of 9 torch launches.
+SW_TAIL_NORM = _flag("OKC_SW_TAIL_NORM", "1")
+# Target verify argmax over the vocab shard with one program per 4096-column block (softcap_row_argmax_split) instead of
+# one per row; same first-maximum result after the gather.
+SW_ARGMAX_SPLIT = _flag("OKC_SW_ARGMAX_SPLIT", "1")
+# DFlash candidate_topk: one all-gather of packed value bits + ids instead of two.
+SW_CAND_AG_MERGE = _flag("OKC_SW_CAND_AG_MERGE", "1")
 
 # Hopper cluster cap for sglang's fused norm-residual boundary (norm_residual.py): upstream runs the one-CTA-per-row
 # kernel unless capability >= 10; > 1 allows the cluster kernel (GB300 policy C = 16 / 8 / 4 / 2 at M <= 8 / 16 / 32
-# / 64) up to this size on sm_90. 1 = upstream behaviour.
-HOPPER_NORM_MAX_CLUSTER = int(os.environ.get("OKC_HOPPER_NORM_MAX_CLUSTER", "1"))
+# / 64) up to this size on sm_90 at M <= 32 (dev2 VG4, SI vg-micro: -1.0 .. -1.8 us per boundary). 1 = upstream.
+HOPPER_NORM_MAX_CLUSTER = int(os.environ.get("OKC_HOPPER_NORM_MAX_CLUSTER", "16"))
 # sglang's fused multicast all-gather + FFN norm-residual boundary (all_gather_norm_residual.py) on sm_90: the
 # unpooler's column slices are gathered inside the boundary kernel instead of a separate all_gather launch (upstream
 # gates it to capability >= 10). Cluster size follows the Hopper rule above.
-SW_AG_NORM_HOPPER = _flag("OKC_SW_AG_NORM_HOPPER", "0")
+SW_AG_NORM_HOPPER = _flag("OKC_SW_AG_NORM_HOPPER", "1")
 # FA3 backend (the DFlash draft's attention; the target's full-attention layers at bs >= 2): FP8 casts of q / k / v and
 # the paged KV write as one fused_fp8_qkv_kv_cache launch (the TRT-LLM backend's kernel) instead of three casts +
 # store_kvcache, unscaled FP8 pools only.
-SW_FA3_FUSED_KV = _flag("OKC_SW_FA3_FUSED_KV", "0")
+SW_FA3_FUSED_KV = _flag("OKC_SW_FA3_FUSED_KV", "1")
+
+# TP8 graph-mode all-reduce: multicast 2-shot (copy in / out of the workspace) only from this size; below it the
+# in-place 2-shot pull (configs/custom_all_reduce_v2.py, SI vg-micro). Upstream 524288.
+AR_TP8_GRAPH_MC_MIN_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_MC_MIN_BYTES", str(2 << 20)))
 
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS",
-           "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
-           "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV", "ANY_ATTN"]
+           "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_TAIL_NORM", "SW_ARGMAX_SPLIT",
+           "SW_CAND_AG_MERGE", "HOPPER_NORM_MAX_CLUSTER",
+           "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "ANY_ATTN"]

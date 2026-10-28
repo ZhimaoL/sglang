@@ -1024,6 +1024,25 @@ class LogitsProcessor(nn.Module):
         num_tokens, shard_width = logits.shape
         col_offset = group.rank_in_group * shard_width
         valid_width = max(0, min(shard_width, self.vocab_size - col_offset))
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        if okc_patch.SW_ARGMAX_SPLIT:
+            # OKC: one program per 4096-column block instead of one per row (8 CTAs at verify bs 1); the first
+            # maximum over (rank, block) in vocab order is the first maximum over (rank) of the per-row results.
+            from sglang.kernels.ops.activation.softcap import softcap_row_argmax_split
+
+            nb = -(-shard_width // 4096)
+            local = softcap_row_argmax_split(
+                logits, self.final_logit_softcapping, valid_width, col_offset, nb
+            )
+            gathered = torch.empty(
+                (group.world_size * num_tokens, nb, 2), dtype=local.dtype, device=local.device
+            )
+            group.all_gather_into_tensor(gathered, local)
+            g = gathered.view(group.world_size, num_tokens, nb, 2).permute(1, 0, 2, 3)
+            g = g.reshape(num_tokens, group.world_size * nb, 2)
+            best = g[..., 0].argmax(dim=1, keepdim=True)
+            return g[..., 1].gather(1, best).squeeze(1).long()
         local = softcap_row_argmax(
             logits, self.final_logit_softcapping, valid_width, col_offset
         )
