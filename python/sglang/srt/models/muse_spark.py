@@ -484,11 +484,14 @@ class MuseSpark1xAttention(nn.Module):
 
     def _okc_block_rows(self, num_tokens: int) -> int:
         """Rows per destination block when this forward's o_proj takes sp_tp_ce.matmul_rs on a sliding layer (the
-        gates of row_parallel_gbar_matmul, all shape-only so every rank agrees), else 0."""
+        gates of row_parallel_gbar_matmul, all shape-only so every rank agrees), else 0. Eager forwards only: under a
+        (breakable) CUDA-graph capture the attention is an eager break and the blocks' fmha launches would be captured
+        into the next segment with this forward's buffers."""
         from sglang.srt.layers import layernorm_sp
 
         tp = self.o_proj.tp_group.world_size if self.o_proj.tp_group is not None else 1
         if (self.attn.sliding_window_size <= 0 or tp <= 1 or num_tokens % tp or not get_forward().sp_active
+                or torch.cuda.is_current_stream_capturing()
                 or num_tokens // tp < okc_patch.RS_ATTN_BLOCKS_MIN_ROWS
                 or tp != get_parallel().tp_group.world_size
                 or getattr(self.o_proj, "_sp_use_cutlass", False) or not layernorm_sp.okc_hopper_sp()
