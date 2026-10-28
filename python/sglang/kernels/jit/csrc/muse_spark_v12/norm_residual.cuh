@@ -411,7 +411,8 @@ template <
     bool kPostNormIsInputScale,
     bool kHasRouter,
     bool kPostWeight,
-    bool kGate>
+    bool kGate,
+    bool kPrefetchStream>
 __global__ void __launch_bounds__(kNumThreads)
     muse_spark_norm_residual_cluster(const __grid_constant__ NormResidualParams params) {
   using namespace device;
@@ -458,6 +459,38 @@ __global__ void __launch_bounds__(kNumThreads)
   fp32x2_t beta_values[kPacks][kPairs];
   BF16Vec pre_w_pf[kPreSlots];
 
+  // OKC (verify-glue, OKC_NORM_PREFETCH): the caller guarantees the predecessor kernel neither writes the stream nor
+  // triggers before its own griddepcontrol.wait (the o-proj all-reduce), so everything but the branch is complete when
+  // this grid launches: the stream (through L2) and the constant weights / gates load before the wait.
+  constexpr int kPf = kPrefetchStream ? kPacks : 1;
+  BF16Vec post_pf[kPrefetchStream && kPostWeight ? kPacks : 1];
+  F32Vec stream_pf[kPf][kFParts];
+  F32Vec alpha_pf[kPrefetchStream && kGate ? kPacks : 1][kFParts];
+  F32Vec beta_pf[kPrefetchStream && kGate ? kPacks : 1][kFParts];
+  if constexpr (kPrefetchStream) {
+#pragma unroll
+    for (int pack = 0; pack < kPacks; ++pack) {
+      const int index = cluster_rank * kNumThreads + threadIdx.x + pack * kTotalThreads;
+      if constexpr (kPostWeight) post_pf[pack].load(post_weight, index);
+      if constexpr (kPrefetchWeights) {
+        if (has_pre_weight) pre_w_pf[pack].load(pre_weight, index);
+      }
+#pragma unroll
+      for (int part = 0; part < kFParts; ++part) {
+        const int float_index = index * kFParts + part;
+        static_assert(sizeof(F32Vec) == sizeof(float4));
+        *reinterpret_cast<float4*>(stream_pf[pack][part].data()) =
+            __ldcg(reinterpret_cast<const float4*>(stream) + float_index);
+        if constexpr (kGate) {
+          if (channel_wise) {
+            alpha_pf[pack][part].load(alpha_ptr, float_index);
+            beta_pf[pack][part].load(beta_ptr, float_index);
+          }
+        }
+      }
+    }
+  }
+
   PDLWaitPrimary<kUsePDL>();
 
   float branch_sum = 0.0f;
@@ -481,18 +514,30 @@ __global__ void __launch_bounds__(kNumThreads)
     F32Vec alpha_values[kFParts];
     F32Vec beta_vector[kFParts];
     branch_values.load(branch, index);
-    if constexpr (kPostWeight) post_weights.load(post_weight, index);
-    if constexpr (kPrefetchWeights) {
-      if (has_pre_weight) pre_w_pf[pack].load(pre_weight, index);
-    }
+    if constexpr (kPrefetchStream) {
+      if constexpr (kPostWeight) post_weights = post_pf[pack];
 #pragma unroll
-    for (int part = 0; part < kFParts; ++part) {
-      const int float_index = index * kFParts + part;
-      stream_values[part].load(stream, float_index);
-      if constexpr (kGate) {
-        if (channel_wise) {
-          alpha_values[part].load(alpha_ptr, float_index);
-          beta_vector[part].load(beta_ptr, float_index);
+      for (int part = 0; part < kFParts; ++part) {
+        stream_values[part] = stream_pf[pack][part];
+        if constexpr (kGate) {
+          alpha_values[part] = alpha_pf[pack][part];
+          beta_vector[part] = beta_pf[pack][part];
+        }
+      }
+    } else {
+      if constexpr (kPostWeight) post_weights.load(post_weight, index);
+      if constexpr (kPrefetchWeights) {
+        if (has_pre_weight) pre_w_pf[pack].load(pre_weight, index);
+      }
+#pragma unroll
+      for (int part = 0; part < kFParts; ++part) {
+        const int float_index = index * kFParts + part;
+        stream_values[part].load(stream, float_index);
+        if constexpr (kGate) {
+          if (channel_wise) {
+            alpha_values[part].load(alpha_ptr, float_index);
+            beta_vector[part].load(beta_ptr, float_index);
+          }
         }
       }
     }
@@ -615,6 +660,7 @@ template <
     bool kUsePDL,
     bool kPrefetchWeights,
     int kClusterSize,
+    bool kPrefetchStream,
     bool kPostNormIsInputScale,
     bool kHasRouter>
 struct MuseSparkNormResidual {
@@ -716,7 +762,8 @@ struct MuseSparkNormResidual {
             kPostNormIsInputScale,
             kHasRouter,
             kHasPostWeight,
-            kHasGate>;
+            kHasGate,
+            kPrefetchStream>;
         [[maybe_unused]] static const bool cluster_configured = [kernel] {
           if constexpr (kClusterSize > 8) {
             RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));

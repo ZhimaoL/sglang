@@ -454,6 +454,8 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
 
         self._ensure_cached_weights(branch_dtype)
 
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
         return _jit_fused_norm_residual(
             branch,
             stream,
@@ -466,6 +468,8 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             beta=self._cc_beta if self._use_residual_gate else None,
             want_router=router_dtype is not None,
             pre_norm_bf16=pre_norm_dtype is torch.bfloat16,
+            # OKC: set by the model on the post-attention boundary only (predecessor = the o-proj all-reduce)
+            prefetch_stream=okc_patch.NORM_PREFETCH and getattr(self, "_okc_prefetch_stream", False),
         )
 
     def jit_selected(self) -> bool:
