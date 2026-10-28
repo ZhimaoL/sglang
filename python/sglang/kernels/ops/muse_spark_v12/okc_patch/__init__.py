@@ -120,6 +120,9 @@ SW_DFLASH_FC_AG = _flag("OKC_SW_DFLASH_FC_AG", "1")
 # BF16 expert layers (0 and 61 of the NVFP4 export): local ids by one table lookup and the fused finalize kernel at
 # every token count (the wrapper's torch chain below 32 tokens is 11 launches).
 SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
+# Their Triton fused_moe configs (okc_patch/moe_configs, E=32 N=4096 H200), retuned at EP routing (one local route per
+# token): T 8 -7.5 %, 16 -11 %, 4096..16384 -12..-24 % per layer, bit-identical outputs (smallt-moe LOG E19).
+SW_BF16_MOE_CFG = _flag("OKC_SW_BF16_MOE_CFG", "1")
 
 # Hopper cluster cap for sglang's fused norm-residual boundary (norm_residual.py): upstream runs the one-CTA-per-row
 # kernel unless capability >= 10; > 1 allows the cluster kernel (GB300 policy C = 16 / 8 / 4 / 2 at M <= 8 / 16 / 32
@@ -134,5 +137,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_MOE_OVL",
-           "SP_PRENORM_SHARD", "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
+           "SP_PRENORM_SHARD", "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG", "HOPPER_NORM_MAX_CLUSTER",
            "ANY_ATTN"]
