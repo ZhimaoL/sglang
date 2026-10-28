@@ -24,7 +24,10 @@ namespace muse_all_gather {
 
 using device::distributed::Counter;
 
-constexpr uint32_t kBlock = 128;
+// OKC: 512 (was 128): each thread polls one or a few vectors instead of ~8 in series (H200 x8 S9 vg-micro, us per
+// gather 128 -> 512 at N 8192: m 8 2.57 -> 2.60, m 32 3.97 -> 3.73, m 64 6.13 -> 5.24, m 128 10.18 -> 8.43,
+// m 256 16.58 -> 14.14; bit-identical; 1024 costs +0.28 at m 8)
+constexpr uint32_t kBlock = 512;
 constexpr uint32_t kVec = 16 / sizeof(bf16_t);  // 8 bf16 (16B) per thread
 
 template <uint32_t kWorld>
