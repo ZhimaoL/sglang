@@ -790,8 +790,10 @@ def _fs_combine(
 # ---------------------------------------------------------------------------
 # attn-v3 fused sliding kernels (court #3 certified; judge check 16/16 pass,
 # sliding decode 1.73-1.92x on the judge). Ticket counters are persistent and
-# NEVER reset: every call adds exactly S tickets per owner, so the in-kernel
-# `ticket % S == S - 1` last-arriver test stays exact across eager calls, graph
+# start at zero; every call takes exactly S tickets per owner, and the last
+# arriver (ticket S - 1) re-arms its counter to zero in-kernel, so the count
+# never accumulates across calls (an int32 that kept counting would wrap after
+# ~2^31 / S calls and stop firing the combine). Exact across eager calls, graph
 # warmups and graph replays (capture itself executes nothing).
 # ---------------------------------------------------------------------------
 
@@ -925,7 +927,9 @@ def _sl_decode_f(
                  mask=row_ok[:, None], cache_modifier=".cg")
 
     ticket = tl.atomic_add(counter_ptr + b, 1, sem="acq_rel", scope="gpu")
-    if ticket % S == S - 1:
+    if ticket == S - 1:
+        # every program of this call has its ticket: re-arm for the next call
+        tl.atomic_xchg(counter_ptr + b, 0, sem="relaxed", scope="gpu")
         base = b * S * HQ
         m_run = tl.full([BLOCK_M], -1e30, tl.float32)
         den = tl.zeros([BLOCK_M], tl.float32)
@@ -1049,7 +1053,9 @@ def _sl_verify_f2(
                  mask=row_ok[:, None], cache_modifier=".cg")
 
     ticket = tl.atomic_add(counter_ptr + b * HKV + h, 1, sem="acq_rel", scope="gpu")
-    if ticket % S == S - 1:
+    if ticket == S - 1:
+        # every program of this call has its ticket: re-arm for the next call
+        tl.atomic_xchg(counter_ptr + b * HKV + h, 0, sem="relaxed", scope="gpu")
         base = (b * HKV + h) * S * LG
         m_run = tl.full([BLOCK_M], -1e30, tl.float32)
         den = tl.zeros([BLOCK_M], tl.float32)

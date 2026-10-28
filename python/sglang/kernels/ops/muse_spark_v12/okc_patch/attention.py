@@ -229,10 +229,11 @@ _CNT = {}
 
 def _counter(kind, n, S, device):
     """Persistent int32 ticket counters (attn-v3): allocated zero once per (kind,
-    owners, S) and NEVER reset -- every sliding call adds exactly S tickets per owner,
-    so the kernels' `ticket % S == S - 1` last-arriver test stays exact across eager
-    calls and graph replays (capture executes nothing). Keyed per (n, S), so each
-    captured decode graph replays against its own counter buffer."""
+    owners, S). Every sliding call takes exactly S tickets per owner and the last
+    arriver (ticket S - 1) resets its counter to zero in-kernel, so the count is back
+    at zero after every call, eager or graph replay (capture executes nothing), and
+    never wraps. Keyed per (n, S), so each captured decode graph replays against its
+    own counter buffer."""
     key = (kind, n, S, str(device))
     c = _CNT.get(key)
     if c is None:
