@@ -115,9 +115,6 @@ SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
 # OKC_SP_CE_AG_GROUP all-gather steps (okc_patch/sp_tp_ce.py) instead of torch's fused ops (16 / 3 barriers per op):
 # session SI bench -0.12 ms per 16K layer-chunk (~-30 ms per first turn); the AG side only on 16K chunks.
 SP_CE_TP = _flag("OKC_SP_CE_TP", "1")
-# SP prefill MoE block with its collectives on the copy engines (okc_patch/sp_moe_ovl.py): pooled AG and RS move by
-# symm-mem P2P pushes under the row-sliced pooler / finalize / unpooler (pg whole) instead of exposed NCCL collectives.
-SW_MOE_OVL = _flag("OKC_SW_MOE_OVL", "0")
 # NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
 SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
 # pg calls of >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS tokens align their routes with the prefill bank's local-slot align
@@ -242,7 +239,6 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
-           "SW_MOE_OVL",
            "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
            "SW_TAIL_NORM", "SW_AR_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
