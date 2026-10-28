@@ -110,9 +110,42 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
     if _CTA_ITEMS:
         grid = min(4096, max(1, -(-(num_pid_m * (2 * 4096 // 128)) // _CTA_ITEMS)))
     xg_t = torch.empty((num_pid_m * 64 * 256 * 64,), dtype=torch.bfloat16, device=x.device)
-    ext.gather(x, xg_t, sorted_ids, live, numel)
+    ext.gather(x, xg_t, sorted_ids, live, numel, 0)
     inter_t = torch.empty((num_pid_m * 64 * 256 * 64,), dtype=torch.bfloat16, device=x.device)
-    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, grid)
+    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, grid, 0)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
-    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid)
+    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid, 0)
     return y
+
+
+# Routes per call up to which grouped_pg_small runs (one CTA routes them all; verify bs 32 = 256 tokens = 2048).
+SMALL_MAX_ROUTES = 2048
+
+
+def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, gs13, wsf2, pdl):
+    """Verify / decode front end of grouped_pg: x [T, 4096] bf16 BEFORE the pre-expert RMSNorm, topk_ids
+    [T, 8] int32 global ids, expert_map [E] int32 global -> local (-1 remote) or None. One pg_route launch
+    replaces the int32 cast, the expert-map gather, moe_align_block_size and pg_tiles (blocks only for local
+    experts: 32 + ceil(T * 8 / 256) at most, instead of moe_align's ~257 for 256 global experts), and
+    pg_gather_norm applies the norm (F.rms_norm's exact fp32 sequence) while it builds the token images.
+    -> (y [T*8, 4096] bf16 as grouped_pg, local_ids [T, 8] int32: the finalize's slot expert ids)."""
+    num_tokens = x.shape[0]
+    numel = num_tokens * 8
+    nb = 32 + (numel + _BLOCK_M - 1) // _BLOCK_M
+    dev = x.device
+    ext = pg_ext()
+    p = 1 if pdl else 0
+    local_ids = torch.empty((num_tokens, 8), dtype=torch.int32, device=dev)
+    sorted_ids = torch.empty((nb * _BLOCK_M,), dtype=torch.int32, device=dev)
+    block_experts = torch.empty((nb,), dtype=torch.int32, device=dev)
+    live = torch.empty((nb + 1,), dtype=torch.int32, device=dev)
+    emap = expert_map if expert_map is not None else topk_ids.new_empty((0,))
+    n_global = expert_map.shape[0] if expert_map is not None else 32
+    ext.route(topk_ids, emap, local_ids, sorted_ids, block_experts, live, numel, n_global, p)
+    xg_t = torch.empty((nb * 64 * 256 * 64,), dtype=torch.bfloat16, device=dev)
+    ext.gather_norm(x, norm_weight, norm_eps, xg_t, sorted_ids, live, numel, p)
+    inter_t = torch.empty((nb * 64 * 256 * 64,), dtype=torch.bfloat16, device=dev)
+    ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, 0, p)
+    y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=dev)
+    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0, p)
+    return y, local_ids

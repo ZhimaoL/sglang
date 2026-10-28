@@ -40,6 +40,12 @@ namespace pgk {
 
 DINL unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 
+// Programmatic dependent launch (no-ops unless the launch carries the programmatic-serialization attribute):
+// every kernel waits before its first read of a predecessor's output and before its first global write, and
+// lets its dependent launch right after (the dependent waits too, so an early trigger only overlaps prologues).
+DINL void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+DINL void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+
 DINL void mbar_init(unsigned bar, unsigned count) {
     asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(bar), "r"(count));
 }
@@ -139,6 +145,8 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
     __shared__ int wsum[32];
     __shared__ int total_s;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    pdl_wait();
+    pdl_trigger();
     const int npm = min(num_pid_m, *n_padded / bm);
     if (tid == 0) total_s = 0;
     __syncthreads();
@@ -166,6 +174,110 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
         }
     }
     if (tid == 0) live[0] = total_s;
+}
+
+// ------------------------------------------------------------------ small-T routing front end
+// One CTA in place of topk_ids -> local ids (expert map), moe_align_block_size and pg_tiles, for numel <= RT_MAX
+// routes (verify / decode): local expert e gets ceil(count_e / 256) consecutive blocks, experts ascending, and no
+// block exists for non-local routes; a block's 256 sorted_ids slots hold its routes in route order, then the numel
+// sentinel. block_experts / live are what pg_tiles writes for the same counts (live: widest class first, block
+// ascending inside a class), so gather / gg1 / gg2 run unchanged; every route's row is computed by the same code
+// as on the moe_align path, only the block numbering differs. local_ids[r] = e or -1 (the finalize's slot ids).
+// No serial loops: a route's rank among same-expert routes of its warp comes from __match_any_sync, the per-expert
+// bases over the 64 warp groups from one warp-wide scan per expert, the block / live lists from one warp's ballots.
+constexpr int RT_MAX = 2048, RT_E = 32, RT_NB = RT_E + RT_MAX / 256;
+__global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_ids, const int* __restrict__ emap,
+                                                 int n_global, int numel, int wmask, int* __restrict__ local_ids,
+                                                 int* __restrict__ sorted_ids, int* __restrict__ block_experts,
+                                                 int* __restrict__ live) {
+    __shared__ int wc[RT_MAX / 32][RT_E];   // per (32-route group g = k * 32 + warp, expert): count -> base
+    __shared__ int cnt[RT_E], bstart[RT_E], bexp[RT_NB], nblk;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const unsigned lt = (1u << lane) - 1u;
+    wc[w][lane] = 0;                         // rows w and 32 + w are written by this warp only
+    wc[32 + w][lane] = 0;
+    __syncwarp();
+    pdl_wait();
+    pdl_trigger();
+    int er[2], rk[2];
+#pragma unroll
+    for (int k = 0; k < 2; k++) {
+        const int r = k * 1024 + tid;
+        int e = -1;
+        if (r < numel) {
+            const int g = topk_ids[r];
+            if ((unsigned)g < (unsigned)n_global) e = emap ? emap[g] : g;
+            if ((unsigned)e >= (unsigned)RT_E) e = -1;
+            local_ids[r] = e;
+        }
+        const unsigned peers = __match_any_sync(0xFFFFFFFFu, e);
+        er[k] = e;
+        rk[k] = __popc(peers & lt);
+        if (e >= 0 && rk[k] == 0) wc[k * 32 + w][e] = __popc(peers);
+    }
+    __syncthreads();
+    {   // warp x = expert x: exclusive scan of its 64 group counts (lane l: groups 2l, 2l + 1)
+        const int x = w;
+        const int c0 = wc[2 * lane][x], c1 = wc[2 * lane + 1][x];
+        int inc = c0 + c1;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xFFFFFFFFu, inc, o);
+            if (lane >= o) inc += v;
+        }
+        const int ex = inc - c0 - c1;
+        wc[2 * lane][x] = ex;
+        wc[2 * lane + 1][x] = ex + c0;
+        if (lane == 31) cnt[x] = inc;
+    }
+    __syncthreads();
+    if (w == 0) {   // lane x = expert x: blocks, block list, live list
+        const int c = cnt[lane];
+        const int nbx = (c + 255) >> 8;
+        int bs = nbx;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xFFFFFFFFu, bs, o);
+            if (lane >= o) bs += v;
+        }
+        const int b0 = bs - nbx;
+        const int nb = __shfl_sync(0xFFFFFFFFu, bs, 31);
+        bstart[lane] = b0;
+        for (int j = 0; j < nbx; j++) { bexp[b0 + j] = lane; block_experts[b0 + j] = lane; }
+        // the expert's last block holds v = c - 256 (nbx - 1) routes, the others 256 (class 3)
+        const int vl = nbx > 0 ? c - ((nbx - 1) << 8) : 0;
+        int code = 3;
+        if ((wmask & 4) && vl <= 192) code = 2;
+        if ((wmask & 2) && vl <= 128) code = 1;
+        if ((wmask & 1) && vl <= 64) code = 0;
+        int base = 0;
+        for (int cls = 3; cls >= 0; cls--) {
+            // blocks of class cls this expert contributes: its full blocks (cls 3) and / or its last block
+            const int k_c = nbx == 0 ? 0 : (cls == 3 ? nbx - 1 : 0) + (code == cls ? 1 : 0);
+            int inc = k_c;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xFFFFFFFFu, inc, o);
+                if (lane >= o) inc += v;
+            }
+            int pos = base + inc - k_c;
+            if (cls == 3) for (int j = 0; j < nbx - 1; j++) live[1 + pos++] = (b0 + j) | (3 << 20);
+            if (nbx > 0 && code == cls) live[1 + pos] = (b0 + nbx - 1) | (code << 20);
+            base += __shfl_sync(0xFFFFFFFFu, inc, 31);
+        }
+        if (lane == 0) { live[0] = nb; nblk = nb; }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 2; k++) {
+        const int e = er[k];
+        if (e >= 0) sorted_ids[(bstart[e] << 8) + wc[k * 32 + w][e] + rk[k]] = k * 1024 + tid;
+    }
+    const int nb = nblk;
+    for (int i = tid; i < nb * 256; i += 1024) {          // sentinel slots (disjoint from the route slots)
+        const int x = bexp[i >> 8];
+        if (i - (bstart[x] << 8) >= cnt[x]) sorted_ids[i] = numel;
+    }
 }
 
 // effective wgmma width of a block: the smallest COMPILED width (WSET bit0 64, bit1 128, bit2 192; 256 always)
@@ -377,6 +489,8 @@ template <int WSET, int KTB>
 __global__ void __launch_bounds__(256) pg_gather(const __nv_bfloat16* __restrict__ x, char* __restrict__ xg,
                                                  const int* __restrict__ sorted_ids, const int* __restrict__ live,
                                                  int numel) {
+    pdl_wait();
+    pdl_trigger();
     const int li = blockIdx.y;
     if (li >= live[0]) return;
     const int ent = live[1 + li];
@@ -394,6 +508,91 @@ __global__ void __launch_bounds__(256) pg_gather(const __nv_bfloat16* __restrict
         for (int k = 0; k < KTB; k++) v[k] = ok ? src[k * 8] : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
         for (int k = 0; k < KTB; k++) *reinterpret_cast<uint4*>(dst + (size_t)k * XB) = v[k];   // bf16 images
+    }
+}
+
+// pg_gather with the pre-expert RMSNorm applied on the way (small-T path, where it replaces the F.rms_norm launch).
+// torch's vectorized rms_norm (block 32 x 4) sums x^2 per lane l of 128 over bf16x4 vectors l + 128 j (j = 0..7, by
+// fma), reduces each warp with shfl_down 16, 8, 4, 2, 1 and the warps as (0 + 2) + (1 + 3), divides by 4096 and takes
+// rsqrtf(. + eps); out = bf16(gamma * (rstd * x)). Here one warp per token holds 4 of those virtual lanes per lane
+// (lane p: virtual warp p >> 3, virtual lanes (p & 7) + 8 q, q = 0..3), so the 16 and 8 steps are in-register adds,
+// the 4 / 2 / 1 steps shuffles inside each 8-lane group and the warp combine 4 shuffles: the same fp32 operations in
+// the same order, so the images hold exactly the bf16 values F.rms_norm returns. The CTA's 512 columns are vector
+// j = blockIdx.x of every virtual lane, so each lane stores its own 4 x 4 columns of the token's image row.
+template <int WSET>
+__global__ void __launch_bounds__(256) pg_gather_norm(const __nv_bfloat16* __restrict__ x,
+                                                      const __nv_bfloat16* __restrict__ gamma, float eps,
+                                                      char* __restrict__ xg, const int* __restrict__ sorted_ids,
+                                                      const int* __restrict__ live, int numel) {
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int vy = lane >> 3, vi = lane & 7;
+    const int kb = blockIdx.x;
+    uint2 g[4];
+#pragma unroll
+    for (int q = 0; q < 4; q++) g[q] = reinterpret_cast<const uint2*>(gamma)[128 * kb + 32 * vy + vi + 8 * q];
+    pdl_wait();
+    pdl_trigger();
+    const int li = blockIdx.y;
+    const int nlive = live[0];
+    const int ent = live[1 + li];            // in bounds for every li < grid (live has grid + 1 entries)
+    if (li >= nlive) return;
+    const int pm = ent & 0xFFFFF;
+    const int nv = eff_nv<WSET>(ent >> 20);
+    const int* sid = sorted_ids + pm * XNT;
+    char* img = xg + (size_t)pm * NKT * XB;
+    for (int t = w; t < nv; t += 8) {
+        const int rid = sid[t];
+        uint2 o[4] = {make_uint2(0u, 0u), make_uint2(0u, 0u), make_uint2(0u, 0u), make_uint2(0u, 0u)};
+        if (rid < numel) {
+            const uint2* row = reinterpret_cast<const uint2*>(x + (size_t)(rid >> 3) * (NKT * 64));
+            uint2 v[4][8], vk[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) v[q][j] = row[128 * j + 32 * vy + vi + 8 * q];
+#pragma unroll
+            for (int q = 0; q < 4; q++) {           // vector j = kb (a runtime index: select, no local memory)
+                vk[q] = v[q][0];
+#pragma unroll
+                for (int j = 1; j < 8; j++) if (kb == j) vk[q] = v[q][j];
+            }
+            float sq[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                float a = 0.f;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float2 lo = __bfloat1622float2(u32b2(v[q][j].x));
+                    const float2 hi = __bfloat1622float2(u32b2(v[q][j].y));
+                    a = __fmaf_rn(lo.x, lo.x, a);
+                    a = __fmaf_rn(lo.y, lo.y, a);
+                    a = __fmaf_rn(hi.x, hi.x, a);
+                    a = __fmaf_rn(hi.y, hi.y, a);
+                }
+                sq[q] = a;
+            }
+            float c = __fadd_rn(__fadd_rn(sq[0], sq[2]), __fadd_rn(sq[1], sq[3]));   // steps 16, 8
+            c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 4));
+            c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 2));
+            c = __fadd_rn(c, __shfl_down_sync(0xFFFFFFFFu, c, 1));
+            const float w0 = __shfl_sync(0xFFFFFFFFu, c, 0), w1 = __shfl_sync(0xFFFFFFFFu, c, 8);
+            const float w2 = __shfl_sync(0xFFFFFFFFu, c, 16), w3 = __shfl_sync(0xFFFFFFFFu, c, 24);
+            const float m2 = __fdiv_rn(__fadd_rn(__fadd_rn(w0, w2), __fadd_rn(w1, w3)), 4096.f);
+            const float rs = rsqrtf(__fadd_rn(m2, eps));
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const float2 xl = __bfloat1622float2(u32b2(vk[q].x)), xh = __bfloat1622float2(u32b2(vk[q].y));
+                const float2 gl = __bfloat1622float2(u32b2(g[q].x)), gh = __bfloat1622float2(u32b2(g[q].y));
+                o[q].x = b2u32(__floats2bfloat162_rn(__fmul_rn(gl.x, __fmul_rn(rs, xl.x)), __fmul_rn(gl.y, __fmul_rn(rs, xl.y))));
+                o[q].y = b2u32(__floats2bfloat162_rn(__fmul_rn(gh.x, __fmul_rn(rs, xh.x)), __fmul_rn(gh.y, __fmul_rn(rs, xh.y))));
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int vl = 32 * vy + vi + 8 * q;            // this CTA's columns 4 vl .. 4 vl + 3
+            const int kt = kb * 8 + (vl >> 4), ch = (vl & 15) >> 1;
+            *reinterpret_cast<uint2*>(img + (size_t)kt * XB + t * 128 + ((ch ^ (t & 7)) << 4) + ((vl & 1) << 3)) = o[q];
+        }
     }
 }
 
@@ -437,6 +636,8 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
         mbar_init(mb + tid * 8, 1);                     // full: producer expect_tx arrival + tx bytes
         mbar_init(mb + NST * 8 + tid * 8, 256);         // empty: every consumer thread arrives
     }
+    pdl_wait();                                         // xg / live / block_experts come from the predecessors
+    pdl_trigger();
     if (SPL && tid == 0) meta[8] = n_wide_entries(live);   // SPL: the 64-wide blocks are pg_n4's
     __syncthreads();                                    // the last CTA-wide barrier
     const int n_items = (SPL ? meta[8] : live[0]) * NWT;
@@ -573,6 +774,23 @@ static int pg_num_sms() {
     return n;
 }
 
+// pdl = 1: launch with programmatic stream serialization (the kernel may start while its predecessor drains; every
+// pg kernel waits on griddepcontrol before touching predecessor data). Captured graphs keep the programmatic edge.
+template <typename... KArgs, typename... Args>
+static void pg_launch(void (*k)(KArgs...), dim3 grid, dim3 block, size_t smem, bool pdl, Args... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k, static_cast<KArgs>(args)...));
+}
+
 void tiles(torch::Tensor block_experts, torch::Tensor n_padded, torch::Tensor sorted_ids, torch::Tensor live,
            int64_t num_pid_m, int64_t bm, int64_t numel, int64_t wmask) {
     pgk::pg_tiles<<<1, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -580,18 +798,46 @@ void tiles(torch::Tensor block_experts, torch::Tensor n_padded, torch::Tensor so
         (int)num_pid_m, (int)bm, (int)wmask, live.data_ptr<int>());
 }
 
-void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::Tensor live, int64_t numel) {
+void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::Tensor live, int64_t numel,
+            int64_t pdl) {
     TORCH_CHECK(x.size(1) == pgk::NKT * 64 && numel == x.size(0) * 8, "pg gather: K 4096, topk 8");
     const int npm = live.size(0) - 1;
-    pgk::pg_gather<3, 8><<<dim3(pgk::NKT / 8, npm), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<char*>(xg.data_ptr()),
-        sorted_ids.data_ptr<int>(), live.data_ptr<int>(), (int)numel);
+    pg_launch(pgk::pg_gather<3, 8>, dim3(pgk::NKT / 8, npm), dim3(256), 0, pdl != 0,
+              reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<char*>(xg.data_ptr()),
+              sorted_ids.data_ptr<int>(), live.data_ptr<int>(), (int)numel);
+}
+
+// small-T front end: topk_ids [T, 8] int32 (global ids), emap [n_global] int32 global -> local (-1 = remote) or
+// an empty tensor (ids already local); outputs local_ids [T * 8], sorted_ids [nb_max * 256], block_experts
+// [nb_max], live [nb_max + 1] with nb_max = 32 + ceil(numel / 256).
+void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor local_ids, torch::Tensor sorted_ids,
+           torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global, int64_t pdl) {
+    TORCH_CHECK(numel <= pgk::RT_MAX && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous(),
+                "pg route: int32 ids, at most 2048 routes");
+    TORCH_CHECK(sorted_ids.numel() >= (pgk::RT_E + (numel + 255) / 256) * 256 &&
+                live.numel() >= pgk::RT_E + (numel + 255) / 256 + 1, "pg route: output sizes");
+    const int* em = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
+    pg_launch(pgk::pg_route, dim3(1), dim3(1024), 0, pdl != 0, topk_ids.data_ptr<int>(), em, (int)n_global,
+              (int)numel, 3, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(), block_experts.data_ptr<int>(),
+              live.data_ptr<int>());
+}
+
+void gather_norm(torch::Tensor x, torch::Tensor gamma, double eps, torch::Tensor xg, torch::Tensor sorted_ids,
+                 torch::Tensor live, int64_t numel, int64_t pdl) {
+    TORCH_CHECK(x.size(1) == pgk::NKT * 64 && numel == x.size(0) * 8 && x.is_contiguous(), "pg gather: K 4096, topk 8");
+    TORCH_CHECK(gamma.numel() == pgk::NKT * 64 && gamma.scalar_type() == at::kBFloat16 && gamma.is_contiguous(),
+                "pg gather_norm: bf16 [4096] weight");
+    const int npm = live.size(0) - 1;
+    pg_launch(pgk::pg_gather_norm<3>, dim3(pgk::NKT / 8, npm), dim3(256), 0, pdl != 0,
+              reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+              reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr()), (float)eps,
+              reinterpret_cast<char*>(xg.data_ptr()), sorted_ids.data_ptr<int>(), live.data_ptr<int>(), (int)numel);
 }
 
 template <int GATED, int NST, int MODE, int WSET, int PAIR64 = 1, int SPL = 0>
 static void launch(const torch::Tensor& xg, const torch::Tensor& wsf, const float* gs, void* out,
                    const int* sorted_ids, const torch::Tensor& block_experts, const torch::Tensor& live,
-                   int numel, int grid, int snake) {
+                   int numel, int grid, int snake, bool pdl) {
     auto fn = pgk::pg_gemm<GATED, NST, MODE, WSET, PAIR64, SPL>;
     constexpr int smem = pgk::smem_bytes<GATED, MODE>(NST);
     static bool set = false;
@@ -601,9 +847,9 @@ static void launch(const torch::Tensor& xg, const torch::Tensor& wsf, const floa
     }
     const int NWT = wsf.size(1);
     TORCH_CHECK(wsf.size(2) == pgk::NKT && wsf.size(3) == pgk::WSB, "pg: wsf layout");
-    fn<<<grid > 0 ? grid : pg_num_sms(), 384, smem, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const char*>(xg.data_ptr()), reinterpret_cast<const char*>(wsf.data_ptr()),
-        gs, out, sorted_ids, block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, numel, snake);
+    pg_launch(fn, dim3(grid > 0 ? grid : pg_num_sms()), dim3(384), smem, pdl,
+              reinterpret_cast<const char*>(xg.data_ptr()), reinterpret_cast<const char*>(wsf.data_ptr()),
+              gs, out, sorted_ids, block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, numel, snake);
 }
 
 // snake item order for small calls (few items per CTA): tokens = numel / 8 <= pgk_snake_max_t
@@ -612,19 +858,19 @@ void set_snake_max_t(int64_t t) { pgk_snake_max_t = (int)t; }
 
 // cfg 350 = the bank's shipped configuration (widths 64 / 128 / 256, 5 stages), the only one built here.
 void gg1(torch::Tensor xg, torch::Tensor wsf, torch::Tensor gs, torch::Tensor inter,
-         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid) {
+         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl) {
     TORCH_CHECK(cfg == 350, "pg: only cfg 350 is built");
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
     launch<1, 5, 0, 3>(xg, wsf, gs.data_ptr<float>(), inter.data_ptr(), nullptr, block_experts, live, 0, grid,
-                       snake);
+                       snake, pdl != 0);
 }
 
 void gg2(torch::Tensor xg, torch::Tensor wsf, torch::Tensor y, torch::Tensor sorted_ids,
-         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid) {
+         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl) {
     TORCH_CHECK(cfg == 350, "pg: only cfg 350 is built");
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
     launch<0, 5, 0, 3>(xg, wsf, nullptr, y.data_ptr(), sorted_ids.data_ptr<int>(), block_experts, live,
-                       (int)numel, grid, snake);
+                       (int)numel, grid, snake, pdl != 0);
 }
 """
 

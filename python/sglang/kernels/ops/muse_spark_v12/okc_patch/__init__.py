@@ -83,6 +83,25 @@ PFMHA_RAGGED_MAX_BS = int(os.environ.get("OKC_PFMHA_RAGGED_MAX_BS", "32"))
 # build of the same kernels, compiled separately when on.
 PFMHA_EXACT = _flag("OKC_PREFILL_FMHA_EXACT", "0")
 
+# Verify-step glue (serving/kernels/verify-glue): at <= 2048 routes a pg-only layer runs one routing launch (pg_route:
+# local ids + block list, in place of the int32 cast / expert-map gather / moe_align / pg_tiles) and folds the
+# pre-expert RMSNorm into the token gather (bit-identical to F.rms_norm).
+SW_PG_SMALL = _flag("OKC_SW_PG_SMALL", "1")
+# Programmatic dependent launch on the OKC kernels inside verify / decode graphs (the next kernel's launch and
+# prologue overlap the previous one's tail; every kernel waits on griddepcontrol before reading its inputs).
+SW_PDL = _flag("OKC_SW_PDL", "1")
+# DFlash context projection fc (5 x 8192 -> 8192, replicated 640 MiB bf16, 159 us per verify step) as a column-split
+# GEMM + the multicast all-gather (gemm_ag) at <= GEMM_AG_MAX_TOKENS tokens.
+SW_DFLASH_FC_AG = _flag("OKC_SW_DFLASH_FC_AG", "1")
+# BF16 expert layers (0 and 61 of the NVFP4 export): local ids by one table lookup and the fused finalize kernel at
+# every token count (the wrapper's torch chain below 32 tokens is 11 launches).
+SW_BF16_MOE_GLUE = _flag("OKC_SW_BF16_MOE_GLUE", "1")
+
+# Hopper cluster cap for sglang's fused norm-residual boundary (norm_residual.py): upstream runs the one-CTA-per-row
+# kernel unless capability >= 10; > 1 allows the cluster kernel (GB300 policy C = 16 / 8 / 4 / 2 at M <= 8 / 16 / 32
+# / 64) up to this size on sm_90. 1 = upstream behaviour.
+HOPPER_NORM_MAX_CLUSTER = int(os.environ.get("OKC_HOPPER_NORM_MAX_CLUSTER", "1"))
+
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
@@ -90,4 +109,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_MOE_OVL",
-           "SP_PRENORM_SHARD", "ANY_ATTN"]
+           "SP_PRENORM_SHARD", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_BF16_MOE_GLUE", "HOPPER_NORM_MAX_CLUSTER",
+           "ANY_ATTN"]

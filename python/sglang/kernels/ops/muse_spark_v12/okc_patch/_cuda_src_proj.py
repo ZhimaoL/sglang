@@ -6,6 +6,11 @@ _CUDA_SRC = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 
+// Programmatic dependent launch: no-ops unless launched with the programmatic-serialization attribute (proj_set_pdl).
+// A kernel waits before reading its activations and before any global store; constant weights may be read earlier.
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+
 // bf16 pair (packed in a u32) -> two fp32, 1 int op each.
 __device__ __forceinline__ float blo(unsigned u) { return __int_as_float(u << 16); }
 __device__ __forceinline__ float bhi(unsigned u) { return __int_as_float(u & 0xffff0000u); }
@@ -28,6 +33,8 @@ __device__ __forceinline__ float dot8(uint4 w, uint4 x, float acc) {
 template <int MT, int R, int U>
 __global__ void gemv_ffma_k(const uint4* __restrict__ W, const uint4* __restrict__ X,
                             __nv_bfloat16* __restrict__ out, int m, int N, int kvec) {
+  pdl_wait();
+  pdl_trigger();
   int wid = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   int lane = threadIdx.x & 31;
   size_t row0 = (size_t)wid * R;
@@ -171,6 +178,17 @@ mma_stream_k(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict__ X,
   float c0[4] = {0.f, 0.f, 0.f, 0.f};
   float c1[4] = {0.f, 0.f, 0.f, 0.f};  // MR==32 second m-tile
 
+  // the first G 64k-groups of W (constant weights) are in flight before the PDL wait: their DRAM latency overlaps
+  // the predecessor's tail and the x staging
+  const uint4* wb = Wp + (((size_t)ncol * (K >> 6) + (kstart >> 6)) << 6) + (lane << 1);
+  uint4 u[G][2];
+#pragma unroll
+  for (int gg = 0; gg < G; gg++) {
+    u[gg][0] = __ldcs(wb + (gg << 6));
+    u[gg][1] = __ldcs(wb + (gg << 6) + 1);
+  }
+  pdl_wait();
+  pdl_trigger();
   {  // stage x[0..MR)[kstart..kstart+kslice) once: cp.async (deep HW queue, no
      // per-thread load->store register chains); zero-pad rows >= m with plain stores
     const int nu4 = kslice >> 3;
@@ -195,14 +213,14 @@ mma_stream_k(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict__ X,
       sa_hi = (unsigned)__cvta_generic_to_shared(xs + ((lane & 15) + 16) * SP + (lane >> 4) * 8);
   }
 
-  const uint4* wb = Wp + (((size_t)ncol * (K >> 6) + (kstart >> 6)) << 6) + (lane << 1);
   for (int kk = 0; kk < kslice; kk += 64 * G) {
-    uint4 u[G][2];
+    if (kk > 0) {
 #pragma unroll
-    for (int gg = 0; gg < G; gg++) {
-      const uint4* p = wb + (((kk >> 6) + gg) << 6);
-      u[gg][0] = __ldcs(p);
-      u[gg][1] = __ldcs(p + 1);
+      for (int gg = 0; gg < G; gg++) {
+        const uint4* p = wb + (((kk >> 6) + gg) << 6);
+        u[gg][0] = __ldcs(p);
+        u[gg][1] = __ldcs(p + 1);
+      }
     }
 #pragma unroll
     for (int gg = 0; gg < G; gg++)
@@ -392,6 +410,8 @@ mma_cstream_k(const uint4* __restrict__ Wm, const uint4* __restrict__ We,
 template <int FOLD>
 __global__ void reduce_k(const float* __restrict__ P, void* __restrict__ out, int m, int NOUT,
                          int SK) {
+  pdl_wait();
+  pdl_trigger();
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   size_t plane = (size_t)m * NOUT;
   if (FOLD == 0) {
@@ -426,6 +446,24 @@ __global__ void reduce_k(const float* __restrict__ P, void* __restrict__ out, in
   }
 }
 
+static bool g_pdl = false;
+void proj_set_pdl(int64_t on) { g_pdl = on != 0; }
+
+template <typename... KArgs, typename... Args>
+static void plaunch(void (*k)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, Args... args) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = g_pdl ? 1 : 0;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k, static_cast<KArgs>(args)...));
+}
+
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
                       int64_t k, int64_t MT, int64_t R, int64_t U, int64_t WPC) {
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -436,7 +474,7 @@ void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int
   auto* o = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
 #define GCASE(mt, r, u)                                                               \
   if (MT == mt && R == r && U == u) {                                                 \
-    gemv_ffma_k<mt, r, u><<<grid, block, 0, stream>>>(w, x, o, (int)m, (int)n, kvec); \
+    plaunch(gemv_ffma_k<mt, r, u>, grid, block, 0, stream, w, x, o, (int)m, (int)n, kvec); \
     return;                                                                           \
   }
   GCASE(1, 1, 2) GCASE(1, 1, 4) GCASE(1, 1, 8)
@@ -455,8 +493,8 @@ void mma_launch(at::Tensor Wp, at::Tensor X, at::Tensor out, int64_t m, int64_t 
   if (MR == mr && SPLIT == sp && G == g) {                                                 \
     cudaFuncSetAttribute(mma_stream_k<mr, sp, g>,                                          \
                          cudaFuncAttributeMaxDynamicSharedMemorySize, 135168);             \
-    mma_stream_k<mr, sp, g><<<grid, block, sh, stream>>>(w, x, o, (int)m, (int)nout,       \
-                                                         (int)k, (int)SK);                 \
+    plaunch(mma_stream_k<mr, sp, g>, grid, block, sh, stream, w, x, o, (int)m, (int)nout,  \
+            (int)k, (int)SK);                                                              \
     return;                                                                                \
   }
   MCASE(8, 0, 2) MCASE(8, 0, 4) MCASE(8, 0, 8) MCASE(8, 1, 2) MCASE(8, 1, 4) MCASE(8, 1, 8)
@@ -494,11 +532,11 @@ void reduce_launch(at::Tensor P, at::Tensor out, int64_t m, int64_t nout, int64_
   dim3 grid((unsigned)((total + 255) / 256)), block(256u);
   const float* p = reinterpret_cast<const float*>(P.data_ptr());
   if (FOLD == 2)
-    reduce_k<2><<<grid, block, 0, stream>>>(p, out.data_ptr(), (int)m, (int)nout, (int)SK);
+    plaunch(reduce_k<2>, grid, block, 0, stream, p, out.data_ptr(), (int)m, (int)nout, (int)SK);
   else if (FOLD)
-    reduce_k<1><<<grid, block, 0, stream>>>(p, out.data_ptr(), (int)m, (int)nout, (int)SK);
+    plaunch(reduce_k<1>, grid, block, 0, stream, p, out.data_ptr(), (int)m, (int)nout, (int)SK);
   else
-    reduce_k<0><<<grid, block, 0, stream>>>(p, out.data_ptr(), (int)m, (int)nout, (int)SK);
+    plaunch(reduce_k<0>, grid, block, 0, stream, p, out.data_ptr(), (int)m, (int)nout, (int)SK);
 }
 
 void gemv_router_launch(at::Tensor Wp, at::Tensor X, at::Tensor out, int64_t m, int64_t k,

@@ -21,6 +21,7 @@ void cmma_launch(at::Tensor Wm, at::Tensor We, at::Tensor X, at::Tensor out, int
                  int64_t WPC, int64_t EB);
 void reduce_launch(at::Tensor P, at::Tensor out, int64_t m, int64_t nout, int64_t SK,
                    int64_t FOLD);
+void proj_set_pdl(int64_t on);
 """
 
 
@@ -36,19 +37,25 @@ def pg_ext():
                     _CUDA_SRC,
                 )
 
+                # The name differs from the prefill bank's build: the small-T front end (route, gather_norm) and
+                # the PDL launch flags changed the entry points.
                 _PG_EXT = load_inline(
-                    name="okc_pg_moe_c350",
+                    name="okc_pg_moe_c350_pdl",
                     cpp_sources="void tiles(torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
                     "void gather(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "int64_t);\n"
+                    "int64_t, int64_t);\n"
+                    "void route(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);\n"
+                    "void gather_norm(torch::Tensor, torch::Tensor, double, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, int64_t, int64_t);\n"
                     "void gg1(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);\n"
+                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
                     "void gg2(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
-                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);\n"
+                    "torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t);\n"
                     "void set_snake_max_t(int64_t);",
                     cuda_sources=_CUDA_SRC,
-                    functions=["tiles", "gather", "gg1", "gg2", "set_snake_max_t"],
+                    functions=["tiles", "gather", "route", "gather_norm", "gg1", "gg2", "set_snake_max_t"],
                     extra_cuda_cflags=[
                         "-O3",
                         "--use_fast_math",
@@ -71,9 +78,10 @@ def proj_ext():
                 )
 
                 # Flags match the certified kernel-track build; the name differs because the router GEMV and
-                # reduce_k<2> changed (a shared name would rebuild over that lane's torch_extensions cache).
+                # reduce_k<2> changed (a shared name would rebuild over that lane's torch_extensions cache), and
+                # again for the PDL launches (proj_set_pdl).
                 _PROJ_EXT = load_inline(
-                    name="okc_v5_stream_det",
+                    name="okc_v5_stream_det_pdl",
                     cpp_sources=[_PROJ_CPP],
                     cuda_sources=[_CUDA_SRC],
                     functions=[
@@ -82,10 +90,14 @@ def proj_ext():
                         "mma_launch",
                         "cmma_launch",
                         "reduce_launch",
+                        "proj_set_pdl",
                     ],
                     extra_cuda_cflags=["-O3"],
                     verbose=False,
                 )
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL
+
+                _PROJ_EXT.proj_set_pdl(1 if SW_PDL else 0)
     return _PROJ_EXT
 
 

@@ -145,12 +145,35 @@ def maybe_forward(layer, hidden_states, topk_scores, topk_ids, post_expert_norm,
         if state["pg_only"]:
             raise RuntimeError(f"OKC pg-only MoE layer cannot run this batch: {decline}")
         return None
-    if pre_expert_norm is not None:
-        hidden_states = pre_expert_norm(hidden_states)
     if not _logged_first_call:
         _logged_first_call = True
         logger.info("OKC pg MoE active (first T=%d).", tokens)
+    small = _small_front(hidden_states, topk_ids, pre_expert_norm)
+    if small is not None:
+        return _moe_pg_small(layer, hidden_states, topk_scores, topk_ids, state, *small)
+    if pre_expert_norm is not None:
+        hidden_states = pre_expert_norm(hidden_states)
     return _moe_pg(layer, hidden_states.contiguous(), topk_scores, topk_ids, state)
+
+
+def _small_front(hidden_states, topk_ids, pre_expert_norm):
+    """(norm weight, eps) for the pg_route / pg_gather_norm front end, or None for the moe_align chain."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+    from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm
+
+    if not _sw.SW_PG_SMALL or topk_ids.numel() > pg_moe.SMALL_MAX_ROUTES:
+        return None
+    if topk_ids.dtype is not torch.int32 or not topk_ids.is_contiguous() or not hidden_states.is_contiguous():
+        return None
+    # The fold reproduces F.rms_norm(x, (H,), bf16 weight, eps) exactly; any other norm keeps its own launch.
+    if type(pre_expert_norm) is not MuseSpark1xRMSNorm:
+        return None
+    weight = pre_expert_norm._get_effective_weight()
+    if weight is None or weight.dtype is not torch.bfloat16 or not weight.is_contiguous():
+        return None
+    if weight.numel() != hidden_states.shape[1]:
+        return None
+    return weight, float(pre_expert_norm.eps)
 
 
 def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
@@ -168,6 +191,29 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
     if layer._post_expert_norm_weight is None:
         return "post-expert norm without a weight"
     return None
+
+
+def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps):
+    from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
+        fused_post_expert_norm_weighted_sum,
+    )
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
+
+    num_tokens, size_k = x.shape
+    y, local_ids = pg_moe.grouped_pg_small(
+        x, topk_ids, layer._expert_map,
+        norm_weight=norm_weight, norm_eps=norm_eps,
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=_sw.SW_PDL,
+    )
+    return fused_post_expert_norm_weighted_sum(
+        y.view(num_tokens, 8, size_k),
+        topk_scores,
+        norm_weight=layer._post_expert_norm_weight,
+        eps=layer._post_expert_norm_eps,
+        weight_first=layer._post_expert_norm_weight_first,
+        slot_expert_ids=local_ids,
+        min_tokens_for_fused=1,
+    )
 
 
 def pg_prep(layer, topk_ids):

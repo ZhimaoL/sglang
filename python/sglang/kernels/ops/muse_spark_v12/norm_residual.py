@@ -184,12 +184,23 @@ def fused_norm_residual(
 
     auto_cluster = cluster_size is None
     if auto_cluster:
-        supports_clusters = torch.cuda.get_device_capability(branch.device)[0] >= 10
+        capability = torch.cuda.get_device_capability(branch.device)
+        supports_clusters = capability[0] >= 10
+        if capability[0] == 9:
+            from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+            # OKC: the cluster kernel uses only sm_90 features (clusters, DSMEM, the non-portable size opt-in).
+            supports_clusters = okc_patch.HOPPER_NORM_MAX_CLUSTER > 1
         cluster_size = (
             _cluster_size_for_shape(hidden_size, m)
             if supports_clusters and not pre_norm_bf16
             else 1
         )
+        if capability[0] == 9 and cluster_size > 1:
+            from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+            while cluster_size > okc_patch.HOPPER_NORM_MAX_CLUSTER:
+                cluster_size //= 2
 
     assert cluster_size is not None
     num_threads, prefetch_weights = _cluster_launch_config(hidden_size, m, cluster_size)
