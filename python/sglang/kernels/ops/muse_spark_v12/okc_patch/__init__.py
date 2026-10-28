@@ -69,10 +69,10 @@ SW_PG_SMALL = _flag("OKC_SW_PG_SMALL", "1")
 # Programmatic dependent launch on the OKC kernels inside verify / decode graphs (the next kernel's launch and
 # prologue overlap the previous one's tail; every kernel waits on griddepcontrol before reading its inputs).
 SW_PDL = _flag("OKC_SW_PDL", "1")
-# _dot (o-proj at m <= 8) triggers its dependents at entry (1) or only at exit (0, default): with the entry trigger
-# the o-proj all-reduce launches ~5 us early and its 132 CTAs sit resident through _dot and the post-attention norm
-# (SI A vs B, bs1 per layer: norm 3.07 -> 3.90 us, _dot 6.40 -> 6.62).
-PDL_DOT_TRIGGER = _flag("OKC_PDL_DOT_TRIGGER", "0")
+# _dot (o-proj at m <= 8) triggers its dependents at entry (1, default) or only at exit (0). The entry trigger launches
+# the o-proj all-reduce ~5 us early (SI bs1 per layer: norm 3.07 -> 3.90 us); without it the next kernel's launch is
+# exposed (1 GPU, _dot -> cluster norm: 7.96 -> 12.13 us per boundary). TP8 A/B: verify-glue dot_ar_norm_bench.py.
+PDL_DOT_TRIGGER = _flag("OKC_PDL_DOT_TRIGGER", "1")
 # DFlash context projection fc (5 x 8192 -> 8192, replicated 640 MiB bf16, 159 us per verify step) as a column-split
 # GEMM + the multicast all-gather (gemm_ag) at <= GEMM_AG_MAX_TOKENS tokens.
 SW_DFLASH_FC_AG = _flag("OKC_SW_DFLASH_FC_AG", "1")

@@ -33,7 +33,7 @@ def _dot(x_ptr, w_ptr, out_ptr, M, N,
          PDL_TRIGGER: tl.constexpr = False):
     if PDL:   # programmatic dependent launch: wait for the producer of x before any load or store
         tlc.gdc_wait()
-        if PDL_TRIGGER:   # OKC_PDL_DOT_TRIGGER: let the next kernel (the o-proj all-reduce) launch right away
+        if PDL_TRIGGER:   # OKC_PDL_DOT_TRIGGER: launch the next kernel (the o-proj all-reduce) right away
             tlc.gdc_launch_dependents()
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
