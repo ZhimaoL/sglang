@@ -14,6 +14,7 @@ _FMHA_EXT = None
 _GLUE_EXT = None
 _WST_EXT = None
 _VFG_EXT = None
+_DRAFT_EXT = None
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -314,3 +315,25 @@ def vfg_ext():
                     verbose=False,
                 )
     return _VFG_EXT
+
+
+def draft_ext():
+    """DFlash draft-side glue (_cuda_src_draft.py): candidate pack / merge, draft context-KV commit."""
+    global _DRAFT_EXT
+    if _DRAFT_EXT is None:
+        with _lock:
+            if _DRAFT_EXT is None:
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_draft import _CPP_SRC, _CUDA_SRC
+
+                # No fast-math: cand_merge's tanh and products must match torch's float kernels.
+                _DRAFT_EXT = load_inline(
+                    name="okc_draft_glue_v1",
+                    cpp_sources=_CPP_SRC,
+                    cuda_sources=[_CUDA_SRC],
+                    functions=["cand_pack", "cand_merge", "kv_write"],
+                    extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+                    verbose=False,
+                )
+    return _DRAFT_EXT

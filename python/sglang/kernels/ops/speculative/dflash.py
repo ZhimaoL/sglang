@@ -299,10 +299,15 @@ def selector_walk_triton(
     uniforms,
     temperatures,
     greedy_mask,
+    tokens_out=None,
+    q_out=None,
 ):
     batch, slots, top_k = candidate_ids.shape
-    tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
-    q_rows = torch.empty(
+    # OKC: callers with static result buffers pass them (contiguous [batch, slots] / [batch, slots, top_k]).
+    tokens = tokens_out if tokens_out is not None else torch.empty(
+        (batch, slots), dtype=torch.int64, device=scores.device
+    )
+    q_rows = q_out if q_out is not None else torch.empty(
         (batch, slots, top_k), dtype=torch.float32, device=scores.device
     )
     _selector_walk_kernel[(batch,)](

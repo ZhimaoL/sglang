@@ -162,6 +162,9 @@ SW_TAIL_NORM = _flag("OKC_SW_TAIL_NORM", "1")
 SW_ARGMAX_SPLIT = _flag("OKC_SW_ARGMAX_SPLIT", "1")
 # DFlash candidate_topk: one all-gather of packed value bits + ids instead of two.
 SW_CAND_AG_MERGE = _flag("OKC_SW_CAND_AG_MERGE", "1")
+# DFlash draft glue (okc_patch.draft_glue, bit-identical): candidate pack / merge; one-launch draft-KV commit.
+SW_CAND_FUSE = _flag("OKC_SW_CAND_FUSE", "1")
+SW_DRAFT_KV_FUSE = _flag("OKC_SW_DRAFT_KV_FUSE", "1")
 
 # Hopper cluster cap for sglang's fused norm-residual boundary (norm_residual.py): upstream runs the one-CTA-per-row
 # kernel unless capability >= 10; > 1 allows the cluster kernel (GB300 policy C = 16 / 8 / 4 / 2 at M <= 8 / 16 / 32
@@ -198,6 +201,6 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_MOE_OVL",
            "SP_PRENORM_SHARD", "SP_AG_GROUP", "SW_PG_SMALL", "SW_PDL", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS",
-           "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "HOPPER_NORM_MAX_CLUSTER",
+           "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "RIDE_ALONG", "ANY_ATTN"]

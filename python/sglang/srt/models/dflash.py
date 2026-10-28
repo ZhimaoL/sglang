@@ -142,6 +142,29 @@ def _project_candidate_logits(
     return logits
 
 
+def _okc_candidate_unary(hidden, lm_head, k, mult, cap, ids_out=None):
+    """OKC (OKC_SW_CAND_FUSE): candidate_topk's merged-gather path + DFlash2's unary transform, bit-identical, with the
+    pack and the post-gather chain one launch each -> (ids, unary) [N, k]; None = take candidate_topk."""
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import draft_glue
+    from sglang.srt.distributed import get_tp_group
+
+    group, w = get_tp_group(), getattr(lm_head, "weight", None)
+    if not okc_patch.SW_CAND_AG_MERGE or cap is None or group.world_size != 8 or k != 16:
+        return None
+    if should_apply_lm_head_quant_method(lm_head, getattr(lm_head, "quant_method", None)):
+        return None
+    if not is_dense_head_weight(w) or w.dtype is not torch.bfloat16:
+        return None
+    si = lm_head.shard_indices
+    logits = _project_candidate_logits(hidden, lm_head, num_org=int(si.num_org_elements), use_quant_head=False)
+    vals, ids = _radix_topk(logits, k)
+    packed = draft_glue.cand_pack(vals, ids, int(si.org_vocab_start_index))
+    out = packed.new_empty((8 * packed.shape[0], 2 * k))
+    group.all_gather_into_tensor(out, packed)
+    return draft_glue.cand_merge(out, packed.shape[0], 8, k, mult, cap, ids_out=ids_out)
+
+
 def candidate_topk(
     hidden: torch.Tensor,
     lm_head: nn.Module,
@@ -1253,6 +1276,8 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
+        tokens_out: Optional[torch.Tensor] = None,
+        q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
@@ -1264,6 +1289,8 @@ class CandidateSelector(nn.Module):
                 uniforms=uniforms,
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
+                tokens_out=tokens_out,
+                q_out=q_out,
             )
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
@@ -1337,11 +1364,24 @@ class DFlash2DraftModel(DFlashDraftModel):
         return logits
 
     def compute_candidates(
-        self, hidden: torch.Tensor
+        self, hidden: torch.Tensor, ids_out: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        if okc_patch.SW_CAND_FUSE:
+            fused = _okc_candidate_unary(
+                hidden,
+                self.lm_head,
+                self.candidate_selector.top_k,
+                self.draft_config.output_multiplier,
+                self.draft_config.final_logit_softcapping,
+                ids_out=ids_out,
+            )
+            if fused is not None:
+                return fused
         ids, vals, _ = candidate_topk(
             hidden, self.lm_head, self.candidate_selector.top_k
         )
