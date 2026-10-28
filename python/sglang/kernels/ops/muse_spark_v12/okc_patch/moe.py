@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 
 _captured_layers = 0
 _logged_first_call = False
+_pack_streams = None
+
+
+def _streams():
+    global _pack_streams
+    if _pack_streams is None:
+        _pack_streams = (torch.cuda.Stream(), torch.cuda.Stream())
+    return _pack_streams
 
 
 def _build_packs(layer) -> dict | None:
@@ -46,12 +54,29 @@ def _build_packs(layer) -> dict | None:
 
     # pack_wsf wants the raw stacked [gate; up] rows and raw e4m3 scale bytes; gs13 is the
     # per-expert scale Marlin also uses (its constant gain is cancelled by the post-expert norm).
-    return {
-        "H": H,
-        "w13_gs32": gs13.float().contiguous(),
-        "pg_wsf13": pg_moe.pack_wsf(w13.contiguous(), sf13.contiguous().view(torch.uint8), gated=True),
-        "pg_wsf2": pg_moe.pack_wsf(w2.contiguous(), sf2.contiguous().view(torch.uint8), gated=False),
-    }
+    # Built in place, the packs land in split blocks of freed temporaries and raw weights, and the
+    # caching allocator can never return those segments: 11.6 GiB/rank of KV pool lost over 62 layers
+    # (serving-patch/smokes/okc_pack_mem_probe.py). So the temporaries live on a side stream (their
+    # blocks are reused only there and are all free afterwards) and each pack is copied into a block of
+    # its own on a keep-stream that never frees anything.
+    side, keep = _streams()
+    cur = torch.cuda.current_stream()
+    side.wait_stream(cur)
+    with torch.cuda.stream(side):
+        built = {
+            "w13_gs32": gs13.float().contiguous(),
+            "pg_wsf13": pg_moe.pack_wsf(w13.contiguous(), sf13.contiguous().view(torch.uint8), gated=True),
+            "pg_wsf2": pg_moe.pack_wsf(w2.contiguous(), sf2.contiguous().view(torch.uint8), gated=False),
+        }
+    keep.wait_stream(side)
+    packs = {"H": H}
+    with torch.cuda.stream(keep):
+        for name, t in built.items():
+            packs[name] = torch.empty_like(t).copy_(t)
+    cur.wait_stream(keep)
+    keep.synchronize()
+    del built
+    return packs
 
 
 def maybe_capture_nvfp4_packs(layer) -> bool:
