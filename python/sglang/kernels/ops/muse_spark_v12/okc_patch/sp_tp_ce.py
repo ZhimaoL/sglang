@@ -40,9 +40,9 @@ GROUP = int(os.environ.get("OKC_SP_CE_AG_GROUP", "1"))
 AG_MIN_TOKENS = int(os.environ.get("OKC_SP_CE_AG_MIN_TOKENS", "16384"))
 STREAMS = int(os.environ.get("OKC_SP_CE_STREAMS", "1"))
 MAX_TOKENS = int(os.environ.get("OKC_SP_CE_MAX_TOKENS", "16384"))
-# The AG side with a readiness flag per push (sp_ag_flags.py: stream memops, no barriers) instead of a barrier per
-# GROUP push steps.
-AG_FLAGS = os.environ.get("OKC_SP_CE_AG_FLAGS", "0") == "1"
+# The AG side with a readiness flag per push (sp_ag_flags.py; 1 = stream memops, 2 = symm-mem signal kernels; no
+# barriers) instead of a barrier per GROUP push steps.
+AG_FLAGS = int(os.environ.get("OKC_SP_CE_AG_FLAGS", "0"))
 
 _state = None
 _failed = False
@@ -228,7 +228,7 @@ def ag_matmul(tp_group, x_shard, weight):
     if AG_FLAGS:
         from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_ag_flags
 
-        fl = sp_ag_flags.flags(tp_group, x_shard.device)
+        fl = sp_ag_flags.KernelFlags(st.hdl) if AG_FLAGS == 2 else sp_ag_flags.flags(tp_group, x_shard.device)
         if fl is not None:
             return sp_ag_flags.ag_matmul(st, fl, x_shard, weight)
     return _drive(st, ag_matmul_steps(st, x_shard, weight))

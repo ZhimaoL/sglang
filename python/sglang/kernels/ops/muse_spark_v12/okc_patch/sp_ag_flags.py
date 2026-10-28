@@ -4,7 +4,8 @@ After each push into rank dest's gather slot the push stream writes 1 into dest'
 fenced after the copy); the consumer waits for flag[src] == 1 (cuStreamWaitValue32) before src's GEMM, then resets
 it. Two uses of a flag are separated by all-rank collectives (o_proj RS, MoE), as for the gather slots, so 1 / 0
 suffices (captured memops keep constant values). All pushes are enqueued before the first wait: a wait blocks its
-hardware queue, which the push stream may share.
+hardware queue, which the push stream may share. OKC_SP_CE_AG_FLAGS=2 runs the same handshake on torch's symm-mem
+signal kernels instead (KernelFlags).
 """
 
 import logging
@@ -46,6 +47,22 @@ class Flags:
         cs = self._cs(stream)
         _ok(self.cu, self.cu.cuStreamWaitValue32(cs, self.slot[src], 1, self.wait_flags))
         _ok(self.cu, self.cu.cuStreamWriteValue32(cs, self.slot[src], 0, self.write_flags))
+
+
+class KernelFlags:
+    """put_signal after the copy (1-warp release CAS 0 -> 1 in dest's slot), wait_signal before the GEMM (acquire CAS
+    1 -> 0: the reset comes with the wait), on channel 1 of sp_tp_ce's buffers (their barrier uses channel 0)."""
+
+    def __init__(self, hdl):
+        self.hdl = hdl
+
+    def signal(self, stream, dest):
+        with torch.cuda.stream(stream):
+            self.hdl.put_signal(dest, channel=1)
+
+    def wait(self, stream, src):
+        with torch.cuda.stream(stream):
+            self.hdl.wait_signal(src, channel=1)
 
 
 def _ok(cu, res):
