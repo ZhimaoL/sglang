@@ -390,9 +390,10 @@ class FusedKVMaterializeHelper:
         self,
         ctx_hidden: torch.Tensor,
         positions: torch.Tensor,
-        write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
-    ) -> None:
-        """Materialize KV cache for all layers using batched projection."""
+        write_layer_kv: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]],
+    ) -> Optional[tuple]:
+        """Materialize KV cache for all layers using batched projection. write_layer_kv None (OKC): return the
+        stacked (cache_k, cache_v) [layers, rows, heads, dim] for a caller that writes every layer at once."""
         total_ctx = ctx_hidden.shape[0]
         if total_ctx == 0:
             return
@@ -453,5 +454,8 @@ class FusedKVMaterializeHelper:
             k_out=tmp_k,
             v_out=tmp_v,
         )
+        if write_layer_kv is None:
+            return cache_k, cache_v
         for layer_idx in range(self.n_layers):
             write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])
+        return None

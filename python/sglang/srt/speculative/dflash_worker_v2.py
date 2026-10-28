@@ -268,11 +268,12 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
-def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+def _selector_lattice(draft_model, pred_hidden, anchor_token_ids, ids_out=None):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
+    kwargs = {} if ids_out is None else {"ids_out": ids_out}
     candidate_ids, unary_logits = draft_model.compute_candidates(
-        pred_hidden.reshape(-1, pred_hidden.shape[-1])
+        pred_hidden.reshape(-1, pred_hidden.shape[-1]), **kwargs
     )
     candidate_ids = candidate_ids.view(bs, num_pred, -1)
     return candidate_ids, draft_model.candidate_selector.build_lattice(
@@ -333,7 +334,13 @@ class _SelectorDraftSampler:
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
-        candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        direct = okc_patch.SW_CAND_FUSE  # OKC: the merge and the walk write the result buffers in place
+        candidate_ids, scores = _selector_lattice(
+            self.draft_model, hs, block_ids[:, 0], ids_out=self.candidate_out[:bs] if direct else None
+        )
+        gamma = hs.shape[1]
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
@@ -341,10 +348,15 @@ class _SelectorDraftSampler:
             uniforms=self.uniforms[:bs].uniform_(),
             temperatures=self.temperatures[:bs],
             greedy_mask=self.greedy_mask[:bs],
+            tokens_out=self.out[: bs * gamma].view(bs, gamma) if direct else None,
+            q_out=self.q_out[:bs] if direct else None,
         )
-        self.out[: tokens.numel()].copy_(tokens.reshape(-1))
-        self.candidate_out[:bs].copy_(candidate_ids)
-        self.q_out[:bs].copy_(q_rows)
+        if tokens.data_ptr() != self.out.data_ptr():
+            self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+        if candidate_ids.data_ptr() != self.candidate_out.data_ptr():
+            self.candidate_out[:bs].copy_(candidate_ids)
+        if q_rows.data_ptr() != self.q_out.data_ptr():
+            self.q_out[:bs].copy_(q_rows)
 
 
 class _DominoDraftSampler:
@@ -475,6 +487,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_model = self.model_runner.model
             if hasattr(target_model, "set_dflash_layers_to_capture"):
                 target_model._okc_aux_project = self.draft_model.okc_project_local
+        self._okc_kv_commit = False
+        if okc_patch.SW_CAND_FUSE or okc_patch.SW_DRAFT_KV_FUSE:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import draft_glue
+
+            draft_glue.prepare()  # build before any capture
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -2069,6 +2086,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 attn.attn.v_scale,
             )
 
+    def _okc_kv_commit_fn(self, pool):
+        """OKC_SW_DRAFT_KV_FUSE: the one-launch draft-KV commit for this pool or None (decided once, outside capture)."""
+        if self._okc_kv_commit is False and not torch.cuda.is_current_stream_capturing():
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import draft_glue
+
+            self._okc_kv_commit = draft_glue.kv_commit_for(pool, [m.self_attn.attn for m in self.draft_model.layers])
+        return self._okc_kv_commit or None
+
     def _append_target_hidden_fused(
         self,
         ctx_hidden: torch.Tensor,
@@ -2081,6 +2106,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         if self._fused_kv_helper is None:
             raise RuntimeError("DFLASH fused KV helper is not initialized.")
+
+        if ctx_cache_loc_2d is not None and commit_lens is not None:
+            commit = self._okc_kv_commit_fn(token_to_kv_pool)
+            if commit is not None:
+                cache_k, cache_v = self._fused_kv_helper.materialize(
+                    ctx_hidden=ctx_hidden, positions=ctx_positions, write_layer_kv=None
+                )
+                commit(cache_k, cache_v, ctx_cache_loc_2d, commit_lens)
+                return
 
         def _write_layer_kv(
             layer_idx: int,
