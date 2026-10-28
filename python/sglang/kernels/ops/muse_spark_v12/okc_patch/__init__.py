@@ -39,7 +39,7 @@ MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
 # the split from this size up: its kernels cost 9-15 us per layer, which at prefill routing it repays only on 16K
 # chunks (S8 arm C ~1K extends: <= 1 us of straggler saved; 1xH200 bench: +5..+21 us at T 753..5632, -20 at 16384)
 MOE_REP_SPLIT_MIN_TOKENS = int(os.environ.get("OKC_MOE_REP_SPLIT_MIN_TOKENS", "8192"))
-# pg's narrow build (_cuda_src_pgn: 128-token blocks, widths 16 / 64 / 128) for calls of OKC_PG_NARROW_MIN_T..MAX_T
+# pg's narrow build (-DPGN_WSET: 128-token blocks, widths 16 / 64 / 128) for calls of OKC_PG_NARROW_MIN_T..MAX_T
 # tokens (serving/kernels/extend E5-E7: 0.77-0.80x at verify T 8..256, 0.86-0.97x at extends of 753..3072); the
 # shipped build (256-token blocks) outside. Same outputs for every real token.
 PG_NARROW_MIN_T = int(os.environ.get("OKC_PG_NARROW_MIN_T", "1"))
