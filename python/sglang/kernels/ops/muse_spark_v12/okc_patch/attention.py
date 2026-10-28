@@ -48,7 +48,6 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN_ACC16,
     SW_ATTN_V3,
     SW_FS,
-    SW_PREFILL_FMHA,
 )
 from sglang.kernels.ops.muse_spark_v12.okc_patch import attn_kernels as ak
 
@@ -110,10 +109,6 @@ def try_attention(attn, qkv, forward_batch) -> Optional[torch.Tensor]:
         q_len = 1
     elif mode.is_target_verify():
         q_len = -1  # resolved from metadata below
-    elif SW_PREFILL_FMHA and mode.is_extend() and not mode.is_mixed():
-        from sglang.kernels.ops.muse_spark_v12.okc_patch import prefill_attn
-
-        return prefill_attn.try_prefill_attention(attn, qkv, forward_batch)
     else:
         return None
     # The kernels fuse per-head QK RMSNorm, the output RMSNorm and the sigmoid gate;
