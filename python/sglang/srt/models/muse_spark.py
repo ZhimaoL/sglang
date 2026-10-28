@@ -1927,6 +1927,10 @@ class MuseSpark1xForCausalLM(nn.Module):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
         # The OKC small-T packs (qkv_gate MMA pack, router hi/lo) are built here: before KV-pool
         # sizing and outside any CUDA-graph capture; the forwards only look them up.
+        if okc_patch.SW_SMALLM:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import smallm as okc_smallm
+
+            okc_smallm.prepare()
         if okc_patch.SW_PROJ or okc_patch.SW_ROUTER:
             for module in self.modules():
                 if okc_patch.SW_PROJ and isinstance(module, MuseSpark1xAttention):

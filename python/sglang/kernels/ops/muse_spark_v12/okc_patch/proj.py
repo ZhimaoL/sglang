@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import cuda as tlc
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL, SW_PROJ_MMA
+from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL, SW_PROJ_MMA, SW_SMALLM
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import proj_ext
 
 
@@ -89,6 +89,11 @@ def prepare_weight(weight) -> None:
     MuseSpark1xForCausalLM.post_load_weights); small_m_gemm only looks packs up."""
     if not SW_PROJ_MMA or tuple(weight.shape) not in _PACKED_SHAPES:
         return
+    if SW_SMALLM:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import smallm
+
+        if smallm.claims(weight.shape[0], weight.shape[1], 8):
+            return  # smallm serves m <= 8 off the resident weight: no pack
     if weight.dtype is not torch.bfloat16 or not weight.is_cuda or not weight.is_contiguous():
         return
     key = (weight.data_ptr(), tuple(weight.shape))

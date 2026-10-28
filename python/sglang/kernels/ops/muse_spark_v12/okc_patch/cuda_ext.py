@@ -7,6 +7,7 @@ import threading
 _lock = threading.Lock()
 _PG_EXT = None
 _PROJ_EXT = None
+_SMALLM_EXT = None
 _FMHA_EXT = None
 
 _PROJ_CPP = """
@@ -143,3 +144,29 @@ def fmha_ext(exact: bool = False):
                     verbose=False,
                 )
     return _FMHA_EXT[key]
+
+
+def smallm_ext():
+    global _SMALLM_EXT
+    if _SMALLM_EXT is None:
+        with _lock:
+            if _SMALLM_EXT is None:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_smallm import (
+                    _CUDA_SRC,
+                )
+
+                # TMA tensor maps (cuTensorMapEncodeTiled via cudaGetDriverEntryPoint) + wgmma: sm_90a.
+                _SMALLM_EXT = load_inline(
+                    name="okc_smallm_rmw_v1",
+                    cpp_sources="void rmw_launch(torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, "
+                    "int64_t, int64_t, int64_t, int64_t, int64_t);",
+                    cuda_sources=[_CUDA_SRC],
+                    functions=["rmw_launch"],
+                    extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+                    extra_ldflags=["-lcuda"],
+                    verbose=False,
+                )
+    return _SMALLM_EXT
