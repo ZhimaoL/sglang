@@ -85,6 +85,21 @@ def _jit_module(
     )
 
 
+def _okc_wide(comm, num_tokens: int, hidden_size: int) -> bool:
+    """OKC_SW_AG_NORM_WIDE: M 33..128 on okc_ag_norm.cuh (the 256-thread row kernel's math, 1024 threads per row)."""
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    return (okc_patch.SW_AG_NORM_WIDE and 32 < num_tokens <= 128 and hidden_size == 8192 and comm.world_size == 8
+            and torch.cuda.get_device_capability()[0] == 9)
+
+
+@cache_once
+def _okc_wide_module(world_size: int) -> Module:
+    args = make_cpp_args(8192, world_size, is_arch_support_pdl())
+    return load_jit("okc_ag_norm", *args, cuda_files=["muse_spark_v12/okc_ag_norm.cuh"],
+                    cuda_wrappers=[("run", f"OkcAgNorm<{args}>::run")], extra_cuda_cflags=["-O3"])
+
+
 def all_gather_norm_residual_supported(
     comm: Optional[CustomAllReduceV2], num_tokens: int, hidden_size: int
 ) -> bool:
@@ -109,6 +124,8 @@ def all_gather_norm_residual_supported(
 
         # H200 x8 (session SI vg-micro, us per boundary fused vs separate): cap 16 M 8 / 16 / 32 -0.15 / -0.16 /
         # -0.85, M 64 +0.45, M 128 -0.87; with the row kernel (cap 1) M 16 / 32 / 64 lose (+0.4 / +1.0 / +0.3).
+        if _okc_wide(comm, num_tokens, hidden_size):
+            return True
         if not ((num_tokens <= 32 and okc_patch.HOPPER_NORM_MAX_CLUSTER > 1) or num_tokens >= 128):
             return False
     try:
@@ -135,11 +152,15 @@ def all_gather_norm_residual(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return BF16 normalized output and FP32 residual for the gathered branch."""
     num_tokens, hidden_size = stream.shape
-    config = _launch_config(hidden_size, num_tokens)
     output = torch.empty(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=stream.device
     )
     new_stream = torch.empty_like(stream)
+    if _okc_wide(comm, num_tokens, hidden_size):
+        _okc_wide_module(comm.world_size).run(comm.obj, local.contiguous(), stream, output, new_stream, post_weight,
+                                              pre_weight, alpha, beta, post_eps, pre_eps, post_norm_is_input_scale)
+        return output, new_stream
+    config = _launch_config(hidden_size, num_tokens)
 
     module = _jit_module(
         hidden_size,
