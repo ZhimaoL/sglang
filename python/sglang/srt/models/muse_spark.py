@@ -46,6 +46,7 @@ if okc_patch.SW_PROJ:
 if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
 if okc_patch.SW_MOE_OVL:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
     from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_moe_ovl as okc_sp_moe_ovl
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
@@ -776,7 +777,7 @@ class MuseSpark1xMoE(nn.Module):
         self, output: torch.Tensor, *, already_reduced: bool = False
     ) -> torch.Tensor:
         if getattr(self, "_okc_ovl_unpooled", False):
-            # The SP MoE pipeline (okc_patch/sp_moe_ovl.py) ran the unpooler per micro-batch.
+            # The SP MoE block (okc_patch/sp_moe_ovl.py) ran the unpooler per row slice.
             self._okc_ovl_unpooled = False
             return output
         # Expert TP already reduced across ranks, before its post-expert norm.
@@ -866,8 +867,8 @@ class MuseSpark1xMoE(nn.Module):
         side_stream = self._side_stream() if use_side_stream else None
         if use_side_stream:
             side_stream.wait_stream(main_stream)
-        # OKC SP MoE pipeline with the pooler split per micro-batch: the router goes first on its side stream and is
-        # joined by the pipeline's comm stream, so the pooler slices run beside it and AG(0) starts after the first.
+        # OKC SP MoE block with the pooler sliced: the router goes first on its side stream and is joined by the
+        # block's comm stream, so the pooler slices run beside it and the first AG pushes follow the first slice.
         ovl_pool = (
             sp_active
             and okc_patch.SW_MOE_OVL
@@ -1021,23 +1022,25 @@ class MuseSpark1xMoE(nn.Module):
         return self.sp_dispatcher.combine(combine_input)
 
     def _okc_ovl_eligible(self, num_shard_rows: int) -> bool:
-        """The SP MoE section of this layer runs as the copy-engine micro-batch pipeline (okc_patch/sp_moe_ovl.py):
+        """The SP MoE block of this layer runs with its collectives on the copy engines (okc_patch/sp_moe_ovl.py):
         pg-only NVFP4 experts under OKC Hopper SP, a chunk in the pipeline's token range. Shape-only: all ranks agree."""
         state = getattr(self.experts, "_okc_moe_state", None)
         return (
             okc_patch.SW_MOE_OVL
             and self.nvfp4_checkpoint
             and layernorm_sp.okc_hopper_sp()
+            and getattr(self.experts, "use_marlin", False)
             and state is not None
             and state["pg_only"]
             and okc_sp_moe_ovl.eligible(num_shard_rows, get_tp_group().world_size)
         )
 
     def _okc_ovl_run(self, x_shard, topk_scores, topk_ids, routed=None):
-        """Run the pipeline on the normed shard (or a (producer, rows) pooler split); None = keep the NCCL path."""
+        """Run the block on the normed shard (or a (producer, rows) sliced pooler); None = keep the NCCL path."""
+        experts = self.experts
         post = None
         if okc_sp_moe_ovl.UNPOOL and self.post_expert_proj is not None:
-            # SP shards are >= 512 rows, where bf16_gemm_dispatch is F.linear: the same cuBLAS call, with out=.
+            # Per row slice, into the slice's rows of the output: F.linear's cuBLAS call with out=.
             weight = self.post_expert_proj.weight
             post = (
                 lambda rows, out: torch.mm(rows, weight.t(), out=out),
@@ -1048,9 +1051,8 @@ class MuseSpark1xMoE(nn.Module):
             x_shard,
             topk_scores,
             topk_ids,
-            lambda x, scores, ids: self.experts(
-                x, scores, ids, self.experts.post_expert_norm
-            ),
+            lambda x, ids: okc_moe.pg_routes(experts, x, ids, experts.post_expert_norm),
+            lambda y, scores, local: okc_moe.finalize_routes(experts, y, scores, local),
             post=post,
             rows=self.expert_hidden_size,
             routed=routed,

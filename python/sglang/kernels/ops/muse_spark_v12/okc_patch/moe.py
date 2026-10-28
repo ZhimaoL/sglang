@@ -170,10 +170,42 @@ def _decline_reason(layer, hidden_states, topk_ids, post_expert_norm, state):
     return None
 
 
-def _moe_pg(layer, x, topk_scores, topk_ids, state):
+def pg_routes(layer, x, topk_ids, post_expert_norm):
+    """The pg half of maybe_forward for the SP MoE pipeline (okc_patch/sp_moe_ovl.py): x [T, H] already
+    pre-expert-normed -> (y [T, 8, H] per-route outputs, local slot ids [T, 8], -1 = not this rank's expert);
+    finalize_routes then combines any row range. Only for pg-only layers (the pipeline checks)."""
+    state = layer._okc_moe_state
+    decline = _decline_reason(layer, x, topk_ids, post_expert_norm, state)
+    if decline is not None:
+        raise RuntimeError(f"OKC pg-only MoE layer cannot run this batch: {decline}")
+    return _pg_routes(layer, x.contiguous(), topk_ids, state)
+
+
+def finalize_routes(layer, y, topk_scores, local_ids):
+    """Post-expert norm and top-k weighted sum of pg's per-route rows (rows of non-local routes are masked)."""
     from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
         fused_post_expert_norm_weighted_sum,
     )
+
+    return fused_post_expert_norm_weighted_sum(
+        y,
+        topk_scores,
+        norm_weight=layer._post_expert_norm_weight,
+        eps=layer._post_expert_norm_eps,
+        weight_first=layer._post_expert_norm_weight_first,
+        slot_expert_ids=local_ids,
+        # Below 32 tokens the wrapper's torch chain is 14 launches, ~36 us per layer at T = 8 (verify bs 1) against
+        # ~4 us for the kernel (session SC); the kernel's math is the same fp32 norm and weighted sum.
+        min_tokens_for_fused=1,
+    )
+
+
+def _moe_pg(layer, x, topk_scores, topk_ids, state):
+    y, local_ids = _pg_routes(layer, x, topk_ids, state)
+    return finalize_routes(layer, y, topk_scores, local_ids)
+
+
+def _pg_routes(layer, x, topk_ids, state):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
@@ -189,14 +221,4 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
         x, sorted_ids, block_experts, n_padded,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"],
     )
-    return fused_post_expert_norm_weighted_sum(
-        y.view(num_tokens, 8, size_k),
-        topk_scores,
-        norm_weight=layer._post_expert_norm_weight,
-        eps=layer._post_expert_norm_eps,
-        weight_first=layer._post_expert_norm_weight_first,
-        slot_expert_ids=local_ids,
-        # Below 32 tokens the wrapper's torch chain is 14 launches, ~36 us per layer at T = 8 (verify bs 1) against
-        # ~4 us for the kernel (session SC); the kernel's math is the same fp32 norm and weighted sum.
-        min_tokens_for_fused=1,
-    )
+    return y.view(num_tokens, 8, size_k), local_ids

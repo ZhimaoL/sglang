@@ -23,9 +23,6 @@ _WMASK = 3        # width classes emitted by pg_tiles: 64 and 128 (256 always)
 # Persistent grid: one CTA per SM (0) or capped at items-per-CTA x this (see _grid).
 import os as _os
 _CTA_ITEMS = int(_os.environ.get("OKC_PG_CTA_ITEMS", "0"))   # 0 = one CTA per SM
-# At most this many persistent CTAs (0 = no cap): sp_moe_ovl leaves SMs free for the comm stream's barrier kernels
-# while pg runs (a pg CTA takes a whole SM: 384 x 168 registers), else they wait for pg to retire.
-GRID_CAP = 0
 
 
 # v7 placement of the 8 codes of a weight word (see dq8r): magnitude bits at MAG[s] .. MAG[s] + 2, sign at SGN[s]
@@ -96,15 +93,6 @@ def pack_wsf(w_u8: torch.Tensor, sf_u8: torch.Tensor, gated: bool):
                      dim=-1).contiguous()
 
 
-_sms = {}
-
-
-def _num_sms(device) -> int:
-    if device.index not in _sms:
-        _sms[device.index] = torch.cuda.get_device_properties(device).multi_processor_count
-    return _sms[device.index]
-
-
 def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
     """x [T, 4096] bf16 -> y [T*8, 4096] bf16 per-route expert outputs (rows of non-local routes stay
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded
@@ -121,8 +109,6 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2):
     grid = 0
     if _CTA_ITEMS:
         grid = min(4096, max(1, -(-(num_pid_m * (2 * 4096 // 128)) // _CTA_ITEMS)))
-    if GRID_CAP:
-        grid = min(grid or _num_sms(x.device), GRID_CAP)
     xg_t = torch.empty((num_pid_m * 64 * 256 * 64,), dtype=torch.bfloat16, device=x.device)
     ext.gather(x, xg_t, sorted_ids, live, numel)
     inter_t = torch.empty((num_pid_m * 64 * 256 * 64,), dtype=torch.bfloat16, device=x.device)
