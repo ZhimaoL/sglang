@@ -1295,7 +1295,10 @@ class MuseSpark1xModel(nn.Module):
                 for moe_layer in moe_layers:
                     moe_layer.set_finalize_ar_workspace(self._finalize_ar_workspace)
         if layernorm_sp.layernorm_sp_enabled() and layernorm_sp.okc_hopper_sp():
-            logger.info("OKC SP prefill on Hopper: NCCL collectives, all-gathered experts.")
+            logger.info(
+                "OKC SP prefill on Hopper: %s participant linears, all-gathered experts.",
+                "symm-mem fused" if layernorm_sp.okc_hopper_sp_symm() else "NCCL",
+            )
         elif layernorm_sp.layernorm_sp_enabled():
             # Scope CUTLASS collectives to Muse; leave the generic Qwen SP
             # path unchanged. Decode never calls the SP participant hooks.

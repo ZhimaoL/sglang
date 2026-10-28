@@ -65,6 +65,7 @@ class _OkcHopperSP:
     Blackwell CUTLASS ones, and the MoE all-gathers its inputs instead of the A2A dispatcher."""
 
     active: bool = False
+    symm: bool = False
 
 
 _okc_hopper = _OkcHopperSP()
@@ -90,6 +91,10 @@ def okc_hopper_sp() -> bool:
     return _okc_hopper.active
 
 
+def okc_hopper_sp_symm() -> bool:
+    return _okc_hopper.symm
+
+
 def initialize_layernorm_sp(*, model_config) -> None:
     """Materialize ``flags.sp.enabled``; runs once per worker after distributed
     setup, alongside ``initialize_dp_attention``."""
@@ -98,6 +103,10 @@ def initialize_layernorm_sp(*, model_config) -> None:
     _okc_hopper.active = (
         not get_parallel().enable_layernorm_sp and _okc_hopper_sp_wanted(architecture)
     )
+    if _okc_hopper.active:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import SP_SYMM
+
+        _okc_hopper.symm = SP_SYMM and _HAS_TORCH_SYMM_MEM_FUSED
     get_flags().sp.enabled = bool(
         (get_parallel().enable_layernorm_sp or _okc_hopper.active)
         and architectures
@@ -230,7 +239,7 @@ def sp_fused_matmul_eligible(linear) -> bool:
     if (
         not (_HAS_TORCH_SYMM_MEM_FUSED or getattr(linear, "_sp_use_cutlass", False))
         or linear.bias is not None
-        or _okc_hopper.active
+        or (_okc_hopper.active and not _okc_hopper.symm)
     ):
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
