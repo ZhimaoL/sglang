@@ -658,9 +658,19 @@ __global__ void __launch_bounds__(1024) pg_rep_cut(const int* __restrict__ tab, 
     if (t < n_rep) ridx[tab[256 + t]] = t;
     __syncthreads();
     if (t < 256 && ridx[t] < 0) atomicAdd(&load[(tab[t] >> 8) & 7], cnt[t]);
-    if (t < n_rep) {
+    // inclusive scan of each replicated expert's block counts: one warp per row (lane = a run of consecutive blocks)
+    for (int j = t >> 5; j < n_rep; j += 32) {
+        const int lane = t & 31, per = (nb + 31) / 32, b0 = lane * per, b1 = min(nb, b0 + per);
+        int* row = bc + j * nb;
         int acc = 0;
-        for (int b = 0; b < nb; b++) { acc += bc[t * nb + b]; bc[t * nb + b] = acc; }
+        for (int b = b0; b < b1; b++) acc += row[b];
+        int incl = acc;
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, incl, o);
+            if (lane >= o) incl += v;
+        }
+        int run = incl - acc;
+        for (int b = b0; b < b1; b++) { run += row[b]; row[b] = run; }
     }
     __syncthreads();
     if (t == 0) {
