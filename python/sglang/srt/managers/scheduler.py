@@ -202,6 +202,7 @@ from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
+from sglang.srt.managers.ride_along import MODE_MERGED, MODE_OFF, RideAlong
 from sglang.srt.managers.small_prefill_first import SmallPrefillFirst
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -638,6 +639,9 @@ class Scheduler(
 
         # Init diffusion LLM
         self.init_diffusion_llm()
+
+        # Init ride-along verify (after chunked prefill and dLLM)
+        self.init_ride_along()
 
         self.init_metrics_reporter()
         self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
@@ -1330,6 +1334,37 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+
+    def init_ride_along(self):
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import RIDE_ALONG
+
+        # The ride-along path mirrors the overlap scheduler's spec-v2 forward of one
+        # TP group; every other topology keeps prefill and decode apart.
+        supported = (
+            self.enable_overlap
+            and self.spec_algorithm.is_dflash()
+            and not self.is_mixed_chunk
+            and get_parallel().pp_size == 1
+            and not get_parallel().attn_dp_enabled
+            and get_disagg().disaggregation_mode == "null"
+            and self.dllm_config is None
+            and not self.enable_hisparse
+            and not self.enable_unified_memory
+            and not get_exec().features.enable_return_routed_experts
+            and not get_exec().features.enable_return_indexer_topk
+            and self.model_worker.supports_ride_along()
+        )
+        self.ride_along = RideAlong(
+            mode=RIDE_ALONG if supported else MODE_OFF,
+            block_size=int(get_spec().speculative_num_draft_tokens or 0),
+            max_tokens=self.chunked_prefill_size,
+        )
+        if self.ride_along.enabled:
+            logger.info(
+                "Ride-along verify on (mode %d): running requests verify inside "
+                "prefill forwards.",
+                self.ride_along.mode,
+            )
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -3772,6 +3807,13 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            if self.ride_along.should_ride(new_batch, running_batch):
+                # The running batch verifies inside this prefill's forward instead of
+                # waiting for it: prepare its decode step as a decode iteration would.
+                running_batch = self.update_running_batch(running_batch)
+                if not running_batch.is_empty():
+                    new_batch.ride_along_batch = running_batch
+                    self.ride_along.note_ride(running_batch.batch_size())
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
@@ -3945,7 +3987,11 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            (
+                running_bs
+                if self.is_mixed_chunk
+                else self.ride_along.reserve_tokens(running_batch, chunked_prefill_size)
+            ),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -4317,7 +4363,9 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def record_batch_in_overlap(self, batch: ScheduleBatch):
+    def record_batch_in_overlap(
+        self, batch: ScheduleBatch, *, same_slot: bool = False
+    ):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
         # NOTE: - for all future tensors, we shall always read from future map
@@ -4327,13 +4375,20 @@ class Scheduler(
         attr_snapshot = [
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
+        if same_slot:
+            # A second batch of the same forward (ride-along) joins this iteration's
+            # slot; advancing the ring would release the previous iteration's early.
+            self.batch_record_buf[self.batch_record_ct].extend([batch, attr_snapshot])
+            return
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
     @contextmanager
-    def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
+    def _forward_isolation(
+        self, batch: ScheduleBatch, *, overlap: bool, same_record_slot: bool = False
+    ):
         """Make SB transactional across one forward (overlap and non-overlap).
 
         1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
@@ -4365,7 +4420,7 @@ class Scheduler(
 
         # 3. pin for 2-iter tensor lifetime (overlap path only)
         if overlap:
-            self.record_batch_in_overlap(batch)
+            self.record_batch_in_overlap(batch, same_slot=same_record_slot)
 
         try:
             yield
@@ -4417,6 +4472,8 @@ class Scheduler(
                 self.maybe_send_cached_prefix_chunk(req)
 
         # Run forward
+        if batch.ride_along_batch is not None:
+            return self._run_ride_along_batch(batch)
         if self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
@@ -4688,6 +4745,63 @@ class Scheduler(
 
         return ret
 
+    def _run_ride_along_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        """run_batch's overlap path for a prefill batch and the decode batch riding
+        along in its forward (managers/ride_along.py): both resolve, publish, relay and
+        copy out exactly as they would alone; the decode result rides on the prefill
+        one."""
+        ride = batch.ride_along_batch
+        batch.ride_along_batch = None
+        ride.forward_iter, ride.launch_ts = batch.forward_iter, batch.launch_ts
+        batches = (batch, ride)
+        for b in batches:
+            self.future_map.resolve_seq_lens_cpu(b)
+        with self.forward_stream_ctx:
+            self.forward_stream.wait_stream(self.schedule_stream)
+            for b in batches:
+                resolve_forward_inputs(b, self.future_map)
+            with self._forward_isolation(batch, overlap=True), self._forward_isolation(
+                ride, overlap=True, same_record_slot=True
+            ):
+                future_indices = [b.req_pool_indices for b in batches]
+                results = self.model_worker.forward_ride_along(
+                    batch,
+                    ride,
+                    merged=self.ride_along.mode == MODE_MERGED,
+                    on_publish_prefill=partial(
+                        self.future_map.publish, future_indices[0]
+                    ),
+                    on_publish_decode=partial(
+                        self.future_map.publish, future_indices[1]
+                    ),
+                )
+                for b, indices, result in zip(batches, future_indices, results):
+                    if result.extra_keep_alive_refs:
+                        self.batch_record_buf[self.batch_record_ct].extend(
+                            result.extra_keep_alive_refs
+                        )
+                    result.copy_done = self.device_module.Event()
+                    self._relay_forward_payload(b, indices, result)
+                if not _is_hip:
+                    self.copy_stream.wait_stream(self.forward_stream)
+                with self.copy_stream_ctx if not _is_hip else nullcontext():
+                    for b, result in zip(batches, results):
+                        result.copy_to_cpu(
+                            return_logprob=b.return_logprob,
+                            return_hidden_states=b.return_hidden_states,
+                        )
+        for b, indices, result in zip(batches, future_indices, results):
+            b.input_ids = None
+            b.spec_info = result.next_draft_input
+            b.spec_info.future_dsa_topk_indices_available = (
+                b.spec_info.dsa_topk_indices is not None
+            )
+            b.spec_info.future_indices = indices
+        prefill_result, decode_result = results
+        prefill_result.ride_along = (ride.copy(), decode_result)
+        self._maybe_report_active_ranks()
+        return prefill_result
+
     def _maybe_report_active_ranks(self) -> None:
         if not (self.attn_dp_enabled and get_exec().moe.elastic_ep_backend is not None):
             return
@@ -4806,6 +4920,11 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if isinstance(result, GenerationBatchResult) and result.ride_along is not None:
+            # A decode step that ran inside this prefill's forward: its result first.
+            ride_batch, ride_result = result.ride_along
+            result.ride_along = None
+            self.process_batch_result(ride_batch, ride_result)
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)

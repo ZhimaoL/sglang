@@ -62,8 +62,14 @@ GEMM_AG_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_MAX_TOKENS", "128"))
 SP_SYMM = _flag("OKC_SP_SYMM", "1")
 SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
 
+# The running batch's DFLASH verify rides along in prefill / extend forwards (srt/managers/ride_along.py): its 8-row
+# blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
+# "1" one merged forward, "2" diagnostic (same scheduling, the two ordinary forwards back to back).
+RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
+
 ANY_ATTN = SW_ATTN or SW_FS
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS",
            "SW_ATTN", "SW_FS", "SW_PROJ", "SW_PROJ_MMA", "SW_ROUTER", "SW_ATTN_V3", "SW_ATTN_ACC16",
-           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "ANY_ATTN"]
+           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "RIDE_ALONG",
+           "ANY_ATTN"]
