@@ -30,6 +30,7 @@ import torch
 from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     PFMHA_EXACT,
     PFMHA_MIN_TOKENS,
+    PFMHA_PREFETCH,
     PFMHA_RAGGED,
     PFMHA_RAGGED_MAX_BS,
     PFMHA_SLIDING,
@@ -51,6 +52,10 @@ _FIRED = set()
 _SCALES = {}
 _DEFER = (0, 0)
 _DEFERRED = None  # (output, blocks, run)
+# PFMHA_PREFETCH state: the side stream, two persistent stage-image slots, the one pending prefetch (the next full
+# layer's prefix blocks), the learned order of full layers (layer id -> next full layer id of the same forward) and
+# the last full call (layer id, forward batch).
+_PF = {"stream": None, "bufs": [None, None], "pending": None, "next": {}, "last": None}
 
 
 @contextlib.contextmanager
@@ -195,9 +200,10 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     q8 = q.contiguous().view(torch.uint8).view(tokens, HQ * D)
     kc = key_cache.view(torch.uint8)
     vc = value_cache.view(torch.uint8)
+    pf = (layer.layer_id, forward_batch, backend) if PFMHA_PREFETCH and bs == 1 and not win else None
     for i, (off, L, max_len) in enumerate(reqs):
         nc, split = _one(ext, q8[off:off + L], kc, vc, page_table[i:i + 1], cache_seqlens[i:i + 1], L, max_len,
-                         win, ks, vs, smqk, o[off:off + L], device, R)
+                         win, ks, vs, smqk, o[off:off + L], device, R, pf)
     HITS["fmha"] += 1
     HITS["fmha_tokens"] += tokens
     _log_once("prefill_fmha" + ("_swa" if win else "") + ("_ragged" if bs > 1 else ""),
@@ -207,22 +213,22 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     return o
 
 
-def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device, R=0):
+def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device, R=0, pf=None):
     """One request: gather its keys into stage images, then fmha7 (+ combine), or with R the deferred R-row blocks.
-    Returns (nc, split)."""
+    pf = (layer id, forward batch, backend): a full layer of a one-request call (PFMHA_PREFETCH). Returns (nc, split)."""
     global _DEFERRED
     cap = ((min(win - 1 + L, max_len) if win else max_len) + 255) & ~255
     capblks = cap // 128
-    kvt = torch.empty((2 * capblks, 16384), dtype=torch.uint8, device=device)
     if win:
+        kvt = torch.empty((2 * capblks, 16384), dtype=torch.uint8, device=device)
         seq = cache_seqlens - L  # the request's cached prefix, on device
         lens = torch.empty_like(cache_seqlens)
-        ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, seq, lens, page_table.stride(0), 0, capblks, 1, L, win)
+        ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, seq, lens, page_table.stride(0), 0, capblks, 1, L, win,
+                    0, 0)
         ntf = min(capblks, (win + 23) // 128 + 2)
     else:
         lens = cache_seqlens
-        none = cache_seqlens[:0]
-        ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, none, none, page_table.stride(0), 0, capblks, 1, L, 0)
+        kvt = _full_images(ext, kc, vc, page_table, cache_seqlens, L, max_len, capblks, device, pf)
         ntf = capblks
     nc, split = pick_cfg(L, ntf)
     if R and R % (8 * nc) == 0:
@@ -236,6 +242,62 @@ def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, sm
     else:
         _attend(ext, q8, kvt, o, lens, ks, vs, smqk, L, capblks, win, nc, split, device)
     return nc, split
+
+
+def _full_images(ext, kc, vc, page_table, cache_seqlens, L, max_len, capblks, device, pf):
+    """A full layer's stage images [2 * capblks, 16 KB]. With pf, blocks [0, old) (prefix rows only) may already be
+    staged in a slot by the previous full layer's call on _PF's side stream: this call then gathers only blocks
+    [old, capblks) (its new rows, after its KV store), and stages the next full layer's prefix blocks into the other
+    slot beside this layer's fmha7. The side stream starts after everything this stream has queued so far (so after
+    the fmha7 that last read that slot) and takes the next layer's K / V buffers in its own context (a HiCache
+    layer-wise load then gates that stream, not this one)."""
+    none = cache_seqlens[:0]
+    stride = page_table.stride(0)
+    old = (max_len - L) >> 7
+    if pf is None:
+        kvt = torch.empty((2 * capblks, 16384), dtype=torch.uint8, device=device)
+        ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, none, none, stride, 0, capblks, 1, L, 0, 0, 0)
+        return kvt
+    lid, fb, backend = pf
+    key = (max_len, L, capblks, page_table.data_ptr(), stride, cache_seqlens.data_ptr())
+    ent, _PF["pending"] = _PF["pending"], None
+    main = torch.cuda.current_stream()
+    slot = None
+    if ent is not None and ent["layer"] == lid and ent["fb"] is fb and ent["key"] == key:
+        slot = ent["slot"]
+        kvt = _PF["bufs"][slot][: 2 * capblks]
+        main.wait_event(ent["done"])
+        ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, none, none, stride, 0, capblks, 1, L, 0, old, 0)
+    else:
+        if ent is not None:   # an unused prefetch: order its slot's later reuse after its writes
+            main.wait_event(ent["done"])
+        kvt = torch.empty((2 * capblks, 16384), dtype=torch.uint8, device=device)
+        ext.gatherp(kc, vc, kvt, page_table, cache_seqlens, none, none, stride, 0, capblks, 1, L, 0, 0, 0)
+    last = _PF["last"]
+    if last is not None and last[1] is fb and last[0] != lid:
+        _PF["next"][last[0]] = lid
+    _PF["last"] = (lid, fb)
+    nxt = _PF["next"].get(lid)
+    if nxt is None or old <= 0:
+        return kvt
+    ns = 1 - slot if slot is not None else 0
+    buf = _PF["bufs"][ns]
+    if buf is None or buf.shape[0] < 2 * capblks:
+        buf = _PF["bufs"][ns] = torch.empty((2 * capblks, 16384), dtype=torch.uint8, device=device)
+    side = _PF["stream"]
+    if side is None or side.device != main.device:
+        side = _PF["stream"] = torch.cuda.Stream(device=main.device)
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        k2, v2 = backend.token_to_kv_pool.get_kv_buffer(nxt)
+        if not (k2.is_contiguous() and v2.is_contiguous() and k2.element_size() == 1 and v2.element_size() == 1):
+            return kvt
+        ext.gatherp(k2.view(torch.uint8), v2.view(torch.uint8), buf[: 2 * capblks], page_table, cache_seqlens, none,
+                    none, stride, 0, capblks, 1, L, 0, 0, old)
+        done = torch.cuda.Event()
+        done.record(side)
+    _PF["pending"] = {"layer": nxt, "fb": fb, "key": key, "slot": ns, "done": done}
+    return kvt
 
 
 def _attend(ext, q8, kvt, o, lens, ks, vs, smqk, L, capblks, win, nc, split, device):

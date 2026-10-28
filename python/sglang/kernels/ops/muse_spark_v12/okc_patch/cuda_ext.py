@@ -210,7 +210,7 @@ void fmha4n_split(torch::Tensor q, torch::Tensor kvt, torch::Tensor out, torch::
 void combine(torch::Tensor po, torch::Tensor pml, torch::Tensor out, int64_t rows, int64_t S);
 void gatherp(torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor kvt, torch::Tensor page_table,
              torch::Tensor lens, torch::Tensor seq, torch::Tensor lens_out, int64_t pt_stride, int64_t pagelog,
-             int64_t capblks, int64_t B, int64_t L, int64_t win);
+             int64_t capblks, int64_t B, int64_t L, int64_t win, int64_t blk0, int64_t blk1);
 """
 
 

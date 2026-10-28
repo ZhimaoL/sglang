@@ -1182,16 +1182,16 @@ DINL int pi_lane(int lam) {
     return (lam & 1) | (((lam >> 2) & 3) << 1) | (((lam >> 1) & 1) << 3) | (lam & 16);
 }
 
-// skw::gather_kp, verbatim
+// skw::gather_kp, verbatim but for the block range (blk0)
 __global__ void __launch_bounds__(256) gather_kp(
     const unsigned char* __restrict__ kc, const unsigned char* __restrict__ vc,
     unsigned char* __restrict__ kvt,
     const int* __restrict__ pt, const int* __restrict__ lens, const int* __restrict__ seq,
-    int* __restrict__ lens_out, int pt_stride, int pagelog, int capblks, int L, int win)
+    int* __restrict__ lens_out, int pt_stride, int pagelog, int capblks, int L, int win, int blk0)
 {
     __shared__ __align__(16) unsigned char sv[128 * 68];
     const int b = blockIdx.y >> 1, kvh = blockIdx.y & 1;
-    const int blk = blockIdx.x;
+    const int blk = blk0 + (int)blockIdx.x;
     const int len = lens[b];
     const int kst = seq ? max(seq[b] - (win - 1), 0) : 0;
     const bool old_blk = kst + (blk << 7) + 127 < len - L;
@@ -1291,14 +1291,17 @@ void combine(torch::Tensor po, torch::Tensor pml, torch::Tensor out, int64_t row
 
 void gatherp(torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor kvt, torch::Tensor page_table,
              torch::Tensor lens, torch::Tensor seq, torch::Tensor lens_out, int64_t pt_stride, int64_t pagelog,
-             int64_t capblks, int64_t B, int64_t L, int64_t win) {
-    pfg::gather_kp<<<dim3((unsigned)capblks, (unsigned)(B * 2)), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+             int64_t capblks, int64_t B, int64_t L, int64_t win, int64_t blk0, int64_t blk1) {
+    // blocks [blk0, blk1) of every (request, kv head) image; blk1 <= 0 = capblks
+    const int nb = (int)((blk1 > 0 ? blk1 : capblks) - blk0);
+    if (nb <= 0) return;
+    pfg::gather_kp<<<dim3((unsigned)nb, (unsigned)(B * 2)), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const unsigned char*>(k_cache.data_ptr()),
         reinterpret_cast<const unsigned char*>(v_cache.data_ptr()),
         reinterpret_cast<unsigned char*>(kvt.data_ptr()),
         (const int*)page_table.data_ptr<int>(), (const int*)lens.data_ptr<int>(),
         seq.numel() ? (const int*)seq.data_ptr<int>() : (const int*)nullptr,
         lens_out.numel() ? lens_out.data_ptr<int>() : (int*)nullptr,
-        (int)pt_stride, (int)pagelog, (int)capblks, (int)L, (int)win);
+        (int)pt_stride, (int)pagelog, (int)capblks, (int)L, (int)win, (int)blk0);
 }
 """
