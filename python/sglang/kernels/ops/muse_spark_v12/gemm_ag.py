@@ -45,19 +45,6 @@ def _jit_module(n: int, world_size: int) -> Module:
     )
 
 
-@cache_once
-def _jit_norm_module(n: int, world_size: int) -> Module:
-    """OKC: the gather with the pre-expert RMSNorm fused (all_gather.cuh kNorm)."""
-    args = make_cpp_args(n, world_size, is_arch_support_pdl())
-    return load_jit(
-        "muse_spark_v12_all_gather_norm",
-        *args,
-        cuda_files=["muse_spark_v12/all_gather.cuh"],
-        cuda_wrappers=[("run", f"MuseSparkAllGatherNorm<{args}>::run")],
-        extra_cuda_cflags=["-O3"],
-    )
-
-
 def large_m_capable(
     device=None, num_tokens: Optional[int] = None, max_tokens: Optional[int] = None
 ) -> bool:
@@ -142,10 +129,12 @@ def all_gather(
     out: torch.Tensor,
     b: Optional[torch.Tensor] = None,
     c: Optional[torch.Tensor] = None,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 0.0,
 ) -> torch.Tensor:
-    """``out[:, rank slice] = local`` gathered from every rank, (+ b) (+ c)."""
+    """``out[:, rank slice] = local`` gathered from every rank, (+ b) (+ c); OKC: RMSNorm-ed with ``norm_weight``."""
     _jit_module(out.shape[1], comm.world_size).run(
-        comm.obj, local.contiguous(), b, c, out
+        comm.obj, local.contiguous(), b, c, out, norm_weight, norm_eps
     )
     return out
 
@@ -176,8 +165,5 @@ def gemm_ag(
     local = gemm_local(comm, x, weight)
     if out is None:
         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
-    if norm_weight is not None:
-        _jit_norm_module(out.shape[1], comm.world_size).run(comm.obj, local.contiguous(), norm_weight, norm_eps, out)
-        return out
-    return all_gather(comm, local, out, b, c)
+    return all_gather(comm, local, out, b, c, norm_weight, norm_eps)
 
