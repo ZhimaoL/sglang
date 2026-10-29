@@ -1252,8 +1252,8 @@ __global__ void __launch_bounds__(256) gather_kp(
 #define PFMHA_OPT4 411043671LL   // nc 4, all-MUFU exp2
 #define PFMHA_OPT3 201328471LL   // nc 3, all-MUFU exp2
 #else
-#define PFMHA_OPT4 4706009687LL
-#define PFMHA_OPT3 4496294487LL
+#define PFMHA_OPT4 4706010455LL
+#define PFMHA_OPT3 4496294999LL
 #endif
 static void pg_fmha4(torch::Tensor q, torch::Tensor kvt, torch::Tensor out, torch::Tensor po, torch::Tensor pml,
                      torch::Tensor lens, torch::Tensor k_scale, torch::Tensor v_scale, double smqk_log2e,
