@@ -1471,6 +1471,23 @@ def _install_pre_attn_norm(
     )
 
 
+def _okc_exit_aux(aux_hidden_states, num_tokens: int, project) -> torch.Tensor:
+    """The DFLASH taps' SP exit: pack while sequence-sharded (so the logits processor does not duplicate the full
+    replicated draft context with torch.cat), the draft's fc + hidden_norm on this shard (OKC_SW_DFLASH_FC_SP: the
+    gather then moves [N, hidden] rather than [N, taps * hidden]), then the all-gather back to token order, narrowed
+    to num_tokens (drops the entry-scatter padding). Runs in the outer forward's eager tail, or inside the captured
+    body with OKC_SW_EXIT_IN_BODY (court C23: the eager tail is host-exposed at the end of a ~1K extend)."""
+    aux_hidden_states = pack_aux_hidden_states(aux_hidden_states)
+    if project is not None:
+        projected = project(aux_hidden_states)
+        if projected is not None:
+            aux_hidden_states = projected
+    return layernorm_sp.sp_exit_gather(aux_hidden_states, num_tokens=num_tokens)
+
+
+_okc_exit_check = [0, 0]  # OKC_EXIT_IN_BODY_CHECK: forwards compared, mismatches
+
+
 class MuseSpark1xModel(nn.Module):
     def __init__(
         self,
@@ -1641,8 +1658,9 @@ class MuseSpark1xModel(nn.Module):
         )
         if input_embeds is None and self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
+        num_tokens = hidden_states.shape[0]
         sp_active = layernorm_sp.runs_sp(
-            forward_batch.forward_mode, num_tokens=hidden_states.shape[0]
+            forward_batch.forward_mode, num_tokens=num_tokens
         )
         get_forward().set("sp_active", sp_active)
         if sp_active:
@@ -1662,6 +1680,14 @@ class MuseSpark1xModel(nn.Module):
             norm_input = stream.to(self.operator_dtype)
             hidden_states = self.norm(norm_input).to(self.operator_dtype)
         if aux_hidden_states:
+            if sp_active and okc_patch.SW_EXIT_IN_BODY:
+                # OKC: the taps' SP exit (fc on the shard + norm + all-gather) inside the prefill graph's last segment;
+                # static per token bucket. The outer forward takes the gathered tensor (same predicate, same count).
+                lm = getattr(self, "_okc_lm", None)
+                exited = _okc_exit_aux(aux_hidden_states, num_tokens, getattr(lm, "_okc_aux_project", None))
+                if okc_patch.EXIT_IN_BODY_CHECK:
+                    return hidden_states, exited, aux_hidden_states
+                return hidden_states, exited
             return hidden_states, aux_hidden_states
         return hidden_states
 
@@ -1710,6 +1736,8 @@ class MuseSpark1xForCausalLM(nn.Module):
         self.nvfp4_checkpoint = quant_name == "modelopt_fp4"
         self.int4_checkpoint = int4_checkpoint
         self.model = MuseSparkModel(config, quant_config, add_prefix("model", prefix))
+        # The captured body reads the DFlash worker's _okc_aux_project through this (not a submodule).
+        object.__setattr__(self.model.language_model, "_okc_lm", self)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -1745,34 +1773,23 @@ class MuseSpark1xForCausalLM(nn.Module):
             input_ids, positions, forward_batch, input_embeds=input_embeds
         )
         aux_hidden_states = None
+        okc_raw_aux = None
         if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+            hidden_states, aux_hidden_states, *okc_raw_aux = hidden_states
+        num_tokens = input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
         if aux_hidden_states is not None and layernorm_sp.runs_sp(
-            forward_batch.forward_mode,
-            num_tokens=(
-                input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-            ),
+            forward_batch.forward_mode, num_tokens=num_tokens
         ):
             # DFLASH consumes every prompt token in replicated token order.
             # Gather the taps before logits pruning applies full-token indices;
             # FULL capture also needs the entry-scatter padding removed.
-            num_tokens = (
-                input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-            )
-            # Pack while sequence-sharded so the logits processor does not
-            # duplicate the full replicated draft context with torch.cat.
-            # Release the tap list before allocating the gathered output.
-            aux_hidden_states = pack_aux_hidden_states(aux_hidden_states)
-            # OKC: the draft's fc + hidden_norm (row-wise) on this shard, so the gather moves [N, hidden] rather than
-            # [N, taps * hidden] and no rank projects the whole chunk (OKC_SW_DFLASH_FC_SP; set by the DFlash worker).
+            # With OKC_SW_EXIT_IN_BODY the body returns the exited taps as one tensor (its own tap list otherwise), so
+            # the shape of the body output, not a recomputed SP verdict, says which side ran the exit.
             okc_project = getattr(self, "_okc_aux_project", None)
-            if okc_project is not None:
-                projected = okc_project(aux_hidden_states)
-                if projected is not None:
-                    aux_hidden_states = projected
-            aux_hidden_states = layernorm_sp.sp_exit_gather(
-                aux_hidden_states, num_tokens=num_tokens
-            )
+            if not (okc_patch.SW_EXIT_IN_BODY and torch.is_tensor(aux_hidden_states)):
+                aux_hidden_states = _okc_exit_aux(aux_hidden_states, num_tokens, okc_project)
+            elif okc_raw_aux:
+                self._okc_check_exit(_okc_exit_aux(okc_raw_aux[0], num_tokens, okc_project), aux_hidden_states)
         # Omni prefill calls the language model with materialized embeddings and
         # ``input_ids=None``. The generic logits processor cannot infer the full
         # token count in that form, so close the SP region here using the
@@ -1791,6 +1808,17 @@ class MuseSpark1xForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+    @staticmethod
+    def _okc_check_exit(eager: torch.Tensor, in_body: torch.Tensor) -> None:
+        """OKC_EXIT_IN_BODY_CHECK (diagnostic, syncs): the in-body exit must equal the eager one bit for bit."""
+        _okc_exit_check[0] += 1
+        if not (eager.shape == in_body.shape and torch.equal(eager, in_body)):
+            _okc_exit_check[1] += 1
+            logger.warning("OKC exit-in-body check: MISMATCH on tp rank %d (shape %s vs %s)", get_parallel().tp_rank,
+                           tuple(eager.shape), tuple(in_body.shape))
+        if _okc_exit_check[0] % 50 == 1 and get_parallel().tp_rank == 0:
+            logger.info("OKC exit-in-body check: %d forwards compared, %d mismatches.", *_okc_exit_check)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
         """Capture the residual stream after each listed decoder layer.

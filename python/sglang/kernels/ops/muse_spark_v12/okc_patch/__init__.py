@@ -213,6 +213,11 @@ SW_DFLASH_FC_SP_PIN = _flag("OKC_SW_DFLASH_FC_SP_PIN", "1")
 # Boot-time launch of every cuBLASLt variant the eager DFlash context GEMMs can pick (fc + fused KV materialization,
 # M = 1..max prefill tokens): a variant's first launch blocks the CPU until the GPU drains (court C21). Outputs unchanged.
 SW_WARM_GEMMS = _flag("OKC_SW_WARM_GEMMS", "1")
+# The DFlash taps' SP exit (shard fc + hidden_norm + all-gather) inside the prefill graph's captured body instead of
+# the eager tail after it (court C23). Bitwise the same ops; EXIT_IN_BODY_CHECK also runs the eager exit on the
+# body's raw taps and compares (diagnostic: syncs, logs "OKC exit-in-body check").
+SW_EXIT_IN_BODY = _flag("OKC_SW_EXIT_IN_BODY", "0")
+EXIT_IN_BODY_CHECK = _flag("OKC_EXIT_IN_BODY_CHECK", "0")
 # The same column split for the DFlash grouped convs' kernel_projection (replicated nn.Linear, 2 per draft layer, ~11 us
 # each per verify step); 8-GPU check (session SI vg-micro): slices bit-identical, [3072, 8192] 16.5 -> 10.4 us at m 8.
 SW_DFLASH_CONV_AG = _flag("OKC_SW_DFLASH_CONV_AG", "1")
@@ -309,7 +314,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_VFG_FULL1", "VP2_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_EXT_AG", "EXT_AG_MAX_BYTES", "SW_EXT_RS", "SP_CE_TP",
            "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
-           "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS",
+           "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS", "SW_EXIT_IN_BODY", "EXIT_IN_BODY_CHECK",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_HICACHE_WB_SPLIT", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
