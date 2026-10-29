@@ -21,12 +21,22 @@ _PLACEMENT_PATH = os.environ.get("OKC_MOE_PLACEMENT_FILE") or os.path.join(
 _REPLICA_PATH = os.environ.get("OKC_MOE_REPLICA_FILE") or os.path.join(
     os.path.dirname(__file__), "muse_spark_expert_replicas.json"
 )
+# OKC_MOE_HOMES=contiguous: stock homes (rank r holds experts [r * n, (r + 1) * n)) and a neutral initial replica plan
+# (rank q replicates the first R experts of rank q + 1), no fitted table at all; with OKC_MOE_ADAPTIVE_REPLICAS the
+# replica sets then come from the run's own counts (okc_patch/adaptive.py).
+_CONTIGUOUS = os.environ.get("OKC_MOE_HOMES", "") == "contiguous"
 
 
 @functools.cache
 def _placement() -> dict:
     with open(_PLACEMENT_PATH) as f:
         placement = json.load(f)
+    if _CONTIGUOUS:
+        n = placement["num_experts"] // placement["ep_size"]
+        placement["layers"] = {k: [list(range(r * n, (r + 1) * n)) for r in range(placement["ep_size"])]
+                               for k in placement.get("layers", placement.get("owner", {}))}
+        placement.pop("owner", None)
+        return placement
     if "owner" in placement:
         # Compact form: owner[layer][e] is the rank holding expert e, one digit per expert (ep_size <= 10). Expanded to
         # the list form, each rank's experts ascending, so every reader sees the same table either way.
@@ -70,6 +80,9 @@ def replica_plan(
         return None
     ranks = placement["layers"].get(str(layer_idx))
     layer = plan["replicas"].get(str(count), {}).get(str(layer_idx))
+    if _CONTIGUOUS and ranks is not None:
+        n = num_experts // ep_size
+        layer = " ".join(f"{((q + 1) % ep_size) * n + j}:{q}" for j in range(count) for q in range(ep_size))
     if ranks is None or layer is None:
         return None
     home = [-1] * num_experts
