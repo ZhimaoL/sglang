@@ -333,10 +333,6 @@ def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.small_prefill_first is None and cfg.attn_dp_size == 1:
         overrides["small_prefill_first"] = True
         logger.info("Prefill small requests first for Muse Spark")
-    # Mid-chunk admission stays off: measured at c4 it costs more than it saves (the capped chunk needs
-    # more chunks, and the decode steps after each small prefill delay every first turn by ~0.3 s).
-    if cfg.mid_chunk_prefill_admission is None and cfg.attn_dp_size == 1:
-        overrides["mid_chunk_prefill_admission"] = False
     if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
         # NaViT shards over the full TP group only, so attention TP narrower
         # than TP needs the replicated (data-parallel) encoder.
