@@ -194,7 +194,7 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
         if _sw.SW_PG_SMALL and small:
             name = "small"
         elif (_sw.PG_ROUTE and tokens * layer.top_k <= pg_moe.ROUTE_MAX_ROUTES and layer.num_local_experts <= 64
-              and _rep_mode(layer, tokens) is None):
+              and _rep_mode(layer, tokens) in ((None, "extend") if _sw.PG_ROUTE_REPX else (None,))):
             name = "route"
         elif _sw.PG_LOCAL_ALIGN and tokens >= _sw.PG_LOCAL_ALIGN_MIN_TOKENS and layer.num_local_experts <= 64:
             name = "local"
@@ -352,10 +352,13 @@ def local_routes(layer, topk_ids):
 
 def _small_map(layer, topk_ids):
     """(expert map, rep) for grouped_pg_small: with replicas at verify size and OKC_PG_ROUTE_REP_FOLD, pg_route runs the
-    balancer itself (rep = (table, rank); no pg_rep_assign launch), else route_map's map."""
+    balancer itself (rep = (table, rank); no pg_rep_assign launch); at extend size with OKC_PG_ROUTE_REPX the extend
+    balancer (rank + 8; no rep_align chain); else route_map's map."""
     rep_table = getattr(layer, "_okc_rep_table", None)
     if _sw.PG_ROUTE_REP_FOLD and rep_table is not None and topk_ids.shape[0] <= _sw.MOE_REP_MAX_TOKENS:
         return None, (rep_table, layer.replica_plan["me"])
+    if _sw.PG_ROUTE_REPX and _rep_mode(layer, topk_ids.shape[0]) == "extend":
+        return None, (rep_table, layer.replica_plan["me"] + 8)   # + 8: the extend balancer
     return route_map(layer, topk_ids), None
 
 

@@ -234,7 +234,7 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     pg_gather_norm applies the norm (F.rms_norm's exact fp32 sequence) while it builds the token images.
     bm = 128 runs the narrow build's front end and kernels (block_m(T)). norm_weight None: x is already normed
     (pg_gather; extends up to ROUTE_MAX_ROUTES). rep = (replica table, rank): pg_route runs the replica balancer itself
-    (pg_rep_assign's decision) and expert_map is not read.
+    (pg_rep_assign's decision; rank + 8: the extend balancer, align_local's with a table) and expert_map is not read.
     -> (y [T*8, 4096] bf16 as grouped_pg, local_ids [T, 8] int32: the finalize's slot expert ids)."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8

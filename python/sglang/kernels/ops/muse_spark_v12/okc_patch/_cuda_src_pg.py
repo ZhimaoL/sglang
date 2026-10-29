@@ -229,6 +229,56 @@ __global__ void __launch_bounds__(1024) pg_tiles(const int* __restrict__ block_e
 
 // the replica balancer (rep_owner, _cuda_src_rep.py, shared with st): pg_route and pg_rep_assign
 @@REP@@
+// Counts-in form of the replica balancer for extend-sized calls (rep_align_scan below; rep_owner is the verify / st form): cnt [256] this
+// call's routes per global expert, tabs [256] / ord [n_rep] the table (all shared). An active expert weighs (wmode)
+// 0: 1, 1: ceil(c / 8), 2: its pg cost in 1/8 SM-us (bm-token blocks of 64 + bm, a tail of 64 + its width class: bm 128
+// narrow 16 / 64 / 128, else 64 / 128 / 256); sort: replicated experts by count descending (ties: id ascending, as
+// pg_rep_cut), else the table order; each active one goes to the holder with the lower load (tie: home). Leaves
+// owner [256] (synced); load [8] / sord [256] shared scratch; loads are 32-bit.
+__device__ __forceinline__ int rep_cost(int c, int wmode, int bm) {
+    if (c <= 0) return 0;
+    if (wmode == 0) return 1;
+    if (wmode == 1) return (c + 7) >> 3;
+    const int full = c / bm, tail = c - full * bm;
+    const int tw = tail <= 0 ? 0 : bm == 128 ? (tail <= 16 ? 16 : tail <= 64 ? 64 : 128)
+                                             : (tail <= 64 ? 64 : tail <= 128 ? 128 : 256);
+    return full * (64 + bm) + (tail > 0 ? 64 + tw : 0);
+}
+
+__device__ __forceinline__ void rep_decide(const int* cnt, const int* tabs, const int* ord, int n_rep, int wmode,
+                                           int bm, int sort, int* owner, int* load, int* sord) {
+    const int t = threadIdx.x;
+    if (t < 256) owner[t] = (tabs[t] >> 8) & 7;
+    if (t < 8) load[t] = 0;
+    __syncthreads();
+    if (t < 256 && !((tabs[t] >> 11) & 1)) {
+        const int w = rep_cost(cnt[t], wmode, bm);
+        if (w) atomicAdd(&load[(tabs[t] >> 8) & 7], w);
+    }
+    __syncthreads();
+    if (t == 0) {
+        for (int j = 0; j < n_rep; j++) {
+            const int e = ord[j];
+            int k = j;
+            if (sort)
+                while (k > 0 && (cnt[sord[k - 1]] < cnt[e] || (cnt[sord[k - 1]] == cnt[e] && sord[k - 1] > e))) {
+                    sord[k] = sord[k - 1];
+                    k--;
+                }
+            sord[k] = e;
+        }
+        for (int j = 0; j < n_rep; j++) {
+            const int e = sord[j], c = cnt[e];
+            if (!c) continue;
+            const int v = tabs[e], h = (v >> 8) & 7, r = (v >> 12) & 7;
+            const int pick = load[r] < load[h] ? r : h;
+            owner[e] = pick;
+            load[pick] += rep_cost(c, wmode, bm);
+        }
+    }
+    __syncthreads();
+}
+
 // ------------------------------------------------------------------ routing front end (verify / decode / extends)
 // One CTA in place of topk_ids -> local ids (expert map), moe_align_block_size and pg_tiles, for numel <= RT_MAX
 // routes (up to 3072-token extends): local slot e < nl <= RT_E (32 home + replicas) gets ceil(count_e / XNT)
@@ -272,11 +322,23 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
     __syncwarp();
     pdl_wait();
     pdl_trigger();
-    if (rtab != nullptr) {   // the replica balancer here (rep_owner, pg_rep_assign's decision, passes 0): this call's map
-        rep_owner<2>(topk_ids, numel, rtab, n_rep, 0, r_tabs, r_cnt, r_own, r_ord, r_load);
+    if (rtab != nullptr) {   // the replica balancer here: this call's map
+        if (me >= 8) {       // me + 8: the extend balancer (rep_align_scan's decision: pg cost weights, count order)
+            if (tid < 256) { r_tabs[tid] = rtab[tid]; r_cnt[tid] = 0; }
+            if (tid < n_rep) r_ord[tid] = rtab[256 + tid];
+            __syncthreads();
+            for (int i = tid; i < numel; i += 1024) {
+                const int g = topk_ids[i];
+                if ((unsigned)g < 256u) atomicAdd(&r_cnt[g], 1);
+            }
+            __syncthreads();
+            rep_decide(r_cnt, r_tabs, r_ord, n_rep, 2, XNT, 1, r_own, r_load, r_map);   // r_map: its sort scratch
+        } else {             // rep_owner, pg_rep_assign's decision, passes 0
+            rep_owner<2>(topk_ids, numel, rtab, n_rep, 0, r_tabs, r_cnt, r_own, r_ord, r_load);
+        }
         if (tid < 256) {
             const int v = r_tabs[tid];
-            r_map[tid] = (r_own[tid] == me && (v & 0xFF) != 0xFF) ? (v & 0xFF) : -1;
+            r_map[tid] = (r_own[tid] == (me & 7) && (v & 0xFF) != 0xFF) ? (v & 0xFF) : -1;
         }
         __syncthreads();
     }
@@ -1232,56 +1294,6 @@ __global__ void __launch_bounds__(512) pg_ag_rows(const uint4* __restrict__ x, c
     __syncthreads();
     if (tx == 0) counter[bx] = phase ^ 1;
 }
-// Counts-in form of the replica balancer for extend-sized calls (rep_align_scan below; rep_owner is the verify / st form): cnt [256] this
-// call's routes per global expert, tabs [256] / ord [n_rep] the table (all shared). An active expert weighs (wmode)
-// 0: 1, 1: ceil(c / 8), 2: its pg cost in 1/8 SM-us (bm-token blocks of 64 + bm, a tail of 64 + its width class: bm 128
-// narrow 16 / 64 / 128, else 64 / 128 / 256); sort: replicated experts by count descending (ties: id ascending, as
-// pg_rep_cut), else the table order; each active one goes to the holder with the lower load (tie: home). Leaves
-// owner [256] (synced); load [8] / sord [256] shared scratch; loads are 32-bit.
-__device__ __forceinline__ int rep_cost(int c, int wmode, int bm) {
-    if (c <= 0) return 0;
-    if (wmode == 0) return 1;
-    if (wmode == 1) return (c + 7) >> 3;
-    const int full = c / bm, tail = c - full * bm;
-    const int tw = tail <= 0 ? 0 : bm == 128 ? (tail <= 16 ? 16 : tail <= 64 ? 64 : 128)
-                                             : (tail <= 64 ? 64 : tail <= 128 ? 128 : 256);
-    return full * (64 + bm) + (tail > 0 ? 64 + tw : 0);
-}
-
-__device__ __forceinline__ void rep_decide(const int* cnt, const int* tabs, const int* ord, int n_rep, int wmode,
-                                           int bm, int sort, int* owner, int* load, int* sord) {
-    const int t = threadIdx.x;
-    if (t < 256) owner[t] = (tabs[t] >> 8) & 7;
-    if (t < 8) load[t] = 0;
-    __syncthreads();
-    if (t < 256 && !((tabs[t] >> 11) & 1)) {
-        const int w = rep_cost(cnt[t], wmode, bm);
-        if (w) atomicAdd(&load[(tabs[t] >> 8) & 7], w);
-    }
-    __syncthreads();
-    if (t == 0) {
-        for (int j = 0; j < n_rep; j++) {
-            const int e = ord[j];
-            int k = j;
-            if (sort)
-                while (k > 0 && (cnt[sord[k - 1]] < cnt[e] || (cnt[sord[k - 1]] == cnt[e] && sord[k - 1] > e))) {
-                    sord[k] = sord[k - 1];
-                    k--;
-                }
-            sord[k] = e;
-        }
-        for (int j = 0; j < n_rep; j++) {
-            const int e = sord[j], c = cnt[e];
-            if (!c) continue;
-            const int v = tabs[e], h = (v >> 8) & 7, r = (v >> 12) & 7;
-            const int pick = load[r] < load[h] ? r : h;
-            owner[e] = pick;
-            load[pick] += rep_cost(c, wmode, bm);
-        }
-    }
-    __syncthreads();
-}
-
 // Extend-sized calls with replicas (above OKC_MOE_REP_MAX_TOKENS, below the split): align_local's three kernels with
 // the balancer inside the scan, from this call's per-expert counts: count the routes per global expert -> one CTA:
 // rep_decide (pg cost weights, count order) -> this call's [256] global -> slot map, the slot counts and the scan ->
@@ -1466,7 +1478,8 @@ void gather(torch::Tensor x, torch::Tensor xg, torch::Tensor sorted_ids, torch::
 // small-T front end: topk_ids [T, 8] int32 (global ids), emap [n_global] int32 global -> local (-1 = remote) or
 // an empty tensor (ids already local); outputs local_ids [T * 8], sorted_ids [nb_max * 256], block_experts
 // [nb_max], live [nb_max + 1] with nb_max = 32 + ceil(numel / 256). rtab non-empty (a replica table): the balancer
-// runs in the kernel (rep_owner, as pg_rep_assign) and emap is not read; me = this rank.
+// runs in the kernel (rep_owner, as pg_rep_assign) and emap is not read; me = this rank, or this rank + 8 for the
+// extend balancer (rep_align_scan's decision, as align with a table).
 void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor rtab, torch::Tensor local_ids,
            torch::Tensor sorted_ids, torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t n_global,
            int64_t nl, int64_t pdl, int64_t me) {
@@ -1477,7 +1490,7 @@ void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor rtab, torch
     const int* em = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
     const int* rt = rtab.numel() > 0 ? rtab.data_ptr<int>() : nullptr;
     TORCH_CHECK(!rt || (rtab.scalar_type() == at::kInt && rtab.numel() >= 256 && rtab.numel() <= 512 && me >= 0 &&
-                        me < 8), "pg route: replica table");
+                        me < 16), "pg route: replica table");
     pg_launch(pgk::pg_route, dim3(1), dim3(1024), 0, pdl != 0, topk_ids.data_ptr<int>(), em, (int)n_global,
 #ifdef PGN_WSET
               (int)numel, (int)PGN_WSET, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
