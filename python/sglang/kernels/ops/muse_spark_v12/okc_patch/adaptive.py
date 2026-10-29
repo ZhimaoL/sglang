@@ -5,8 +5,9 @@ decided from the run's OWN routing counts and refreshed between forwards.
 Counting (graph-safe, every rank in step): per pg layer with replicas, a verify counter [256] (route_k adds its picks
 when given it: T <= 256, rank 0 only) and a ring of the last ADAPT_RING prefill / extend forwards' counts [K, 256]
 (T > 256: every rank under SP, whose ids are its own shard's; rank 0 only otherwise), advanced by a device-side slot.
-Refresh (ModelRunner.forward entry, target worker, never while capturing): when ADAPT_FIRST_TOKENS (then
-ADAPT_EVERY_TOKENS) prefill tokens have been forwarded since the last one, every rank all-reduces the counters (so all
+Refresh (ModelRunner.forward entry, target worker, never while capturing): when ADAPT_FIRST_TOKENS prefill tokens and
+ADAPT_FIRST_VERIFY verify tokens (then ADAPT_EVERY_TOKENS prefill tokens) have been forwarded since the last one, every
+rank all-reduces the counters (so all
 hold the exact global counts), halves its verify counters, and decides its share of the layers (layer i on rank i %
 world) in a background process with decide() below: placement_joint's objective greedy on those counts (verify
 stragglers, prefill straggler, extend; homes fixed, R per rank, never on the home rank). Every ADAPT_CHECK forwards
@@ -294,6 +295,7 @@ class _State:
     def __init__(self):
         self.layers = None          # [(layer_idx, experts module)] with replicas, layer order
         self.tokens = 0             # prefill tokens forwarded since the last trigger
+        self.vtokens = 0            # verify tokens forwarded (host count; gates the first refresh)
         self.refreshes = 0
         self.pending = None         # AsyncResult of this rank's decisions
         self.fwd = 0
@@ -332,7 +334,9 @@ def maybe_refresh(model_runner, forward_batch):
     st = _S
     st.fwd += 1
     mode = forward_batch.forward_mode
-    if mode.is_extend() and not mode.is_target_verify():
+    if mode.is_target_verify():
+        st.vtokens += int(forward_batch.input_ids.numel())
+    elif mode.is_extend():
         n = getattr(forward_batch, "extend_num_tokens", None)
         st.tokens += int(n if n is not None else forward_batch.input_ids.numel())
     if st.layers is None:
@@ -340,8 +344,9 @@ def maybe_refresh(model_runner, forward_batch):
         if not st.layers:
             logger.info("OKC adaptive replicas: no pg layer with replicas; off.")
         else:
-            logger.info("OKC adaptive replicas on for %d layers (first after %d prefill tokens, then every %d).",
-                        len(st.layers), sw.ADAPT_FIRST_TOKENS, sw.ADAPT_EVERY_TOKENS)
+            logger.info("OKC adaptive replicas on for %d layers (first after %d prefill + %d verify tokens, then every "
+                        "%d prefill tokens).", len(st.layers), sw.ADAPT_FIRST_TOKENS, sw.ADAPT_FIRST_VERIFY,
+                        sw.ADAPT_EVERY_TOKENS)
     if not st.layers:
         return
     if not st.warm:   # NCCL's P2P connections between every pair, paid here (server warm-up), not at a refresh
@@ -350,7 +355,10 @@ def maybe_refresh(model_runner, forward_batch):
     if st.queue:
         _trickle(sw.ADAPT_TRICKLE)
     elif st.pending is None:
-        if st.tokens >= (sw.ADAPT_FIRST_TOKENS if st.refreshes == 0 else sw.ADAPT_EVERY_TOKENS):
+        if st.refreshes == 0:
+            if st.tokens >= sw.ADAPT_FIRST_TOKENS and st.vtokens >= sw.ADAPT_FIRST_VERIFY:
+                _trigger()
+        elif st.tokens >= sw.ADAPT_EVERY_TOKENS:
             _trigger()
     elif st.fwd % sw.ADAPT_CHECK == 0:
         _check()
