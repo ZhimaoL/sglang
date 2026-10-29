@@ -301,7 +301,13 @@ AR_TP8_GRAPH_2PUSH_MAX_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_2PUSH_MAX_BY
 # calls, ~15 ms before the next chunk or the first decode step launches; SI arm A trace). 1024: ~1 ms of CPU and the
 # copies at ~48 GB/s instead of ~19 (serving/tests/bench_staged_chunk.py), 17.6 MB of staging per rank taken before
 # KV sizing. Same bytes to host; "64" restores upstream.
-HICACHE_STAGING_PAGES = max(1, int(os.environ.get("OKC_HICACHE_STAGING_PAGES", "1024")))
+# HC-DRAIN (extend E40 / E42): a relayout kernel queued behind a DtoH copy on the write-through stream blocks a shared
+# hardware queue's head, and a push stream aliased to it (8 connections) waits for the whole burst (~8 ms, twice per
+# first turn). On: every staged call is one staging chunk (16384 pages: ~267 MiB of staging per rank, taken before KV
+# sizing) and its relayout runs on a second stream that waits only on the submission's ready event, so no kernel waits
+# on a copy. Same bytes to host.
+SW_HICACHE_WB_SPLIT = _flag("OKC_SW_HICACHE_WB_SPLIT", "0")
+HICACHE_STAGING_PAGES = max(1, int(os.environ.get("OKC_HICACHE_STAGING_PAGES", "16384" if SW_HICACHE_WB_SPLIT else "1024")))
 
 # DFLASH prefill -> verify hand-off without a host sync: the extend branch's extend / prefix lengths go to the device
 # from pinned memory (dflash_worker_v2.host_ints_to_device) instead of torch.tensor(..., device=cuda), whose pageable
@@ -345,7 +351,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
-           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_HICACHE_WB_SPLIT", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
            "SW_FU_MERGE", "FU_MERGE_PASSES", "FU_MERGE_MIN_LOAD", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
            "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "RS_ATTN_BLOCKS_FULL",
            "RS_ATTN_BLOCKS_PADDED",
