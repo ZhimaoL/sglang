@@ -47,9 +47,7 @@ struct Params {
   float eps;
 };
 
-// OKC kNorm: the gathered row's RMSNorm in torch's vectorized rms_norm order (128 lanes, an fma chain over bf16x4
-// vectors l + 128 j, shfl_down 16 .. 1, warps (0 + 2) + (1 + 3), / N, rsqrtf(. + eps)); the row is
-// bf16(gamma * (rstd * x)), the values F.rms_norm returns and st's norm fold rebuilds (_cuda_src_st rms_rstd).
+// OKC kNorm: rstd in torch's rms_norm order (st rms_rstd's); out = bf16(gamma * (rstd * x)) = F.rms_norm, bit for bit
 template <uint32_t N>
 __device__ __forceinline__ float okc_row_rstd(const bf16_t* row, float eps, float* s_w) {
   const uint32_t tx = threadIdx.x;
@@ -97,7 +95,7 @@ __global__ __launch_bounds__(kBlock) void all_gather_kernel(const __grid_constan
   using vec_t = AlignedVector<bf16x2_t, kVec / 2>;
   constexpr uint32_t kNLocal = N / kWorld;
   static_assert(N % kVec == 0 && kNLocal % kVec == 0, "a vector must never cross a rank block");
-  static_assert(!kNorm || (N == kBlock * kVec && !kHasB && !kHasC), "kNorm: one row per CTA pass, no b / c");
+  static_assert(!kNorm || (N == kBlock * kVec && !kHasB && !kHasC));
   __shared__ __align__(16) bf16_t s_row[kNorm ? N : 8];
   __shared__ float s_w[4];
   const auto bx = blockIdx.x;
@@ -148,12 +146,12 @@ __global__ __launch_bounds__(kBlock) void all_gather_kernel(const __grid_constan
       ptx::ld_relaxed_16B(raw, src, 0);
     } while ((raw.x & 0xffffu) == 0 || (raw.x >> 16) == 0 || (raw.y & 0xffffu) == 0 || (raw.y >> 16) == 0 ||
              (raw.z & 0xffffu) == 0 || (raw.z >> 16) == 0 || (raw.w & 0xffffu) == 0 || (raw.w >> 16) == 0);
-    if constexpr (kNorm) {   // the whole row is this CTA's (one vector per thread): stage it, then normalize
+    if constexpr (kNorm) {   // the row is this CTA's
       *reinterpret_cast<uint4*>(s_row + col) = raw;
       __syncthreads();
       const float rs = okc_row_rstd<N>(s_row, params.eps, s_w);
       okc_row_norm<N>(raw, params.gamma, col, rs);
-      __syncthreads();   // s_row / s_w are reused by the next row
+      __syncthreads();
     }
     const auto& gathered = *reinterpret_cast<const vec_t*>(&raw);
     vec_t out_vec;
@@ -185,7 +183,7 @@ struct MuseSparkAllGather {
   template <bool kHasB, bool kHasC>
   static constexpr auto kernel = muse_all_gather::all_gather_kernel<N, kWorld, kHasB, kHasC, kUsePDL>;
 
-  // OKC: gamma = the pre-expert RMSNorm weight [N] -> the gathered rows come out normed (kNorm; N 4096, no b / c)
+  // OKC: gamma -> rows RMSNorm-ed (kNorm)
   static void run(CommunicatorRef ref, TensorView local, std::optional<TensorView> b, std::optional<TensorView> c,
                   TensorView out, std::optional<TensorView> gamma, double eps) {
     using namespace host;
@@ -227,12 +225,12 @@ struct MuseSparkAllGather {
         b.has_value() ? (c.has_value() ? kernel<1, 1> : kernel<1, 0>) : (c.has_value() ? kernel<0, 1> : kernel<0, 0>);
     if constexpr (N == muse_all_gather::kBlock * muse_all_gather::kVec) {
       if (gamma.has_value()) {
-        CHECK_HOST(!b.has_value() && !c.has_value()) << "the fused norm takes no b / c";
+        CHECK_HOST(!b.has_value() && !c.has_value());
         TensorMatcher({N}).with_dtype<bf16_t>().with_device(device).verify(gamma.value());
         fn = muse_all_gather::all_gather_kernel<N, kWorld, false, false, kUsePDL, true>;
       }
     } else {
-      CHECK_HOST(!gamma.has_value()) << "the fused norm needs N == 4096";
+      CHECK_HOST(!gamma.has_value());
     }
     host::LaunchKernel(num_work_blocks + 1, muse_all_gather::kBlock, device.unwrap()).enable_pdl(kUsePDL)(fn, params);
   }
