@@ -33,6 +33,7 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     PFMHA_RAGGED_MAX_BS,
     PFMHA_SLIDING,
     PFMHA_SLIDING_MIN_TOKENS,
+    RS_ATTN_BLOCKS_PADDED,
 )
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import fmha_ext
 
@@ -53,9 +54,11 @@ _DEFERRED = None  # (output, blocks, run)
 
 @contextlib.contextmanager
 def defer_row_blocks(rows: int, blocks: int):
-    """A one-request call of exactly rows * blocks tokens inside gathers and leaves its output unwritten;
-    take_deferred(output) gives run(j, n): fmha7 at the whole call's (nc, split) over rows [j rows, (j + n) rows) with
-    that range's length. Blocks are whole 8 * nc query tiles, so every CTA computes as in the whole call (bit-equal)."""
+    """A one-request call of exactly rows * blocks tokens (or, with OKC_RS_ATTN_BLOCKS_PADDED, of at most that many: a
+    padded bucket's real rows) inside gathers and leaves its output unwritten; take_deferred(output) gives run(j, n):
+    fmha7 at the whole call's (nc, split) over the real rows of [j rows, (j + n) rows) with that range's length (none
+    past the real rows). Blocks are whole 8 * nc query tiles from row 0, so every CTA computes as in the whole call
+    (bit-equal), the last real block's partial tile included."""
     global _DEFER
     _DEFER = (rows, blocks)
     try:
@@ -70,7 +73,7 @@ def take_deferred(output: torch.Tensor):
     d, _DEFERRED = _DEFERRED, None
     if d is None:
         return None
-    if output.data_ptr() == d[0].data_ptr() and output.numel() == d[0].numel():
+    if output.data_ptr() == d[0].data_ptr() and output.numel() >= d[0].numel():   # >: the bucket over the real rows
         return d[2]
     d[2](0, d[1])
     return None
@@ -183,7 +186,9 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     win = window_size[0] + 1 if is_swa else 0
     usable = out is not None and out.dtype is torch.bfloat16 and out.is_contiguous() and out.numel() == tokens * HQ * D
     # row blocks: one request of exactly the blocks, and no caller copy of an unwritten result (out is used)
-    R = _DEFER[0] if bs == 1 and tokens == _DEFER[0] * _DEFER[1] > 0 and (out is None or usable) else 0
+    R, nb = _DEFER
+    padded = RS_ATTN_BLOCKS_PADDED and 0 < tokens < R * nb
+    R = R if bs == 1 and (tokens == R * nb > 0 or padded) and (out is None or usable) else 0
     if not usable:
         out = torch.empty((tokens, HQ, D), dtype=torch.bfloat16, device=device)
     o = out.view(tokens, HQ, D)
@@ -193,7 +198,7 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     vc = value_cache.view(torch.uint8)
     for i, (off, L, max_len) in enumerate(reqs):
         nc, split = _one(ext, q8[off:off + L], kc, vc, page_table[i:i + 1], cache_seqlens[i:i + 1], L, max_len,
-                         win, ks, vs, smqk, o[off:off + L], device, R)
+                         win, ks, vs, smqk, o[off:off + L], device, R, nb)
     HITS["fmha"] += 1
     HITS["fmha_tokens"] += tokens
     _log_once("prefill_fmha" + ("_swa" if win else "") + ("_ragged" if bs > 1 else ""),
@@ -201,9 +206,9 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     return o
 
 
-def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device, R=0):
-    """One request: gather its keys into stage images, then fmha7 (+ combine), or with R the deferred R-row blocks.
-    Returns (nc, split)."""
+def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, smqk, o, device, R=0, nb=0):
+    """One request: gather its keys into stage images, then fmha7 (+ combine), or with R the deferred R-row blocks
+    (nb of them; L <= R nb real rows). Returns (nc, split)."""
     global _DEFERRED
     cap = ((min(win - 1 + L, max_len) if win else max_len) + 255) & ~255
     capblks = cap // 128
@@ -220,13 +225,17 @@ def _one(ext, q8, kc, vc, page_table, cache_seqlens, L, max_len, win, ks, vs, sm
         ntf = capblks
     nc, split = pick_cfg(L, ntf)
     if R and R % (8 * nc) == 0:
-        blens = lens - torch.arange(L // R - 1, -1, -1, dtype=torch.int32, device=device) * R   # block ends
+        ends = torch.arange(1, nb + 1, dtype=torch.int32, device=device) * R
+        blens = lens - (L - ends).clamp(min=0)   # each block's last real row's length
 
         def run(j, n):
-            r = slice(j * R, (j + n) * R)
-            _attend(ext, q8[r], kvt, o[r], blens[j + n - 1:j + n], ks, vs, smqk, n * R, capblks, win, nc, split, device)
+            e0, e1 = j * R, min((j + n) * R, L)
+            if e1 > e0:
+                r = slice(e0, e1)
+                _attend(ext, q8[r], kvt, o[r], blens[j + n - 1:j + n], ks, vs, smqk, e1 - e0, capblks, win, nc, split,
+                        device)
 
-        _DEFERRED = (o, L // R, run)
+        _DEFERRED = (o, nb, run)
     else:
         _attend(ext, q8, kvt, o, lens, ks, vs, smqk, L, capblks, win, nc, split, device)
     return nc, split
