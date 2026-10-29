@@ -241,6 +241,7 @@ class _State:
         self.fwd = 0
         self.gs = None              # {layer: [256] float global scales of every expert}
         self.pool = None
+        self.last_counts = None
 
 
 _S = _State()
@@ -318,6 +319,7 @@ def _trigger():
                 g[np.asarray(ids)] = allg[r][i][: len(ids)]
             st.gs[li] = g
     Vh, Rh = V.cpu().numpy(), Rg.cpu().numpy()
+    st.last_counts = {"layers": [li for li, _ in st.layers], "verify": Vh.tolist(), "prefill_ring": Rh.tolist()}
     for _, m in st.layers:
         m._okc_adapt_vcnt.floor_divide_(2)
     jobs = []
@@ -350,8 +352,24 @@ def _check():
         plan.update(p)
     st.pending = None
     st.refreshes += 1
+    import hashlib
+    import json
+    import time
+
+    t0 = time.perf_counter()
     n = apply(plan, _p2p_transfer)
-    logger.info("OKC adaptive replicas: refresh %d applied (%d expert copies).", st.refreshes, n)
+    torch.cuda.current_stream().synchronize()
+    ms = (time.perf_counter() - t0) * 1e3
+    rec = {"refresh": st.refreshes, "forward": st.fwd, "copies": n, "apply_ms": round(ms, 2),
+           "plan": {str(k): [list(map(int, x)) for x in v] for k, v in sorted(plan.items())}}
+    digest = hashlib.md5(json.dumps(rec["plan"], sort_keys=True).encode()).hexdigest()[:12]
+    logger.info("OKC adaptive replicas: refresh %d applied (%d expert copies, %.1f ms, plan %s).", st.refreshes, n, ms, digest)
+    d = os.environ.get("OKC_ADAPT_LOG_DIR")
+    if d and rank == 0:   # the audit trail: every refresh's plan and the counts it was decided on
+        os.makedirs(d, exist_ok=True)
+        rec["md5"] = digest
+        with open(os.path.join(d, f"refresh_{st.refreshes:03d}.json"), "w") as f:
+            json.dump(dict(rec, counts=st.last_counts), f)
 
 
 def _p2p_transfer(copies):
