@@ -206,11 +206,12 @@ def count_prefill(experts, topk_ids, local_ids, ep_rank):
     """T > 256 forwards: this forward's route counts into the ring's next slot. local_ids: SP shard ids (count on every
     rank), else rank-identical ids (rank 0 counts)."""
     ring = getattr(experts, "_okc_adapt_ring", None)
-    if ring is None or not (local_ids or ep_rank == 0):
+    if ring is None:
         return
     slot = experts._okc_adapt_slot
-    idx = topk_ids.reshape(-1).long() + slot * 256
-    ring.view(-1).index_add_(0, idx, torch.ones(idx.shape, dtype=torch.int32, device=idx.device))
+    if local_ids or ep_rank == 0:   # every rank still advances the slot, so ring rows stay aligned across ranks
+        idx = topk_ids.reshape(-1).long() + slot * 256
+        ring.view(-1).index_add_(0, idx, torch.ones(idx.shape, dtype=torch.int32, device=idx.device))
     slot.add_(1).remainder_(ring.shape[0])
 
 
