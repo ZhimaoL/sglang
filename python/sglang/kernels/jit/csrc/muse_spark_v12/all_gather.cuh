@@ -173,21 +173,6 @@ __global__ __launch_bounds__(kBlock) void all_gather_kernel(const __grid_constan
   if (tx == 0) params.counter[bx].set(phase ^ 1);
 }
 
-// OKC: 1-GPU check of the kNorm row math (one CTA per row, the same helpers)
-template <uint32_t N>
-__global__ __launch_bounds__(kBlock) void okc_row_norm_test_kernel(const bf16_t* x, const bf16_t* gamma, float eps,
-                                                                    bf16_t* out) {
-  __shared__ __align__(16) bf16_t s_row[N];
-  __shared__ float s_w[4];
-  const uint32_t col = threadIdx.x * kVec;
-  uint4 raw = *reinterpret_cast<const uint4*>(x + size_t(blockIdx.x) * N + col);
-  *reinterpret_cast<uint4*>(s_row + col) = raw;
-  __syncthreads();
-  const float rs = okc_row_rstd<N>(s_row, eps, s_w);
-  okc_row_norm<N>(raw, gamma, col, rs);
-  *reinterpret_cast<uint4*>(out + size_t(blockIdx.x) * N + col) = raw;
-}
-
 }  // namespace muse_all_gather
 
 using host::distributed::CommunicatorRef;
@@ -284,19 +269,6 @@ struct MuseSparkAllGatherNorm {
     const auto num_work_blocks = std::min(host::div_ceil(num_vecs, muse_all_gather::kBlock), push.num_blocks - 1);
     host::LaunchKernel(num_work_blocks + 1, muse_all_gather::kBlock, device.unwrap())
         .enable_pdl(kUsePDL)(muse_all_gather::all_gather_kernel<N, kWorld, false, false, kUsePDL, true>, params);
-  }
-
-  static void test(TensorView x, TensorView gamma, double eps, TensorView out) {   // 1 GPU: the row math only
-    using namespace host;
-    auto M = SymbolicSize{"num_tokens"};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
-    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(x);
-    TensorMatcher({N}).with_dtype<bf16_t>().with_device(device).verify(gamma);
-    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(out);
-    host::LaunchKernel(static_cast<uint32_t>(M.unwrap()), muse_all_gather::kBlock, device.unwrap())(
-        muse_all_gather::okc_row_norm_test_kernel<N>, static_cast<const bf16_t*>(x.data_ptr()),
-        static_cast<const bf16_t*>(gamma.data_ptr()), static_cast<float>(eps), static_cast<bf16_t*>(out.data_ptr()));
   }
 };
 
