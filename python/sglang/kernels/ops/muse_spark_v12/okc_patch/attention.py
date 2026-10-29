@@ -309,8 +309,8 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
               bs, q_len, kv_scale, sm_scale, qk_factor, eps):
     """Full-layer verify on the attention lane's wst kernels (bank v16c_m7g_rlx3 `_full_wst`, wst_cfg 54, no RoPE):
     every CTA builds its e4m3 q fragments from qkv (RMSNorm), the split holding the block's new positions writes their
-    k (RMSNorm) / v rows to the cache before staging them, and the (b, kv head) partials (O fp32, bf16 with
-    OKC_WST_ACC16=1; m / l fp32) are folded in-kernel with RMSNorm x sigmoid(gate). Splits come from the device-side lengths only (never the table width).
+    k (RMSNorm) / v rows to the cache before staging them, and the (b, kv head) partials (O / m / l fp32: the
+    -DOKC_WST_ACC32=1 build) are folded in-kernel with RMSNorm x sigmoid(gate). Splits come from the device-side lengths only (never the table width).
 
       bs < WST_BAL_MIN_BS: wst_ct14, grid (SMs // bs, bs), uniform split of the batch's longest span, row-sliced
                            K-waiter merge (cooperative launch: SMs // bs * bs <= SMs CTAs at 1 CTA / SM).
