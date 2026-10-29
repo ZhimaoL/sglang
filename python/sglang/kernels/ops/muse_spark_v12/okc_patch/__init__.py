@@ -319,6 +319,11 @@ RIDE_CORE = _flag("OKC_RIDE_CORE", "1")
 # mode and gets the same gate).
 SW_RIDE_LOW = _flag("OKC_SW_RIDE_LOW", "0")
 RIDE_MAX_LOAD = int(os.environ.get("OKC_RIDE_MAX_LOAD", "16"))
+# Bounded merge of follow-up extends (court C30 / C31): at load >= FU_MERGE_MIN_LOAD, with requests decoding and
+# only follow-ups waiting, hold them up to FU_MERGE_PASSES scheduler passes so later ones join one extend.
+SW_FU_MERGE = _flag("OKC_SW_FU_MERGE", "0")
+FU_MERGE_PASSES = int(os.environ.get("OKC_FU_MERGE_PASSES", "6"))
+FU_MERGE_MIN_LOAD = int(os.environ.get("OKC_FU_MERGE_MIN_LOAD", "9"))
 
 ANY_ATTN = SW_ATTN or SW_WST
 
@@ -335,7 +340,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
-           "RIDE_ALONG", "RIDE_CORE", "SW_RIDE_LOW", "RIDE_MAX_LOAD", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
+           "RIDE_ALONG", "RIDE_CORE", "SW_RIDE_LOW", "RIDE_MAX_LOAD", "SW_FU_MERGE", "FU_MERGE_PASSES", "FU_MERGE_MIN_LOAD", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
            "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "RS_ATTN_BLOCKS_FULL",
            "RS_ATTN_BLOCKS_PADDED",
            "ANY_ATTN"]
