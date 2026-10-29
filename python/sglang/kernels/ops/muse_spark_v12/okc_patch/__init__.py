@@ -137,11 +137,11 @@ SP_CE_TP = _flag("OKC_SP_CE_TP", "1")
 SW_RS_NORM_FOLD = _flag("OKC_SW_RS_NORM_FOLD", "1")
 # Sliding layers there: fmha7 + output gate per destination block inside one eager break with the o-proj RS, so each
 # GEMM + push starts under the attention (serving/kernels/rsfold R4-R7, bit-equal). Off until an 8-GPU arm prices it.
-SW_RS_ATTN_BLOCKS = _flag("OKC_SW_RS_ATTN_BLOCKS", "0")
-RS_ATTN_BLOCKS_MIN_ROWS = int(os.environ.get("OKC_RS_ATTN_BLOCKS_MIN_ROWS", "2048"))
+SW_RS_ATTN_BLOCKS = _flag("OKC_SW_RS_ATTN_BLOCKS", "1")
+RS_ATTN_BLOCKS_MIN_ROWS = int(os.environ.get("OKC_RS_ATTN_BLOCKS_MIN_ROWS", "1152"))
 RS_ATTN_BLOCKS_GROUP = int(os.environ.get("OKC_RS_ATTN_BLOCKS_GROUP", "2"))
 # Full-attention layers too, in groups of this many destinations per fmha launch (0 = off; R4: 2-4 launches).
-RS_ATTN_BLOCKS_FULL = int(os.environ.get("OKC_RS_ATTN_BLOCKS_FULL", "0"))
+RS_ATTN_BLOCKS_FULL = int(os.environ.get("OKC_RS_ATTN_BLOCKS_FULL", "4"))
 # ... and a padded bucket (the last chunk's real rows < rows x 8): blocks over the real rows, none past them (extend E39).
 RS_ATTN_BLOCKS_PADDED = _flag("OKC_RS_ATTN_BLOCKS_PADDED", "1")
 # NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
@@ -164,7 +164,7 @@ PG_LOCAL_ALIGN_MIN_TOKENS = int(os.environ.get("OKC_PG_LOCAL_ALIGN_MIN_TOKENS", 
 # three all-gathers. Same bytes; the two small gathers' fixed latency goes (cand7 ~1K extend: 17 + 12 us per layer).
 SP_AG_GROUP = _flag("OKC_SP_AG_GROUP", "1")
 # ... or as one push-plane launch (rows + top-k, gemm_ag.row_gather) up to this many gathered rows (extend E26).
-SP_AG_PUSH = _flag("OKC_SP_AG_PUSH", "0")
+SP_AG_PUSH = _flag("OKC_SP_AG_PUSH", "1")
 SP_AG_PUSH_MAX_TOKENS = int(os.environ.get("OKC_SP_AG_PUSH_MAX_TOKENS", "2048"))
 
 # Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call. Per request:
@@ -303,5 +303,5 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "RS_ATTN_BLOCKS_FULL",
            "RS_ATTN_BLOCKS_PADDED",
            "ANY_ATTN"]
-SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "0")  # M 33..128: fused AG + norm, row kernel at 1024 threads
+SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "1")  # M 33..128: fused AG + norm, row kernel at 1024 threads
 __all__ += ["SW_AG_NORM_WIDE"]
