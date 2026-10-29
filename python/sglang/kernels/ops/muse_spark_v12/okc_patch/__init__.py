@@ -128,8 +128,9 @@ GEMM_AG_UNPOOLER_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_UNPOOLER_MAX_TOKEN
 SP_SYMM = _flag("OKC_SP_SYMM", "1")
 SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
 # SP forwards below that (the follow-up extends): the qkv-in all-gather as torch's multimem all-gather into a symmetric
-# buffer of OKC_EXT_AG_MAX_BYTES instead of NCCL's ring (okc_patch/ext_coll.py, extend E44; exact, a copy)
-SW_EXT_AG = _flag("OKC_SW_EXT_AG", "0")
+# buffer of OKC_EXT_AG_MAX_BYTES instead of NCCL's ring (okc_patch/ext_coll.py, extend E44; exact, a copy; Lium XC
+# step M: eager / graph / back-to-back / skewed layer pattern bitwise, 1.10-1.55x NCCL at 8-62 MiB)
+SW_EXT_AG = _flag("OKC_SW_EXT_AG", "1")
 EXT_AG_MAX_BYTES = int(os.environ.get("OKC_EXT_AG_MAX_BYTES", str(4096 * 8192 * 2)))
 # ... and the extend's o-proj / MoE-out reduce-scatters as multimem.ld_reduce (fp32 in the switch) over a second
 # symmetric buffer of that size: differs from NCCL's ring in ~half the elements by an ulp (equal to the fp32 sum), so
