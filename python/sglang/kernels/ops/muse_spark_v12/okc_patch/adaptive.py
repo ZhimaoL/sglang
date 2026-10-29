@@ -296,6 +296,9 @@ class _State:
         self.layers = None          # [(layer_idx, experts module)] with replicas, layer order
         self.tokens = 0             # prefill tokens forwarded since the last trigger
         self.vtokens = 0            # verify tokens forwarded (host count; gates the first refresh)
+        self.seen = 0               # prefill tokens forwarded since the start
+        self.seen_full = 0          # ... at the last full refresh
+        self.full = False           # the pending refresh is a full one
         self.refreshes = 0
         self.pending = None         # AsyncResult of this rank's decisions
         self.fwd = 0
@@ -338,7 +341,9 @@ def maybe_refresh(model_runner, forward_batch):
         st.vtokens += int(forward_batch.input_ids.numel())
     elif mode.is_extend():
         n = getattr(forward_batch, "extend_num_tokens", None)
-        st.tokens += int(n if n is not None else forward_batch.input_ids.numel())
+        n = int(n if n is not None else forward_batch.input_ids.numel())
+        st.tokens += n
+        st.seen += n
     if st.layers is None:
         st.layers = _collect(model_runner.model)
         if not st.layers:
@@ -371,6 +376,11 @@ def _groups():
     return g.device_group, g.cpu_group, g.rank_in_group, g.world_size
 
 
+def full_refresh(refreshes, seen, seen_full, growth):
+    """Refresh 1 is full; later ones when the prefill tokens seen have grown growth x since the last full one."""
+    return refreshes == 0 or (growth > 0 and seen >= growth * seen_full)
+
+
 def _trigger():
     sw = _knobs()
     st = _S
@@ -396,6 +406,9 @@ def _trigger():
     st.last_counts = {"layers": [li for li, _ in st.layers], "verify": Vh.tolist(), "prefill_ring": Rh.tolist()}
     for _, m in st.layers:
         m._okc_adapt_vcnt.floor_divide_(2)
+    full = full_refresh(st.refreshes, st.seen, st.seen_full, sw.ADAPT_FULL_GROWTH)
+    if full:
+        st.seen_full = st.seen
     jobs = []
     for i, (li, m) in enumerate(st.layers):
         if i % world != rank:
@@ -403,7 +416,7 @@ def _trigger():
         R = len(m.replica_plan["order"]) // world
         cur = [list(x) for x in zip(m.replica_plan["order"], m.replica_plan["rank"])]
         jobs.append((li, list(m.replica_plan["home"]), Vh[i].tolist(), Rh[i].tolist(), R, 1000 + li, cur,
-                     sw.ADAPT_THETA, sw.ADAPT_MAX_SWAPS, st.refreshes == 0))
+                     sw.ADAPT_THETA, sw.ADAPT_MAX_SWAPS, full))
     # a plain child interpreter (not multiprocessing: the scheduler process may be daemonic), numpy single-threaded
     import pickle
     import subprocess
@@ -417,7 +430,9 @@ def _trigger():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=lambda: os.nice(10))
     st.pending = (proc, f.name, f.name + ".out")
     st.tokens = 0
-    logger.info("OKC adaptive replicas: refresh %d decided in the background (%d layers here).", st.refreshes + 1, len(jobs))
+    st.full = full
+    logger.info("OKC adaptive replicas: refresh %d (%s, %d prefill tokens seen) decided in the background (%d layers "
+                "here).", st.refreshes + 1, "full" if full else "incremental", st.seen, len(jobs))
 
 
 def _check():
@@ -463,7 +478,8 @@ def _check():
     full = {str(k): [list(map(int, x)) for x in v] for k, v in sorted(plan.items())}
     digest = hashlib.md5(json.dumps(full, sort_keys=True).encode()).hexdigest()[:12]
     ncopy = sum(c for _, _, c in changed)
-    st.rec = {"refresh": st.refreshes, "forward": st.fwd, "layers_changed": len(changed), "copies": ncopy,
+    st.rec = {"refresh": st.refreshes, "full": st.full, "seen": st.seen,
+              "forward": st.fwd, "layers_changed": len(changed), "copies": ncopy,
               "apply_ms": 0.0, "steps": 0, "md5": digest, "plan": full}
     logger.info("OKC adaptive replicas: refresh %d decided (plan %s): %d layers change, %d expert copies, trickled.",
                 st.refreshes, digest, len(changed), ncopy)
