@@ -55,6 +55,32 @@ def _load_inline(**kw):
             os.environ["TORCH_CUDA_ARCH_LIST"] = prev
 
 
+# The loaders a serving boot calls. In a cold container each compiled at its first use, one after another (~45-50 s of
+# single-process nvcc each: 581 s of H1's 1084-s cold boot, court C40); prebuild() starts them all at once.
+_PREBUILD = ("smallm_ext", "pg_ext", "pg_narrow_ext", "pg_narrow64_ext", "st_ext", "draft_ext", "fmha_ext", "proj_ext",
+             "glue_ext", "route_ext", "vfg_ext", "wst_ext", "lt")
+_PREBUILD_RUN = """import sys
+from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext, lt
+try:
+    lt._ext() if sys.argv[1] == "lt" else getattr(cuda_ext, sys.argv[1])()
+except Exception:
+    pass  # a build failure surfaces again at the server's own call
+"""
+
+
+def prebuild() -> None:
+    """Start every okc extension build at once, one CPU-only background process each (once per node, at worker init,
+    before the weights load). Each process runs the loader itself: same sources, flags, arch and build directory, so
+    the server's own call finds the build finished (or waits on torch's build lock for it) and what it loads is
+    unchanged. With warm caches each process finds its build up to date and exits."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    for f in _PREBUILD:
+        subprocess.Popen([sys.executable, "-c", _PREBUILD_RUN, f], env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
                       int64_t k, int64_t MT, int64_t R, int64_t U, int64_t WPC);

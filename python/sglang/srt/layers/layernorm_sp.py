@@ -158,6 +158,10 @@ def initialize_layernorm_sp(*, model_config) -> None:
         )
 
         _okc_hopper.min_tokens = SP_MIN_TOKENS
+        if get_parallel().tp_rank == 0:   # one per node: the okc extension builds start now, in parallel
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext
+
+            cuda_ext.prebuild()
 
         # Every rank evaluates the same switches, so all of them enter the collective probe together. A failed probe
         # turns off every symm-mem path (the fused linears, ext_coll's multimem gather / reduce, the copy-engine ops).
