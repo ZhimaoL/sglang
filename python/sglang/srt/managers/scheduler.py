@@ -203,6 +203,7 @@ from sglang.srt.managers.overlap_utils import (
     resolve_forward_inputs,
 )
 from sglang.srt.managers.ride_along import MODE_MERGED, MODE_OFF, RideAlong
+from sglang.srt.managers.followup_merge import FollowupMerge
 from sglang.srt.managers.small_prefill_first import SmallPrefillFirst
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -1320,6 +1321,11 @@ class Scheduler(
         )
         self._okc_between_batch = False
         self._okc_fold_batch = False
+        self.fu_merge = FollowupMerge(
+            enabled=okc_patch.SW_FU_MERGE,
+            passes=okc_patch.FU_MERGE_PASSES,
+            min_load=okc_patch.FU_MERGE_MIN_LOAD,
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -3816,6 +3822,13 @@ class Scheduler(
             new_batch = None
         elif self.small_prefill_first.should_decode_first(
             num_running=running_batch.batch_size()
+        ):
+            new_batch = None
+        elif self.fu_merge.should_hold(
+            waiting_queue=self.waiting_queue,
+            tree_cache=self.tree_cache,
+            chunked_req=self.chunked_req,
+            num_running=0 if running_batch.is_prefill_only else running_batch.batch_size(),
         ):
             new_batch = None
         else:
