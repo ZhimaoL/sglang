@@ -1776,8 +1776,10 @@ class MuseSpark1xForCausalLM(nn.Module):
             # DFLASH consumes every prompt token in replicated token order.
             # Gather the taps before logits pruning applies full-token indices;
             # FULL capture also needs the entry-scatter padding removed.
+            # With OKC_SW_EXIT_IN_BODY the body returns the exited taps as one tensor (its own tap list otherwise), so
+            # the shape of the body output, not a recomputed SP verdict, says which side ran the exit.
             okc_project = getattr(self, "_okc_aux_project", None)
-            if not okc_patch.SW_EXIT_IN_BODY:
+            if not (okc_patch.SW_EXIT_IN_BODY and torch.is_tensor(aux_hidden_states)):
                 aux_hidden_states = _okc_exit_aux(aux_hidden_states, num_tokens, okc_project)
             elif okc_raw_aux:
                 self._okc_check_exit(_okc_exit_aux(okc_raw_aux[0], num_tokens, okc_project), aux_hidden_states)
