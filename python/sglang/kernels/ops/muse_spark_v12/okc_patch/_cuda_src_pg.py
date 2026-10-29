@@ -307,6 +307,8 @@ DINL int route_code(int v, int wmask) {
     return code;
 }
 DINL int route_cls(int i) { return RT_N16 ? (i < 4 ? 15 - 4 * i : 1 - (i - 4)) : RT_FULL - i; }
+// XB: the extend balancer (me = rank + 8), a separate instance so the verify one keeps its code
+template <bool XB>
 __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_ids, const int* __restrict__ emap,
                                                  int n_global, int numel, int wmask, int nl,
                                                  int* __restrict__ local_ids, int* __restrict__ sorted_ids,
@@ -323,7 +325,7 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
     pdl_wait();
     pdl_trigger();
     if (rtab != nullptr) {   // the replica balancer here: this call's map
-        if (me >= 8) {       // me + 8: the extend balancer (rep_align_scan's decision: pg cost weights, count order)
+        if (XB) {            // the extend balancer (rep_align_scan's decision: pg cost weights, count order)
             if (tid < 256) { r_tabs[tid] = rtab[tid]; r_cnt[tid] = 0; }
             if (tid < n_rep) r_ord[tid] = rtab[256 + tid];
             __syncthreads();
@@ -338,7 +340,7 @@ __global__ void __launch_bounds__(1024) pg_route(const int* __restrict__ topk_id
         }
         if (tid < 256) {
             const int v = r_tabs[tid];
-            r_map[tid] = (r_own[tid] == (me & 7) && (v & 0xFF) != 0xFF) ? (v & 0xFF) : -1;
+            r_map[tid] = (r_own[tid] == (XB ? me - 8 : me) && (v & 0xFF) != 0xFF) ? (v & 0xFF) : -1;
         }
         __syncthreads();
     }
@@ -1491,7 +1493,8 @@ void route(torch::Tensor topk_ids, torch::Tensor emap, torch::Tensor rtab, torch
     const int* rt = rtab.numel() > 0 ? rtab.data_ptr<int>() : nullptr;
     TORCH_CHECK(!rt || (rtab.scalar_type() == at::kInt && rtab.numel() >= 256 && rtab.numel() <= 512 && me >= 0 &&
                         me < 16), "pg route: replica table");
-    pg_launch(pgk::pg_route, dim3(1), dim3(1024), 0, pdl != 0, topk_ids.data_ptr<int>(), em, (int)n_global,
+    pg_launch(rt && me >= 8 ? pgk::pg_route<true> : pgk::pg_route<false>, dim3(1), dim3(1024), 0, pdl != 0,
+              topk_ids.data_ptr<int>(), em, (int)n_global,
 #ifdef PGN_WSET
               (int)numel, (int)PGN_WSET, (int)nl, local_ids.data_ptr<int>(), sorted_ids.data_ptr<int>(),
 #else   // PGN_WSET
