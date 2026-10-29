@@ -45,7 +45,7 @@ ADAPT_CHECK = int(os.environ.get("OKC_ADAPT_CHECK", "32"))
 # hysteresis: a slot change must lower the layer objective (% official) by more than ADAPT_THETA per expert copy;
 # at most ADAPT_MAX_SWAPS incremental changes per layer per refresh (the first refresh may also take the full
 # greedy plan); the applied changes trickle in at <= ADAPT_TRICKLE expert copies per forward (whole layers).
-ADAPT_THETA = float(os.environ.get("OKC_ADAPT_THETA", "0.003"))
+ADAPT_THETA = float(os.environ.get("OKC_ADAPT_THETA", "0.001"))
 ADAPT_MAX_SWAPS = int(os.environ.get("OKC_ADAPT_MAX_SWAPS", "4"))
 ADAPT_TRICKLE = int(os.environ.get("OKC_ADAPT_TRICKLE", "8"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
