@@ -280,12 +280,6 @@ void wst_attn_fqbt(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, t
 void wst_attn_bal(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                   torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, double, int64_t, int64_t, int64_t,
                   int64_t, int64_t, int64_t, double, double, double, torch::Tensor, torch::Tensor, torch::Tensor);
-void wst_core_fqbt(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                   torch::Tensor, torch::Tensor, torch::Tensor, double, int64_t, int64_t, int64_t, int64_t,
-                   torch::Tensor, torch::Tensor, torch::Tensor);
-void wst_core_bal(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                  torch::Tensor, torch::Tensor, torch::Tensor, double, int64_t, int64_t, int64_t, int64_t,
-                  torch::Tensor, torch::Tensor, torch::Tensor);
 """
 
 
@@ -307,7 +301,7 @@ def wst_ext():
                     name="okc_wst_verify_v1_p32",
                     cpp_sources=[_WST_CPP],
                     cuda_sources=[_CUDA_SRC],
-                    functions=["wst_attn_fqbt", "wst_attn_bal", "wst_core_fqbt", "wst_core_bal"],
+                    functions=["wst_attn_fqbt", "wst_attn_bal"],
                     extra_cuda_cflags=[
                         "-O3",
                         "--use_fast_math",

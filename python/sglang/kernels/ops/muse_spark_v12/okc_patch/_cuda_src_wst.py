@@ -1606,37 +1606,4 @@ void wst_attn_fqbt(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cac
                               reinterpret_cast<const long long*>(cache_loc.data_ptr()), (float)rcp_k, (float)rcp_v, (float)eps,
                               reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tickets.data_ptr<int>(), v_scale.data_ptr<float>());
 }
-// serving: the ride-along riders' core entries. q8 = the riders' normed e4m3 q [B*L, 16, 64] (no qk factor folded in),
-// their k / v rows already in the cache, out = the pre-norm attention output [B*L, 16, 64] bf16 (O / l x v_scale).
-void wst_core_fqbt(torch::Tensor q8, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table, torch::Tensor seq_lens,
-                   torch::Tensor ws_acc, torch::Tensor ws_m, torch::Tensor ws_l, torch::Tensor k_scale, double smqk_log2e,
-                   int64_t B, int64_t L, int64_t maxP, int64_t S, torch::Tensor out, torch::Tensor tickets, torch::Tensor v_scale) {
-    TORCH_CHECK(S >= 1 && S <= 256, "wst_core_fqbt: the +256 ticket epoch needs S <= 256");
-    const long rows = k_cache.numel() / 128;
-    CUtensorMap km = row_map(k_cache.data_ptr(), rows);
-    CUtensorMap vm = row_map(v_cache.data_ptr(), rows);
-    dim3 grid((int)S, (int)B);
-    auto stream = at::cuda::getCurrentCUDAStream();
-    launch_ct14fq<4, 2, 4, 1, 1, 1>(grid, stream, km, vm, reinterpret_cast<const unsigned char*>(v_cache.data_ptr()),
-                                    reinterpret_cast<const unsigned char*>(k_cache.data_ptr()), page_table.data_ptr<int>(),
-                                    seq_lens.data_ptr<int>(), reinterpret_cast<float*>(ws_acc.data_ptr()), ws_m.data_ptr<float>(),
-                                    ws_l.data_ptr<float>(), k_scale.data_ptr<float>(), (float)smqk_log2e, (int)B, (int)L, (int)maxP,
-                                    0, (int)S, 0, nullptr, 0, nullptr, 1.f, 1.f, 1e-5f,
-                                    reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tickets.data_ptr<int>(), v_scale.data_ptr<float>(),
-                                    reinterpret_cast<const unsigned char*>(q8.data_ptr()));
-}
-void wst_core_bal(torch::Tensor q8, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table, torch::Tensor seq_lens,
-                  torch::Tensor ws_acc, torch::Tensor ws_m, torch::Tensor ws_l, torch::Tensor k_scale, double smqk_log2e,
-                  int64_t B, int64_t L, int64_t maxP, int64_t G, torch::Tensor out, torch::Tensor tickets, torch::Tensor v_scale) {
-    const long rows = k_cache.numel() / 128;
-    CUtensorMap km = row_map(k_cache.data_ptr(), rows);
-    CUtensorMap vm = row_map(v_cache.data_ptr(), rows);
-    auto stream = at::cuda::getCurrentCUDAStream();
-    launch_ct14b<4, 2, 4, 1, 1>((int)G, stream, km, vm, reinterpret_cast<const unsigned char*>(v_cache.data_ptr()),
-                                reinterpret_cast<const unsigned char*>(k_cache.data_ptr()), page_table.data_ptr<int>(),
-                                seq_lens.data_ptr<int>(), reinterpret_cast<float*>(ws_acc.data_ptr()), ws_m.data_ptr<float>(),
-                                ws_l.data_ptr<float>(), k_scale.data_ptr<float>(), (float)smqk_log2e, (int)B, (int)L, (int)maxP,
-                                0, 3, nullptr, 0, nullptr, 1.f, 1.f, 1e-5f, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-                                tickets.data_ptr<int>(), v_scale.data_ptr<float>(), reinterpret_cast<const unsigned char*>(q8.data_ptr()));
-}
 """

@@ -351,9 +351,6 @@ class LogitsMetadata:
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
-    # EXTEND without logprobs: the rows to return logits for, when they are not
-    # each request's last row (ForwardBatch.extend_logits_rows).
-    extend_logits_rows: Optional[torch.Tensor] = None
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -417,7 +414,6 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
-            extend_logits_rows=forward_batch.extend_logits_rows,
         )
 
     def compute_dp_attention_metadata(self):
@@ -694,10 +690,7 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-            if logits_metadata.extend_logits_rows is not None:
-                last_index = logits_metadata.extend_logits_rows
-            else:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]

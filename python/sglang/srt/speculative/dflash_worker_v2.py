@@ -1,4 +1,3 @@
-import copy
 import logging
 import math
 import os
@@ -24,7 +23,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
-    LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -58,10 +56,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_ride_along import (
-    build_ride_along_batch,
-    ride_along_logits_rows,
-)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -2441,157 +2435,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         new_seq_lens: torch.Tensor,
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
-
-    def supports_ride_along(self) -> bool:
-        # The merged forward reuses the plain greedy verify; the drafts, accept rules
-        # and draft caches below keep their own decode step.
-        return (
-            self.lilicorr is None
-            and not self._is_domino
-            and not self._need_mamba_verify_commit
-            and not self.use_compact_draft_cache
-            and not self.draft_owns_attention
-            and not self.target_worker.model_runner.prefill_aware_swa
-        )
-
-    def forward_ride_along(
-        self,
-        prefill_batch: ScheduleBatch,
-        decode_batch: ScheduleBatch,
-        *,
-        merged: bool,
-        on_publish_prefill=None,
-        on_publish_decode=None,
-    ) -> Tuple[GenerationBatchResult, GenerationBatchResult]:
-        """The prefill batch's forward and the decode batch's verify step in one
-        target EXTEND forward (dflash_ride_along.py); one ordinary result each.
-        ``merged=False`` runs the two ordinary steps back to back instead."""
-        if not merged or decode_batch.seq_lens_cpu is None:
-            return (
-                self.forward_batch_generation(
-                    prefill_batch, on_publish=on_publish_prefill
-                ),
-                self.forward_batch_generation(
-                    decode_batch, on_publish=on_publish_decode
-                ),
-            )
-        draft_input = decode_batch.spec_info
-        decode_batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
-        block_size = int(self.block_size)
-        draft_block = self._draft_block(decode_batch, draft_input)
-        bs = draft_block.bs
-
-        # --- The prefill rows and the riders' verify rows in one EXTEND forward.
-        model_runner = self.target_worker.model_runner
-        forward_batch = ForwardBatch.init_new(
-            build_ride_along_batch(
-                prefill_batch,
-                decode_batch,
-                draft_tokens=draft_block.draft_tokens,
-                verify_out_cache_loc=draft_block.verify_out_cache_loc,
-            ),
-            model_runner,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            return_hidden_states_before_norm=False,
-        )
-        forward_batch.extend_logits_rows = ride_along_logits_rows(
-            prefill_batch.extend_lens, bs, block_size, device=self.device
-        )
-        forward_batch.extend_attn_split = len(prefill_batch.reqs)
-        self.target_worker.set_hicache_consumer(prefill_batch.hicache_consumer_index)
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None, forward_batch=forward_batch, is_verify=True
-        )
-        logits_output = target_out.logits_output
-        num_prefill = len(prefill_batch.reqs)
-        num_prefill_tokens = int(prefill_batch.extend_num_tokens)
-        target_done = None
-        if _between_chunk():
-            # As in forward_batch_generation: the scheduler's chunk-boundary wait.
-            target_done = torch.cuda.Event()
-            target_done.record()
-
-        # Prefill requests: the target worker's sampler on their last rows.
-        prefill_logits_output = LogitsProcessorOutput(
-            next_token_logits=logits_output.next_token_logits[:num_prefill]
-        )
-        prefill_view = copy.copy(forward_batch)
-        prefill_view.batch_size = num_prefill
-        prefill_view.seq_lens = forward_batch.seq_lens[:num_prefill]
-        next_token_ids = model_runner.sample(prefill_logits_output, prefill_view)
-        self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
-
-        # Riders: the greedy accept of a decode step on their rows.
-        rider_logits = logits_output.next_token_logits[num_prefill:]
-        prefix_lens = draft_block.prefix_lens
-        _, commit_lens, bonus, out_tokens, new_seq_lens, _ = (
-            self._accept_block(
-                candidates=draft_block.draft_tokens,
-                next_token_logits=rider_logits,
-                sampling_info=decode_batch.sampling_info,
-                draft_input=draft_input,
-                prefix_lens=prefix_lens,
-                bs=bs,
-                target_predict=torch.argmax(rider_logits, dim=-1),
-            )
-        )
-        if new_seq_lens is None:
-            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
-        if on_publish_prefill is not None:
-            on_publish_prefill(prefill_batch.seq_lens)
-        if on_publish_decode is not None:
-            on_publish_decode(new_seq_lens)
-
-        # --- Draft KV: every prefill row (as an extend), the riders' committed rows
-        # (as a verify).
-        hidden = logits_output.hidden_states
-        if hidden is None:
-            raise RuntimeError("DFLASH ride-along requires target hidden states.")
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden[:num_prefill_tokens],
-            cache_loc=self._draft_write_ids(forward_batch.kv_loc_plan)[
-                :num_prefill_tokens
-            ],
-            positions=forward_batch.positions[:num_prefill_tokens],
-            extend_lens=forward_batch.extend_seq_lens[:num_prefill],
-        )
-        rider_cache_loc = self._draft_write_ids(draft_block.kv_loc_plan)
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden[
-                num_prefill_tokens : num_prefill_tokens + bs * block_size
-            ],
-            cache_loc=rider_cache_loc,
-            cache_loc_2d=rider_cache_loc.view(bs, block_size),
-            positions=draft_block.positions,
-            commit_lens=commit_lens,
-        )
-        logits_output.hidden_states = None
-
-        prefill_result = GenerationBatchResult(
-            logits_output=prefill_logits_output,
-            next_token_ids=next_token_ids,
-            can_run_cuda_graph=target_out.can_run_cuda_graph,
-            next_draft_input=self._make_next_draft_input_prefill(
-                bonus_tokens=next_token_ids, seq_lens=prefill_batch.seq_lens
-            ),
-            new_seq_lens=prefill_batch.seq_lens,
-        )
-        if target_done is not None:
-            prefill_result.okc_target_done = target_done
-        decode_result = GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=rider_logits),
-            next_token_ids=out_tokens.reshape(-1),
-            accept_lens=commit_lens,
-            can_run_cuda_graph=target_out.can_run_cuda_graph,
-            next_draft_input=self._make_next_draft_input_decode(
-                bonus_tokens=bonus, new_seq_lens=new_seq_lens
-            ),
-            speculative_num_draft_tokens=block_size,
-            new_seq_lens=new_seq_lens,
-        )
-        return prefill_result, decode_result
 
     def forward_batch_generation(
         self,

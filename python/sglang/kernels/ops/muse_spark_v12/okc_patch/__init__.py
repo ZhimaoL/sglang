@@ -302,23 +302,10 @@ BETWEEN_CHUNK_MAX_REQS = int(os.environ.get("OKC_BETWEEN_CHUNK_MAX_REQS", "8"))
 # (the chunk shrinks, keeping >= half its budget; in a chunk's last pass they take the leftover before the next first
 # turn). Under ride-along a follow-up otherwise waits FCFS behind the remaining first turns (c32: ~40 s), past the
 # device SWA cache's ~8 s retention of its conversation tail, and re-prefills its whole prompt (session SI arm R: 30 of
-# 32 first follow-ups, c32 p90 TTFT 42 s; serving/kernels/court/LOG.md C12). Folded follow-ups verify inside the next
-# chunk forward when ride-along is on (no forced decode steps); otherwise they get small-prefill-first's two. Implies
-# OKC_SW_BETWEEN_CHUNK. Same tokens per forward. Default off.
+# 32 first follow-ups, c32 p90 TTFT 42 s; serving/kernels/court/LOG.md C12). Folded follow-ups get small-prefill-first's two
+# forced decode steps. Implies OKC_SW_BETWEEN_CHUNK. Same tokens per forward. Default off.
 SW_FOLLOWUP_ADMIT = _flag("OKC_SW_FOLLOWUP_ADMIT", "1")
 
-# The running batch's DFLASH verify rides along in prefill / extend forwards (srt/managers/ride_along.py): its 8-row
-# blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
-# "1" one merged forward, "2" diagnostic (same scheduling, the two ordinary forwards back to back).
-RIDE_ALONG = int(os.environ.get("OKC_SW_RIDE_ALONG", "0"))
-# Riders' full-layer attention on the wst core (attention.verify_core_rows: their own normed e4m3 q, k / v already
-# stored, pre-gate output) instead of their own FA3 call; "0" keeps FA3.
-RIDE_CORE = _flag("OKC_RIDE_CORE", "1")
-# Low-load ride-along (court C29): merged riders (mode 1) only while running + waiting + the chunked request <=
-# RIDE_MAX_LOAD, so c4 / c16 ride and c32 never does. Independent of OKC_SW_RIDE_ALONG (which, when set, keeps its
-# mode and gets the same gate).
-SW_RIDE_LOW = _flag("OKC_SW_RIDE_LOW", "0")
-RIDE_MAX_LOAD = int(os.environ.get("OKC_RIDE_MAX_LOAD", "16"))
 # Bounded merge of follow-up extends (court C30 / C31): at load >= FU_MERGE_MIN_LOAD, with requests decoding and
 # only follow-ups waiting, hold them up to FU_MERGE_PASSES scheduler passes so later ones join one extend.
 SW_FU_MERGE = _flag("OKC_SW_FU_MERGE", "0")
@@ -340,7 +327,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
-           "RIDE_ALONG", "RIDE_CORE", "SW_RIDE_LOW", "RIDE_MAX_LOAD", "SW_FU_MERGE", "FU_MERGE_PASSES", "FU_MERGE_MIN_LOAD", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
+           "SW_FU_MERGE", "FU_MERGE_PASSES", "FU_MERGE_MIN_LOAD", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
            "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "RS_ATTN_BLOCKS_FULL",
            "RS_ATTN_BLOCKS_PADDED",
            "ANY_ATTN"]

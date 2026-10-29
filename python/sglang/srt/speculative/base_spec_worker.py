@@ -325,11 +325,6 @@ class BaseSpecWorker(ABC):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
-    def supports_ride_along(self) -> bool:
-        """Whether a running batch's verify step can run inside a prefill forward
-        (`forward_ride_along`, managers/ride_along.py). Default: no."""
-        return False
-
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:

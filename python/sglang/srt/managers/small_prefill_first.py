@@ -62,9 +62,6 @@ class SmallPrefillFirst:
         self._between_enabled = between_chunk_enabled or fold_enabled
         self._between_max_reqs = between_chunk_max_reqs
         self._fold_enabled = fold_enabled
-        # Set by the scheduler when ride-along carries the running batch's verify in prefill forwards: a folded
-        # follow-up then verifies inside the next chunk's forward, and forced decode steps would stall the chunk.
-        self.fold_rides_along = False
         self._num_folds = 0
         self._num_folded = 0
         # One small batch per chunk boundary: set when it is scheduled, cleared when the next chunk is.
@@ -250,7 +247,6 @@ class SmallPrefillFirst:
             if (self._enabled or between_chunk)
             and num_small
             and more_prefill
-            and not (folded and self.fold_rides_along)
             else 0
         )
         if folded and num_small:
