@@ -358,6 +358,13 @@ def column_parallel_g_matmul(
             group_name=group_name,
         )
         return mm_outputs[0][:num_tokens]
+    if _okc_hopper.active:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
+
+        tp_group = get_parallel().tp_group
+        full = ext_coll.all_gather(input_parallel, tp_group.device_group.group_name, tp_group.world_size)
+        if full is not None:   # OKC_SW_EXT_AG: the extend's qkv-in gather on multimem (same bytes)
+            return linear.quant_method.apply(linear, full[:num_tokens], bias)
     gathered = sp_exit_gather(input_parallel, num_tokens=num_tokens)
     return linear.quant_method.apply(linear, gathered, bias)
 
