@@ -9,7 +9,7 @@
   OKC_MOE_PG_ONLY=1  (default) packed layers drop their Marlin copy and run pg at every token count
                      (verify steps included), so every layer fits: +0.1 GiB per layer over Marlin.
                      0 keeps Marlin and uses pg on the prefill chunks of the first N layers only.
-  OKC_MOE_REPLICAS=1 hot-expert replicas per rank per pg-only layer (0..3), 1.8 GiB per rank per replica.
+  OKC_MOE_REPLICAS=2 hot-expert replicas per rank per pg-only layer (0..3), 1.8 GiB per rank per replica.
 
 Switches are read once at import, so dispatch is stable across CUDA-graph capture and replay.
 The judge's launch command is fixed, so the submitted defaults are the ones below.
@@ -32,7 +32,7 @@ MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 # most active experts): forwards of <= OKC_MOE_REP_MAX_TOKENS tokens give each active replicated expert to the holder
 # with fewer active experts (pg_moe.assign_replicas), longer ones (OKC_MOE_REP_PREFILL) split its routes between the
 # two holders at a token boundary that levels routed tokens (pg_moe.split_replicas).
-MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "1"))
+MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "2"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
 MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
 # on the st chain the verify balancer weighs an expert by its st passes ceil(routes / 8); 0 = every active expert 1
