@@ -8,6 +8,7 @@ _lock = threading.Lock()
 _PG_EXT = None
 _PG_NARROW_EXT = None
 _PG_NARROW64_EXT = None
+_PG_NARROW32_EXT = None
 _ST_EXT = None
 _PROJ_EXT = None
 _SMALLM_EXT = None
@@ -117,6 +118,23 @@ def pg_narrow64_ext():
                     ["-DPGN_WSET=24", "-DPGN_NST=7", "-DPGN_XNT=64"],
                 )
     return _PG_NARROW64_EXT
+
+
+def pg_narrow32_ext():
+    """G1-X32 test: the narrow build on 32-token blocks (-DPGN_XNT=32, widths 16 / 32, OKC_PG32_NST 18 KB ring slots)."""
+    global _PG_NARROW32_EXT
+    if _PG_NARROW32_EXT is None:
+        with _lock:
+            if _PG_NARROW32_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import PG32_NST
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
+
+                _PG_NARROW32_EXT = _pg_load(
+                    f"okc_pg_moe_n16x32s{PG32_NST}_int_d3_b8", _CUDA_SRC,
+                    ["tiles", "gather", "gg1", "gg2", "route", "gather_norm", "set_snake_max_t"],
+                    ["-DPGN_WSET=16", f"-DPGN_NST={PG32_NST}", "-DPGN_XNT=32"],
+                )
+    return _PG_NARROW32_EXT
 
 
 def st_ext():

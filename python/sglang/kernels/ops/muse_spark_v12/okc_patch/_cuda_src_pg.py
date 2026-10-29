@@ -150,8 +150,9 @@ constexpr int BK  = 64;                  // k per stage
 constexpr int NKT = 64;                  // k-tiles (K = 4096 for both GEMMs)
 constexpr int XB  = XNT * BK * 2;        // 32768: one k-tile token image [256 t][128 B], 128B-swizzled K-major
 constexpr int WSB = 5120;                // merged W(4096) + bf16 scale pairs (1024) per (wt, kt)
+constexpr int PXB = XNT < 64 ? XB : 8192;  // PAIR stage X bytes per k-tile (64 tokens; XNT 32: 32 tokens)
 #ifdef PGN_WSET
-constexpr int SB  = (16384 + 2 * WSB + 1023) / 1024 * 1024;   // PAIR stage: X 2 x 8 KB + W|sf 2 x WSB
+constexpr int SB  = (2 * PXB + 2 * WSB + 1023) / 1024 * 1024;   // PAIR stage: X 2 x PXB + W|sf 2 x WSB
 #else   // PGN_WSET
 constexpr int SB  = 37888;               // stage stride: X 32768 + W|sf 5120 (a whole number of 1024 B atoms)
 #endif  // PGN_WSET
@@ -505,8 +506,8 @@ struct Ctx {
 // advances. Twice the k-tiles in flight for the same ring: 64-token items are bound by ring depth / TMA latency.
 template <int GATED, int NV, int NST, int MODE, int LAG, int PAIR = 0, int SUB = 0, int N4 = 0>
 DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
-    constexpr unsigned XOFF = PAIR ? SUB * 8192 : 0;
-    constexpr unsigned WOFF = PAIR ? 16384 + SUB * WSB : XB;
+    constexpr unsigned XOFF = PAIR ? SUB * PXB : 0;
+    constexpr unsigned WOFF = PAIR ? 2 * PXB + SUB * WSB : XB;
     if (!PAIR || SUB == 0) mbar_wait(c.mb + c.sl * 8, c.cph);
     if (MODE == 0) {
         const char* stp = c.smem + c.sl * SB + (N4 ? c.woff : 0);
@@ -529,7 +530,7 @@ DINL void kstep(Ctx& c, int kt, float* acc, unsigned (&ab)[16]) {
     }
     if (MODE != 3) {
         const unsigned xaddr = c.sbase + c.sl * SB + XOFF;
-        constexpr unsigned HS = PAIR ? 4096 : XB / 2;     // gg2: stride of the two SW64 half-tiles in the slot
+        constexpr unsigned HS = PAIR ? PXB / 2 : XB / 2;  // gg2: stride of the two SW64 half-tiles in the slot
         // the descriptor's start-address field is (addr >> 4) < 2^14 for every smem address (16 B aligned), below
         // the LBO bits of dhi's low word: base + compile-time k16 offset needs no mask and no carry handling
         const unsigned dlo0 = (unsigned)c.dhi + (xaddr >> 4);
@@ -921,10 +922,10 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
                             const char* xk = xs + (size_t)(kt + sub) * XB;
                             if (GATED) {
 #ifdef PGN_WSET
-                                bulk_g2s(st + sub * 8192, xk, nv * 128, mb + sl * 8);
+                                bulk_g2s(st + sub * PXB, xk, nv * 128, mb + sl * 8);
                             } else {
-                                bulk_g2s(st + sub * 8192, xk, nv * 64, mb + sl * 8);
-                                bulk_g2s(st + sub * 8192 + 4096, xk + XB / 2, nv * 64, mb + sl * 8);
+                                bulk_g2s(st + sub * PXB, xk, nv * 64, mb + sl * 8);
+                                bulk_g2s(st + sub * PXB + PXB / 2, xk + XB / 2, nv * 64, mb + sl * 8);
 #else   // PGN_WSET
                                 bulk_g2s(st + sub * 8192, xk, 8192, mb + sl * 8);
                             } else {
@@ -933,7 +934,7 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
 #endif  // PGN_WSET
                             }
                         }
-                        bulk_g2s(st + 16384, ws + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);   // W|sf kt, kt+1
+                        bulk_g2s(st + 2 * PXB, ws + (size_t)kt * WSB, 2 * WSB, mb + sl * 8);   // W|sf kt, kt+1
                     }
                     if (++sl == NST) { sl = 0; rnd++; }
                     if (ks == 8 && nxt < n_items) e_n = block_experts[ent_n & 0xFFFFF];
@@ -989,6 +990,12 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
         }
         const int nv = eff_nv<WSET>(wcode);
 #ifdef PGN_WSET
+        if constexpr (XNT < 64) {                       // XNT 32: widths 16 / 32 only
+            if (nv == 16)
+                item_body<GATED, NST, MODE, 16, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            else
+                item_body<GATED, NST, MODE, XNT, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+        } else
         if ((WSET & 16) && nv == 16)
             item_body<GATED, NST, MODE, 16, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
         else if ((WSET & 8) && nv == 32)

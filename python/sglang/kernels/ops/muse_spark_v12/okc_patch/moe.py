@@ -75,6 +75,8 @@ def _build_packs(layer) -> dict | None:
             pg_moe.pg_narrow_ext()
             if _sw.PG64_MAX_T >= _sw.PG_NARROW_MIN_T:
                 pg_moe.pg_narrow64_ext()
+            if _sw.PG32_MAX_T >= _sw.PG_NARROW_MIN_T:
+                pg_moe.pg_narrow32_ext()
         if _sw.SW_MOE_ST:
             from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext
 
@@ -202,7 +204,7 @@ def dispatch_path(layer, tokens, pre_expert_norm=None):
             name = "align"
         bm = pg_moe.block_m(tokens)
         if bm != pg_moe._BLOCK_M:
-            name += "-narrow" if bm == 128 else "-narrow64"
+            name += "-narrow" if bm == 128 else "-narrow32" if bm == 32 else "-narrow64"
     mode = _rep_mode(layer, tokens)
     # split_replicas is per route: the small front end's per-expert map (route_map) is static above the limit
     if mode == "assign":

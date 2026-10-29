@@ -16,8 +16,8 @@ replica).
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL
-from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow64_ext, pg_narrow_ext
+from sglang.kernels.ops.muse_spark_v12.okc_patch import PG32_MAX_T, PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL
+from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow32_ext, pg_narrow64_ext, pg_narrow_ext
 
 _BLOCK_M = 256
 _CFG = 350        # the bank's shipped pg configuration (widths 64 / 128 / 256, 5 stages)
@@ -104,12 +104,16 @@ def block_m(num_tokens: int) -> int:
     """moe_align block size for a call of num_tokens tokens: 64 up to OKC_PG64_MAX_T and 128 above it on the narrow
     build's range, else 256. A host-side size only, so a captured graph's dispatch is fixed per token bucket."""
     if PG_NARROW_MIN_T <= num_tokens <= PG_NARROW_MAX_T:
+        if num_tokens <= PG32_MAX_T:
+            return 32
         return 64 if num_tokens <= PG64_MAX_T else 128
     return _BLOCK_M
 
 
 def _ext(bm: int):
     """The pg build for token block bm (256 shipped, 128 / 64 the narrow instances)."""
+    if bm == 32:
+        return pg_narrow32_ext()
     return pg_ext() if bm == _BLOCK_M else pg_narrow_ext() if bm == 128 else pg_narrow64_ext()
 
 
