@@ -69,6 +69,7 @@ class _OkcHopperSP:
 
     active: bool = False
     symm: bool = False
+    symm_ok: bool = False   # the startup probe passed (gates every symm-mem path: fused, ext_coll, copy-engine)
     symm_min_tokens: int = 0
     min_tokens: int = 0
 
@@ -152,13 +153,18 @@ def initialize_layernorm_sp(*, model_config) -> None:
             SP_MIN_TOKENS,
             SP_SYMM,
             SP_SYMM_MIN_TOKENS,
+            SW_EXT_AG,
+            SW_EXT_RS,
         )
 
         _okc_hopper.min_tokens = SP_MIN_TOKENS
 
-        # Every rank evaluates the same switches, so all of them enter the collective probe together.
-        _okc_hopper.symm = SP_SYMM and _HAS_TORCH_SYMM_MEM_FUSED and _okc_symm_probe()
-        if SP_SYMM and _HAS_TORCH_SYMM_MEM_FUSED and not _okc_hopper.symm:
+        # Every rank evaluates the same switches, so all of them enter the collective probe together. A failed probe
+        # turns off every symm-mem path (the fused linears, ext_coll's multimem gather / reduce, the copy-engine ops).
+        want = SP_SYMM or SW_EXT_AG or SW_EXT_RS
+        _okc_hopper.symm_ok = want and _HAS_TORCH_SYMM_MEM_FUSED and _okc_symm_probe()
+        _okc_hopper.symm = SP_SYMM and _okc_hopper.symm_ok
+        if want and not _okc_hopper.symm_ok:
             logger.warning("OKC SP: symm-mem fused linears unavailable on this node; using NCCL collectives.")
         _okc_hopper.symm_min_tokens = SP_SYMM_MIN_TOKENS
     get_flags().sp.enabled = bool(

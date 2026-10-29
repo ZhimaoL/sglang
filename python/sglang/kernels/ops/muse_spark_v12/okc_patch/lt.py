@@ -141,8 +141,7 @@ def _ext():
         with _lock:
             if _OK is None:
                 try:
-                    from torch.utils.cpp_extension import load_inline
-
+                    from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import _load_inline as load_inline
                     from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_lt import _CPP_SRC
 
                     _EXT = load_inline(name="okc_lt_v2", cpp_sources=[_CPP_SRC],

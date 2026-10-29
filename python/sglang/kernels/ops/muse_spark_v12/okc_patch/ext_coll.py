@@ -12,11 +12,60 @@ contribution, which each peer sends after its qkv GEMM has read the buffer, so n
 layer's stores arrive.
 """
 
+import logging
+
 import torch
 
 from sglang.kernels.ops.muse_spark_v12 import okc_patch as _sw
 
+logger = logging.getLogger(__name__)
 _STATE = {}   # group name -> (symmetric bf16 buffer, elements) or None (no multicast: NCCL)
+
+
+def agree(ok) -> bool:
+    """True only if every TP rank passes ok (MIN over the CPU group): a symmetric-memory path runs on all ranks or on
+    none, since a rank that failed alone would leave its peers waiting inside the next collective."""
+    import torch.distributed as dist
+
+    from sglang.srt.runtime_context import get_parallel
+
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=get_parallel().tp_group.cpu_group)
+    return bool(flag.item())
+
+
+def agreed(step):
+    """step() on every TP rank: its result if no rank raised or got None, else None on all of them. Setup runs as
+    agreed steps (allocate, rendezvous, first use), so no rank enters a collective that a peer has given up on."""
+    try:
+        r = step()
+    except Exception as e:  # setup / IPC / multicast failure: the NCCL path
+        logger.warning("OKC symm-mem setup failed: %r", e)
+        r = None
+    return r if agree(r is not None) else None
+
+
+def _symm_ok() -> bool:
+    """The startup probe's verdict (layernorm_sp._okc_symm_probe, agreed over the TP ranks)."""
+    from sglang.srt.layers.layernorm_sp import _okc_hopper
+
+    return _okc_hopper.symm_ok
+
+
+def _mc_handle(buf, group_name: str):
+    import torch.distributed._symmetric_memory as symm_mem
+
+    hdl = symm_mem.rendezvous(buf, group_name)
+    return hdl if int(getattr(hdl, "multicast_ptr", 0) or 0) else None
+
+
+def _mc_gather_ok(hdl, buf, group_name: str):
+    """One small multimem gather of the rank ids through the buffer, checked: True, or None."""
+    w = hdl.world_size
+    src = torch.full((8,), hdl.rank, dtype=torch.bfloat16, device=buf.device)
+    torch.ops.symm_mem.multimem_all_gather_out(src, group_name, buf[: 8 * w])
+    want = torch.arange(w, dtype=torch.bfloat16, device=buf.device).repeat_interleave(8)
+    return True if torch.equal(buf[: 8 * w], want) else None
 
 
 def _buffer(group_name: str, device):
@@ -26,16 +75,14 @@ def _buffer(group_name: str, device):
     if torch.cuda.is_current_stream_capturing():
         return None   # never allocate / rendezvous inside a capture (the eager warm-up makes it first)
     st = None
-    try:
+    if _symm_ok():
         import torch.distributed._symmetric_memory as symm_mem
 
         n = _sw.EXT_AG_MAX_BYTES // 2
-        buf = symm_mem.empty(n, dtype=torch.bfloat16, device=device)
-        hdl = symm_mem.rendezvous(buf, group_name)
-        if int(getattr(hdl, "multicast_ptr", 0) or 0) != 0:
+        buf = agreed(lambda: symm_mem.empty(n, dtype=torch.bfloat16, device=device))
+        hdl = buf is not None and agreed(lambda: _mc_handle(buf, group_name))
+        if hdl and agreed(lambda: _mc_gather_ok(hdl, buf, group_name)):
             st = (buf, n)
-    except Exception:
-        st = None
     _STATE[group_name] = st
     return st
 
@@ -107,9 +154,9 @@ _RS_EXT = None
 def _rs_ext():
     global _RS_EXT
     if _RS_EXT is None:
-        from torch.utils.cpp_extension import load_inline
+        from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import _load_inline
 
-        _RS_EXT = load_inline(name="okc_ext_rsld_v1", cpp_sources="void okc_rsld_run(int64_t, torch::Tensor, int64_t);",
+        _RS_EXT = _load_inline(name="okc_ext_rsld_v1", cpp_sources="void okc_rsld_run(int64_t, torch::Tensor, int64_t);",
                               cuda_sources=_RS_SRC, functions=["okc_rsld_run"], extra_cuda_cflags=["-O3"],
                               verbose=False)
     return _RS_EXT
@@ -125,18 +172,14 @@ def _rs_buffer(group_name: str, device):
     if torch.cuda.is_current_stream_capturing():
         return None
     st = None
-    try:
+    if _symm_ok():
         import torch.distributed._symmetric_memory as symm_mem
 
         n = _sw.EXT_AG_MAX_BYTES // 2
-        buf = symm_mem.empty(n, dtype=torch.bfloat16, device=device)
-        hdl = symm_mem.rendezvous(buf, group_name)
-        mc = int(getattr(hdl, "multicast_ptr", 0) or 0)
-        if mc != 0:
-            _rs_ext()
-            st = (buf, n, hdl, mc)
-    except Exception:
-        st = None
+        buf = agreed(lambda: symm_mem.empty(n, dtype=torch.bfloat16, device=device))
+        hdl = buf is not None and agreed(lambda: _mc_handle(buf, group_name))
+        if hdl and agreed(_rs_ext):
+            st = (buf, n, hdl, int(hdl.multicast_ptr))
     _RS_STATE[group_name] = st
     return st
 

@@ -87,11 +87,11 @@ def take_slots(out):
 class _Buffers:
     """One symmetric allocation per rank: [gather: W*R*H bf16 | receive: W*R*H bf16], rank-major slots of R rows."""
 
-    def __init__(self, group_name: str, world: int, rows: int, hidden: int, device):
+    def __init__(self, buf, group_name: str, world: int, rows: int, hidden: int):
         from torch.distributed import _symmetric_memory as symm_mem
 
         n = world * rows * hidden
-        self.buf = symm_mem.empty(2 * 2 * n, dtype=torch.uint8, device=device)
+        self.buf = buf
         self.hdl = symm_mem.rendezvous(self.buf, group_name)
         self.rank, self.world = self.hdl.rank, self.hdl.world_size
         if self.world != world:
@@ -114,15 +114,21 @@ def _buffers(tp_group, hidden: int, device):
         return _state
     if torch.cuda.is_current_stream_capturing():
         return None
-    try:
-        world = tp_group.world_size
-        _state = _Buffers(tp_group.device_group.group_name, world, -(-MAX_TOKENS // world), hidden, device)
+    from torch.distributed import _symmetric_memory as symm_mem
+
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.ext_coll import agreed
+
+    world = tp_group.world_size
+    rows = -(-MAX_TOKENS // world)
+    # agreed steps (allocate, then rendezvous): every rank takes the copy-engine path or none does
+    buf = agreed(lambda: symm_mem.empty(2 * 2 * world * rows * hidden, dtype=torch.uint8, device=device))
+    _state = None if buf is None else agreed(lambda: _Buffers(buf, tp_group.device_group.group_name, world, rows, hidden))
+    if _state is None:
+        logger.warning("OKC SP copy-engine TP collectives unavailable (symm-mem buffers); using the fused / NCCL path.")
+        _failed = True
+    else:
         logger.info("OKC SP copy-engine TP collectives: AG barrier every %d steps, %d comm streams, %.0f MiB symmetric.",
                     GROUP, len(_state.streams), _state.buf.numel() / 2**20)
-    except Exception as e:
-        logger.warning("OKC SP copy-engine TP collectives unavailable (symm-mem buffers): %r", e)
-        _failed = True
-        _state = None
     return _state
 
 

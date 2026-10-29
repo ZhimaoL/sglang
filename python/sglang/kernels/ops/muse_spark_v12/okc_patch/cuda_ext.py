@@ -2,6 +2,7 @@
 pg and wst carry hand wgmma PTX, which needs the sm_90a feature target."""
 
 import os
+import tempfile
 import threading
 
 _lock = threading.Lock()
@@ -17,6 +18,42 @@ _WST_EXT = None
 _VFG_EXT = None
 _DRAFT_EXT = None
 _ROUTE_EXT = None
+
+def _build_dir(name: str):
+    """None (torch's default build directory) when that is writable, else one under the temp dir: a read-only home or
+    cache would otherwise fail the first build."""
+    from torch.utils import cpp_extension
+
+    try:
+        if os.access(cpp_extension._get_build_directory(name, False), os.W_OK):
+            return None
+    except AttributeError:
+        return None
+    except OSError:
+        pass
+    d = os.path.join(tempfile.gettempdir(), "okc_torch_extensions", name)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _load_inline(**kw):
+    """torch's load_inline with TORCH_CUDA_ARCH_LIST=9.0a for this build only (the hand wgmma / TMA PTX needs sm_90a;
+    the process's own value is restored after) and a writable build directory (_build_dir)."""
+    from torch.utils.cpp_extension import load_inline
+
+    prev = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+    try:
+        d = _build_dir(kw["name"])
+        if d is not None:
+            kw["build_directory"] = d
+        return load_inline(**kw)
+    finally:
+        if prev is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = prev
+
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -34,12 +71,10 @@ def glue_ext():
     if _GLUE_EXT is None:
         with _lock:
             if _GLUE_EXT is None:
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_PDL
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_glue import _CUDA_SRC
 
-                ext = load_inline(
+                ext = _load_inline(
                     name="okc_verify_glue_v1",
                     cpp_sources="void tail_boundary(torch::Tensor, torch::Tensor, torch::Tensor, double, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, double, torch::Tensor, torch::Tensor);\n"
@@ -63,11 +98,8 @@ _ARG = {"T": "torch::Tensor", "i": "int64_t", "d": "double"}
 
 
 def _pg_load(name, src, fns, defines=()):
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
-    from torch.utils.cpp_extension import load_inline
-
     cpp = "".join(f"void {f}({', '.join(_ARG[c] for c in _PG_SIG[f])});\n" for f in fns)
-    return load_inline(
+    return _load_inline(
         name=name, cpp_sources=cpp, cuda_sources=src, functions=list(fns),
         extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a", *defines],
         verbose=False,
@@ -125,13 +157,10 @@ def st_ext():
     if _ST_EXT is None:
         with _lock:
             if _ST_EXT is None:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch import _cuda_src_st as _st_src
 
                 # bf16 scales and the 64-slot table (the lane's okc_st_moe_c1 reads 8-bit codes, 32 slots)
-                _ST_EXT = load_inline(
+                _ST_EXT = _load_inline(
                     name="okc_st_moe_c8_s16_e64",
                     cpp_sources="void st_moe(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, int64_t, torch::Tensor, double, torch::Tensor, "
@@ -153,12 +182,10 @@ def route_ext():
     if _ROUTE_EXT is None:
         with _lock:
             if _ROUTE_EXT is None:
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_route import _CUDA_SRC
 
                 # no --use_fast_math, as reduce_k<2> and the routing kernel
-                _ROUTE_EXT = load_inline(
+                _ROUTE_EXT = _load_inline(
                     name="okc_route_c9",
                     cpp_sources="void route(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "int64_t, int64_t, double, double, double, int64_t, torch::Tensor);",
@@ -175,8 +202,6 @@ def proj_ext():
     if _PROJ_EXT is None:
         with _lock:
             if _PROJ_EXT is None:
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_proj import (
                     _CUDA_SRC,
                 )
@@ -184,7 +209,7 @@ def proj_ext():
                 # Flags match the certified kernel-track build; the name differs because the router GEMV and
                 # reduce_k<2> changed (a shared name would rebuild over that lane's torch_extensions cache), and
                 # again for the PDL launches (proj_set_pdl) and once more without the MMA-pack / 13-bit streams.
-                _PROJ_EXT = load_inline(
+                _PROJ_EXT = _load_inline(
                     name="okc_v5_stream_det_pdl_g",
                     cpp_sources=[_PROJ_CPP],
                     cuda_sources=[_CUDA_SRC],
@@ -223,15 +248,12 @@ def fmha_ext(exact: bool = False):
             if _FMHA_EXT is None:
                 _FMHA_EXT = {}
             if key not in _FMHA_EXT:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_fmha import (
                     _CUDA_SRC,
                 )
 
                 # The prefill lane's flags for this module (fmha7's TMA / wgmma PTX needs sm_90a).
-                _FMHA_EXT[key] = load_inline(
+                _FMHA_EXT[key] = _load_inline(
                     name="okc_pfmha_c4b_exact" if key else "okc_pfmha_c4b",
                     cpp_sources=[_FMHA_CPP],
                     cuda_sources=[_CUDA_SRC],
@@ -252,15 +274,12 @@ def smallm_ext():
     if _SMALLM_EXT is None:
         with _lock:
             if _SMALLM_EXT is None:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_smallm import (
                     _CUDA_SRC,
                 )
 
                 # TMA tensor maps (cuTensorMapEncodeTiled via cudaGetDriverEntryPoint) + wgmma: sm_90a.
-                _SMALLM_EXT = load_inline(
+                _SMALLM_EXT = _load_inline(
                     name="okc_smallm_rmw_v1",
                     cpp_sources="void rmw_launch(torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, "
                     "int64_t, int64_t, int64_t, int64_t, int64_t);",
@@ -289,15 +308,12 @@ def wst_ext():
     if _WST_EXT is None:
         with _lock:
             if _WST_EXT is None:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_wst import (
                     _CUDA_SRC,
                 )
 
                 # The bank's flags (v16c_m7g_rlx3 _wst_ext); a name of our own so the lane's cache is never reused.
-                _WST_EXT = load_inline(
+                _WST_EXT = _load_inline(
                     name="okc_wst_verify_v1_p32",
                     cpp_sources=[_WST_CPP],
                     cuda_sources=[_CUDA_SRC],
@@ -331,15 +347,12 @@ def vfg_ext():
     if _VFG_EXT is None:
         with _lock:
             if _VFG_EXT is None:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_vfg import (
                     _CUDA_SRC,
                 )
 
                 # The bank's flags for its svsd module (v16c_m7g_rlx3 _svsd_ext); a name of our own.
-                _VFG_EXT = load_inline(
+                _VFG_EXT = _load_inline(
                     name="okc_vfg_verify_v2",
                     cpp_sources=[_VFG_CPP],
                     cuda_sources=[_CUDA_SRC],
@@ -363,12 +376,10 @@ def draft_ext():
     if _DRAFT_EXT is None:
         with _lock:
             if _DRAFT_EXT is None:
-                from torch.utils.cpp_extension import load_inline
-
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_draft import _CPP_SRC, _CUDA_SRC
 
                 # No fast-math: cand_merge's tanh and products must match torch's float kernels.
-                _DRAFT_EXT = load_inline(
+                _DRAFT_EXT = _load_inline(
                     name="okc_draft_glue_v1",
                     cpp_sources=_CPP_SRC,
                     cuda_sources=[_CUDA_SRC],
