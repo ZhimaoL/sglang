@@ -86,8 +86,7 @@ MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 # st folds the pre-expert RMSNorm into its gate/up kernel (bit-identical to F.rms_norm, as pg_gather_norm), saving the
 # separate norm launch on every st layer.
 SW_ST_NORM_FOLD = _flag("OKC_SW_ST_NORM_FOLD", "1")
-# With the fold on, the verify pooler's gather (gemm_ag) emits the pre-expert norm instead (computed once per token, the
-# same values), and st reads the normed rows without restaging (court C39: the fold's per-CTA restage is st's span)
+# with the fold on, the pooler's gather emits the pre-expert norm (once per token, same values; court C39)
 SW_AG_PRENORM = _flag("OKC_SW_AG_PRENORM", "1")
 # st runs pg_rep_assign's balancer (or the home map) in its own CTAs, saving that launch (bit-identical).
 SW_ST_REP_FOLD = _flag("OKC_SW_ST_REP_FOLD", "1")

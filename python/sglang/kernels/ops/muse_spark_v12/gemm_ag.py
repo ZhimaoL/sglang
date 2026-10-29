@@ -132,7 +132,7 @@ def all_gather(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 0.0,
 ) -> torch.Tensor:
-    """``out[:, rank slice] = local`` gathered from every rank, (+ b) (+ c); OKC: RMSNorm-ed with ``norm_weight``."""
+    """``out[:, rank slice] = local`` gathered from every rank, (+ b) (+ c)."""
     _jit_module(out.shape[1], comm.world_size).run(
         comm.obj, local.contiguous(), b, c, out, norm_weight, norm_eps
     )
@@ -160,8 +160,7 @@ def gemm_ag(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 0.0,
 ) -> torch.Tensor:
-    """``x @ weight.T (+ b) (+ c)``; ``weight`` is the FULL replicated [N, K]. OKC: with ``norm_weight`` (N == 4096,
-    no b / c) the gathered rows come out RMSNorm-ed: F.rms_norm(row, (N,), norm_weight, norm_eps), bit for bit."""
+    """``x @ weight.T (+ b) (+ c)``; ``weight`` is the FULL replicated [N, K]. OKC: ``norm_weight`` -> F.rms_norm-ed."""
     local = gemm_local(comm, x, weight)
     if out is None:
         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)

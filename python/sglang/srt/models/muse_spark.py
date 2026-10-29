@@ -1096,9 +1096,7 @@ class MuseSpark1xMoE(nn.Module):
         return output
 
     def _okc_ag_prenorm(self, tokens: int):
-        """OKC_SW_AG_PRENORM: (weight, eps) when the pooler's gather can emit the pre-expert norm itself, i.e. when the
-        experts would run st with the norm folded (T <= OKC_MOE_ST_MAX_TOKENS): the norm is then computed once per token
-        instead of in every st CTA at each pass switch (same values: torch's rms_norm order in both). Else None."""
+        """OKC_SW_AG_PRENORM: (weight, eps) when st would fold the pre-expert norm: the gather emits it instead."""
         if not (okc_patch.SW_AG_PRENORM and okc_patch.SW_ST_NORM_FOLD and self.nvfp4_checkpoint):
             return None
         state = getattr(self.experts, "_okc_moe_state", None)
@@ -1109,7 +1107,7 @@ class MuseSpark1xMoE(nn.Module):
         if not okc_moe.dispatch_path(self.experts, tokens, self.pre_expert_norm).startswith("st"):
             return None
         probe = getattr(self, "_okc_ag_prenorm_w", None)
-        if probe is None:   # the fold's own weight checks, once
+        if probe is None:
             probe = self._okc_ag_prenorm_w = okc_moe._norm_fold(
                 torch.empty((1, self.expert_hidden_size), dtype=torch.bfloat16), self.pre_expert_norm) or ()
         return probe or None
