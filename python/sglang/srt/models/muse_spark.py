@@ -1098,8 +1098,10 @@ class MuseSpark1xMoE(nn.Module):
 
         if _OKC_TOPK_DUMP_DIR:
             _okc_dump_topk(self.layer_idx, topk_ids, self.ep_rank, bool(sp_active))
+        # the ring holds whole prefill forwards of >= ADAPT_MIN_T tokens (SP: shard rows x ranks; every rank alike):
+        # small SP extends (ext_coll) would otherwise fill it with 1K-token rows and understate the prefill straggler
         if (okc_patch.ADAPT_REPLICAS and getattr(self.experts, "_okc_adapt_ring", None) is not None
-                and (sp_active or topk_ids.shape[0] >= okc_patch.ADAPT_MIN_T)):
+                and topk_ids.shape[0] * (self.ep_size if sp_active else 1) >= okc_patch.ADAPT_MIN_T):
             from sglang.kernels.ops.muse_spark_v12.okc_patch import adaptive as okc_adaptive
 
             okc_adaptive.count_prefill(self.experts, topk_ids, bool(sp_active), self.ep_rank)
