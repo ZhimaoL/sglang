@@ -1123,6 +1123,60 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
 
+    def okc_warm_eager_gemms(self, max_tokens: int) -> None:
+        """OKC (OKC_SW_WARM_GEMMS): launch every cuBLASLt kernel variant the eager DFlash context path can pick, once, at
+        boot. The draft fc (the target's SP-exit tail and the replicated projection of verify commits / short extends)
+        and the fused KV materialization run outside the CUDA graphs with M = new context rows, and the heuristic takes
+        a different nvjet variant every few M. A variant's first launch blocks the CPU until the GPU queue drains, which
+        exposes the scheduler's serial post-batch work (court C20 / C21: 5 drains of 9-16 ms per 2.85 s of c32 tail;
+        CUDA_MODULE_LOADING=EAGER does not help). Same weights, shapes, strides and dispatch as the runtime calls, every
+        rank in the same order (the replicated fc's gemm_ag gathers); zero rows, no KV write: the materialization fills
+        the helper's own workspace, rewritten on every use."""
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        if not okc_patch.SW_WARM_GEMMS or max_tokens <= 0:
+            return
+        import time
+
+        from sglang.srt.distributed import get_tp_group
+
+        t0 = time.perf_counter()
+        dm = self.draft_model
+        fc = getattr(dm, "fc", None)
+        helper = self._fused_kv_helper if self._use_fused_kv_materialize else None
+        calls = loads = 0
+
+        def run(fn, *args):  # over 1 ms of host time: a first launch (~1.9 ms idle, court C21), a gather wait or a full queue
+            nonlocal calls, loads
+            c = time.perf_counter()
+            fn(*args)
+            calls += 1
+            loads += time.perf_counter() - c > 1e-3
+
+        with torch.inference_mode(), draft_tp_context(self.draft_owns_attention):
+            if isinstance(fc, torch.nn.Linear) and fc.weight.dtype is torch.bfloat16:
+                tp = int(get_tp_group().world_size)
+                hooked = getattr(self.model_runner.model, "_okc_aux_project", None) is not None
+                shard_rows = -(-max_tokens // tp) if hooked else 0
+                rep_rows = min(max_tokens, okc_patch.SP_MIN_TOKENS)
+                taps = torch.zeros((max(shard_rows, rep_rows), fc.in_features), dtype=fc.weight.dtype, device=self.device)
+                for r in range(1, shard_rows + 1):
+                    run(dm.okc_project_local, taps[:r])
+                for m in range(1, rep_rows + 1):
+                    run(dm.project_target_hidden, taps[:m])
+                del taps
+            if helper is not None:
+                w = helper.flat_kv_weight_t
+                ctx = torch.zeros((max_tokens, w.shape[0]), dtype=w.dtype, device=self.device)
+                pos = torch.zeros((max_tokens,), dtype=torch.int64, device=self.device)
+                for m in range(1, max_tokens + 1):
+                    run(helper.materialize, ctx[:m], pos[:m], None)
+                del ctx, pos
+        torch.cuda.synchronize()
+        if get_parallel().tp_rank == 0:
+            logger.info("OKC eager GEMM warmup: %d calls up to %d rows, %d slow (first launches), %.1f s.", calls, max_tokens, loads,
+                        time.perf_counter() - t0)
+
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
             0

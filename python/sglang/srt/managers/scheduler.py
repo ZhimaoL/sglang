@@ -6160,6 +6160,10 @@ def run_scheduler_process(
     scheduler = None
     try:
         scheduler = Scheduler(server_args, port_args)
+        # OKC: load the eager DFlash GEMM variants before the server reports ready (court C21).
+        warm = getattr(getattr(scheduler, "draft_worker", None), "okc_warm_eager_gemms", None)
+        if warm is not None:
+            warm(max(server_args.chunked_prefill_size or 0, server_args.max_prefill_tokens or 0))
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
