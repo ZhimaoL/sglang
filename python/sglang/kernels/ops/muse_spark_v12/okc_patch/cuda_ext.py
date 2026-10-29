@@ -17,6 +17,7 @@ _WST_EXT = None
 _VFG_EXT = None
 _DRAFT_EXT = None
 _ROUTE_EXT = None
+_ARBULK_EXT = None
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
@@ -168,6 +169,28 @@ def route_ext():
                     verbose=False,
                 )
     return _ROUTE_EXT
+
+
+def arbulk_ext():
+    """The bulk-copy 2-shot all-reduce (custom_all_reduce_v2 under OKC_SW_AR_BULK): TMA bulk PTX, sm_90a."""
+    global _ARBULK_EXT
+    if _ARBULK_EXT is None:
+        with _lock:
+            if _ARBULK_EXT is None:
+                from torch.utils.cpp_extension import load_inline
+
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_arbulk import _CUDA_SRC
+
+                _ARBULK_EXT = load_inline(
+                    name="okc_arbulk_v1",
+                    cpp_sources="void ar2_bulk_launch(int64_t, int64_t, int64_t, std::vector<int64_t>, int64_t, int64_t, "
+                    "int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);\nint64_t ar2_ws_bytes(int64_t, int64_t);",
+                    cuda_sources=_CUDA_SRC,
+                    functions=["ar2_bulk_launch", "ar2_ws_bytes"],
+                    extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+                    verbose=False,
+                )
+    return _ARBULK_EXT
 
 
 def proj_ext():

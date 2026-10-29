@@ -25,6 +25,7 @@ the kernel captured in the graph dereferences its row at replay time.
 """
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import List, NamedTuple, Optional, Tuple
 
@@ -68,6 +69,15 @@ MB = 1024 * 1024
 _ALIGN_BYTES = 1024
 _SEMAPHORE_BYTES = 128
 _MAX_GRAPH_INPUTS = 131072
+# OKC bulk-copy 2-shot all-reduce (okc_patch/_cuda_src_arbulk.py): bf16 2-shot-push calls of OKC_AR_BULK_MIN_KB ..
+# OKC_AR_BULK_MAX_KB (the verify ARs at bs 12-32) run as TMA bulk peer copies on OKC_AR_BULK_G CTAs in
+# OKC_AR_BULK_P-byte pieces, bit-identical to push2. Own symmetric workspace (2 x MAX + flags per rank). Default off.
+_AR_BULK = os.environ.get("OKC_SW_AR_BULK", "0") == "1"
+_AR_BULK_MIN = int(os.environ.get("OKC_AR_BULK_MIN_KB", "1536")) * 1024
+_AR_BULK_MAX = int(os.environ.get("OKC_AR_BULK_MAX_KB", "4096")) * 1024
+_AR_BULK_G = int(os.environ.get("OKC_AR_BULK_G", "32"))
+_AR_BULK_P = int(os.environ.get("OKC_AR_BULK_P", "16384"))
+_AR_BULK_PDL = os.environ.get("OKC_AR_BULK_PDL", "1") == "1"
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
 # forced per-direction workspace sizes; highest priority, override both the
@@ -216,6 +226,35 @@ class CustomAllReduceV2:
         self._graph_mode_allowed = False
         self._capture_started = False
         self.disabled = False
+        self._bulk = self._init_bulk() if _AR_BULK else None
+
+    def _init_bulk(self):
+        """(ext, peer workspace ptrs, cmax, npmax, capacity) of the bulk 2-shot AR, or None (TP8 and >= MIN only)."""
+        cap = _AR_BULK_MAX   # its own workspace: independent of the push plane's (re)reserved capacity
+        if self.world_size != 8 or cap < _AR_BULK_MIN or (cap // 8) % _AR_BULK_P:
+            return None
+        from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import arbulk_ext
+
+        ext = arbulk_ext()
+        cmax = cap // 8
+        npmax = cmax // _AR_BULK_P
+        nbytes = _ceil_align(ext.ar2_ws_bytes(cmax, npmax), _ALIGN_BYTES)
+        self._bulk_tensor, symm = _allocate_symmetric_memory(nbytes, device=self.device, group=self.group)
+        bufs = [symm.get_buffer(i, [nbytes], torch.uint8) for i in range(self.world_size)]
+        bufs[self.rank].zero_()   # flags and gen start at 0
+        torch.cuda.synchronize()
+        dist.barrier(group=self.group)
+        self._bulk_symm = symm
+        logger.info("OKC bulk-copy 2-shot AR on for %d..%d KiB (G %d, P %d, %.1f MiB workspace).",
+                    _AR_BULK_MIN >> 10, cap >> 10, _AR_BULK_G, _AR_BULK_P, nbytes / 2**20)
+        return ext, [b.data_ptr() for b in bufs], cmax, npmax, cap
+
+    def _bulk_all_reduce(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
+        ext, peers, cmax, npmax, _ = self._bulk
+        out = torch.empty_like(input)
+        ext.ar2_bulk_launch(input.data_ptr(), out.data_ptr(), peers[self.rank], peers, self.rank, nbytes, _AR_BULK_P,
+                            cmax, npmax, _AR_BULK_G, 1 if _AR_BULK_PDL else 0, torch.cuda.current_stream().cuda_stream)
+        return out
 
     def reserve_push_capacity(self, nbytes: int) -> None:
         """Grow shared storage without changing AR dispatch or counter capacity.
@@ -426,6 +465,10 @@ class CustomAllReduceV2:
             config = self._pick_config(nbytes, self._can_use_graph())
             assert config is not None, f"No config for {nbytes = }"
             algo, use_graph, use_multicast = config
+            if (self._bulk is not None and algo == AllReduceAlgo.TWO_SHOT_PUSH and input.dtype == torch.bfloat16
+                    and _AR_BULK_MIN <= nbytes <= self._bulk[4] and nbytes % (8 * _AR_BULK_P) == 0
+                    and input.is_contiguous()):
+                return self._bulk_all_reduce(input, nbytes)
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
         return custom_all_reduce(
             self.obj,
