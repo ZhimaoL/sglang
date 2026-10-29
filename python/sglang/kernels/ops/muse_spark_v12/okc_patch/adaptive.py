@@ -16,7 +16,6 @@ an all-gathered table; the replica table is rebuilt and copied in place (capture
 replica slot is a byte copy of the home's packs, so every expert's output is bit-identical on any holder.
 """
 import logging
-import multiprocessing
 import os
 
 import numpy as np
@@ -227,11 +226,6 @@ def _decide_many(jobs):
     return out
 
 
-def _worker_init():
-    for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-        os.environ[k] = "1"
-
-
 class _State:
     def __init__(self):
         self.layers = None          # [(layer_idx, experts module)] with replicas, layer order
@@ -240,7 +234,6 @@ class _State:
         self.pending = None         # AsyncResult of this rank's decisions
         self.fwd = 0
         self.gs = None              # {layer: [256] float global scales of every expert}
-        self.pool = None
         self.last_counts = None
 
 
@@ -328,9 +321,18 @@ def _trigger():
             continue
         R = len(m.replica_plan["order"]) // world
         jobs.append((li, list(m.replica_plan["home"]), Vh[i].tolist(), Rh[i].tolist(), R, 1000 + li))
-    if st.pool is None:
-        st.pool = multiprocessing.get_context("spawn").Pool(1, initializer=_worker_init)
-    st.pending = st.pool.apply_async(_decide_many, (jobs,))
+    # a plain child interpreter (not multiprocessing: the scheduler process may be daemonic), numpy single-threaded
+    import pickle
+    import subprocess
+    import sys
+    import tempfile
+
+    f = tempfile.NamedTemporaryFile(prefix="okc_adapt_", suffix=".pkl", delete=False)
+    pickle.dump(jobs, f); f.close()
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
+    proc = subprocess.Popen([sys.executable, "-m", __name__, f.name, f.name + ".out"], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    st.pending = (proc, f.name, f.name + ".out")
     st.tokens = 0
     logger.info("OKC adaptive replicas: refresh %d decided in the background (%d layers here).", st.refreshes + 1, len(jobs))
 
@@ -341,10 +343,23 @@ def _check():
     st = _S
     _, cpu_g, rank, world = _groups()
     flags = [None] * world
-    dist.all_gather_object(flags, bool(st.pending.ready()), group=cpu_g)
+    proc, fin, fout = st.pending
+    dist.all_gather_object(flags, proc.poll() is not None, group=cpu_g)
     if not all(flags):
         return
-    mine = st.pending.get()
+    import pickle
+
+    mine = {}
+    if proc.returncode == 0 and os.path.exists(fout):
+        with open(fout, "rb") as f:
+            mine = pickle.load(f)
+    else:
+        logger.warning("OKC adaptive replicas: this rank's decision failed (rc %s); its layers keep their sets.", proc.returncode)
+    for x in (fin, fout):
+        try:
+            os.remove(x)
+        except OSError:
+            pass
     parts = [None] * world
     dist.all_gather_object(parts, mine, group=cpu_g)
     plan = {}
@@ -455,3 +470,15 @@ def apply(plan, transfer, rank=None, world=None):
         if getattr(m, "local_expert_ids", None) is not None:
             m.local_expert_ids = ids
     return len(copies_all)
+
+
+if __name__ == "__main__":   # the background decision: python -m ...okc_patch.adaptive <jobs.pkl> <out.pkl>
+    import pickle
+    import sys
+
+    with open(sys.argv[1], "rb") as f:
+        _jobs = pickle.load(f)
+    _res = _decide_many(_jobs)
+    with open(sys.argv[2] + ".tmp", "wb") as f:
+        pickle.dump(_res, f)
+    os.replace(sys.argv[2] + ".tmp", sys.argv[2])
