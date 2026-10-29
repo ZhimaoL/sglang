@@ -185,8 +185,9 @@ struct MuseSparkAllGather {
   template <bool kHasB, bool kHasC>
   static constexpr auto kernel = muse_all_gather::all_gather_kernel<N, kWorld, kHasB, kHasC, kUsePDL>;
 
-  static void
-  run(CommunicatorRef ref, TensorView local, std::optional<TensorView> b, std::optional<TensorView> c, TensorView out) {
+  // OKC: gamma = the pre-expert RMSNorm weight [N] -> the gathered rows come out normed (kNorm; N 4096, no b / c)
+  static void run(CommunicatorRef ref, TensorView local, std::optional<TensorView> b, std::optional<TensorView> c,
+                  TensorView out, std::optional<TensorView> gamma, double eps) {
     using namespace host;
     const auto& push = ref.get()->get_push_obj();
 
@@ -216,59 +217,24 @@ struct MuseSparkAllGather {
         .c = c.has_value() ? static_cast<const bf16_t*>(c.value().data_ptr()) : nullptr,
         .out = static_cast<bf16_t*>(out.data_ptr()),
         .num_rows = num_tokens,
-        .gamma = nullptr,
-        .eps = 0.f,
-    };
-    const auto num_vecs = num_tokens * N / muse_all_gather::kVec;
-    CHECK_HOST(push.num_blocks >= 2) << "gather needs a work block and a counter-update block";
-    const auto num_work_blocks = std::min(host::div_ceil(num_vecs, muse_all_gather::kBlock), push.num_blocks - 1);
-    const auto fn =
-        b.has_value() ? (c.has_value() ? kernel<1, 1> : kernel<1, 0>) : (c.has_value() ? kernel<0, 1> : kernel<0, 0>);
-    host::LaunchKernel(num_work_blocks + 1, muse_all_gather::kBlock, device.unwrap()).enable_pdl(kUsePDL)(fn, params);
-  }
-};
-
-// OKC: the gather with the pre-expert RMSNorm fused (kNorm, N == 4096 only).
-template <uint32_t N, uint32_t kWorld, bool kUsePDL>
-struct MuseSparkAllGatherNorm {
-  using TensorView = tvm::ffi::TensorView;
-  static constexpr uint32_t kNLocal = N / kWorld;
-
-  static void run(CommunicatorRef ref, TensorView local, TensorView gamma, double eps, TensorView out) {
-    using namespace host;
-    const auto& push = ref.get()->get_push_obj();
-    auto M = SymbolicSize{"num_tokens"};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
-    TensorMatcher({M, kNLocal}).with_dtype<bf16_t>().with_device(device).verify(local);
-    TensorMatcher({N}).with_dtype<bf16_t>().with_device(device).verify(gamma);
-    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(out);
-    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
-    CHECK_HOST(num_tokens >= 1);
-    CHECK_HOST(push.world_size == kWorld) << "the kernel is compiled for TP" << kWorld;
-    CHECK_HOST(int64_t(num_tokens) * N * 2 <= push.slot_bytes)
-        << "gathered rows exceed the push slot size " << push.slot_bytes;
-    CHECK_HOST(push.mc_workspace != nullptr) << "requires a multicast-capable push plane";
-    muse_all_gather::Params<kWorld> params{
-        .ws_local = push.workspaces[push.rank],
-        .ws_mc = push.mc_workspace,
-        .counter = push.counter,
-        .num_counters = push.num_blocks,
-        .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
-        .rank = push.rank,
-        .local = static_cast<const bf16_t*>(local.data_ptr()),
-        .b = nullptr,
-        .c = nullptr,
-        .out = static_cast<bf16_t*>(out.data_ptr()),
-        .num_rows = num_tokens,
-        .gamma = static_cast<const bf16_t*>(gamma.data_ptr()),
+        .gamma = gamma.has_value() ? static_cast<const bf16_t*>(gamma.value().data_ptr()) : nullptr,
         .eps = static_cast<float>(eps),
     };
     const auto num_vecs = num_tokens * N / muse_all_gather::kVec;
     CHECK_HOST(push.num_blocks >= 2) << "gather needs a work block and a counter-update block";
     const auto num_work_blocks = std::min(host::div_ceil(num_vecs, muse_all_gather::kBlock), push.num_blocks - 1);
-    host::LaunchKernel(num_work_blocks + 1, muse_all_gather::kBlock, device.unwrap())
-        .enable_pdl(kUsePDL)(muse_all_gather::all_gather_kernel<N, kWorld, false, false, kUsePDL, true>, params);
+    auto fn =
+        b.has_value() ? (c.has_value() ? kernel<1, 1> : kernel<1, 0>) : (c.has_value() ? kernel<0, 1> : kernel<0, 0>);
+    if constexpr (N == muse_all_gather::kBlock * muse_all_gather::kVec) {
+      if (gamma.has_value()) {
+        CHECK_HOST(!b.has_value() && !c.has_value()) << "the fused norm takes no b / c";
+        TensorMatcher({N}).with_dtype<bf16_t>().with_device(device).verify(gamma.value());
+        fn = muse_all_gather::all_gather_kernel<N, kWorld, false, false, kUsePDL, true>;
+      }
+    } else {
+      CHECK_HOST(!gamma.has_value()) << "the fused norm needs N == 4096";
+    }
+    host::LaunchKernel(num_work_blocks + 1, muse_all_gather::kBlock, device.unwrap()).enable_pdl(kUsePDL)(fn, params);
   }
 };
 
