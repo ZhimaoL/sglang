@@ -55,10 +55,11 @@ def _load_inline(**kw):
             os.environ["TORCH_CUDA_ARCH_LIST"] = prev
 
 
-# The loaders a serving boot calls. In a cold container each compiled at its first use, one after another (~45-50 s of
-# single-process nvcc each: 581 s of H1's 1084-s cold boot, court C40); prebuild() starts them all at once.
-_PREBUILD = ("smallm_ext", "pg_ext", "pg_narrow_ext", "pg_narrow64_ext", "st_ext", "draft_ext", "fmha_ext", "proj_ext",
-             "glue_ext", "route_ext", "vfg_ext", "wst_ext", "lt")
+# The loaders a serving boot calls, in first-use order. In a cold container each compiled at its first use, one after
+# another (~45-50 s of single-process nvcc each: 581 s of H1's 1084-s cold boot, court C40); prebuild() starts them
+# together, at most half the CPUs at a time.
+_PREBUILD = ("smallm_ext", "lt", "pg_ext", "pg_narrow_ext", "pg_narrow64_ext", "st_ext", "draft_ext", "fmha_ext",
+             "proj_ext", "glue_ext", "route_ext", "vfg_ext", "wst_ext")
 _PREBUILD_RUN = """import sys
 from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext, lt
 try:
@@ -69,17 +70,31 @@ except Exception:
 
 
 def prebuild() -> None:
-    """Start every okc extension build at once, one CPU-only background process each (once per node, at worker init,
-    before the weights load). Each process runs the loader itself: same sources, flags, arch and build directory, so
-    the server's own call finds the build finished (or waits on torch's build lock for it) and what it loads is
-    unchanged. With warm caches each process finds its build up to date and exits."""
+    """Start the okc extension builds now, one CPU-only process each, min(13, ncpu / 2) at a time (once per node, at
+    worker init, before the weights load). Each process runs the loader itself: same sources, flags, arch and build
+    directory, so the server's own call finds the build finished (or waits on torch's build lock for it) and what it
+    loads is unchanged. With warm caches each process finds its build up to date and exits."""
+    import queue
     import subprocess
     import sys
+    import threading
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    todo = queue.Queue()
     for f in _PREBUILD:
-        subprocess.Popen([sys.executable, "-c", _PREBUILD_RUN, f], env=env, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        todo.put(f)
+
+    def worker():   # daemon: a build not started when the process exits is left to the server's own call
+        while True:
+            try:
+                f = todo.get_nowait()
+            except queue.Empty:
+                return
+            subprocess.run([sys.executable, "-c", _PREBUILD_RUN, f], env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    for _ in range(max(1, min(len(_PREBUILD), (os.cpu_count() or 2) // 2))):
+        threading.Thread(target=worker, daemon=True, name="okc-prebuild").start()
 
 _PROJ_CPP = """
 void gemv_bf16_launch(at::Tensor W, at::Tensor X, at::Tensor out, int64_t m, int64_t n,
