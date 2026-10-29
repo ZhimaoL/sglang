@@ -36,13 +36,14 @@ MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "1"))
 # runtime-adaptive replicas (okc_patch/adaptive.py): replica sets decided from the run's own routing counts, refreshed
 # between forwards; first after ADAPT_FIRST_TOKENS prefill tokens and ADAPT_FIRST_VERIFY verify tokens (so the first,
 # full decision sees verify counts; prefill-only traffic such as max_new_tokens 1 never fires it), then every
-# ADAPT_EVERY_TOKENS; ring of the last
-# ADAPT_RING prefill forwards (SP shards or T >= ADAPT_MIN_T); readiness checked every ADAPT_CHECK forwards.
+# ADAPT_EVERY_TOKENS; ring of the last ADAPT_RING prefill forwards (SP shards or T >= ADAPT_MIN_T; 64 ~ 14 first turns:
+# the decisions price the prefill straggler on these rows, and 16 left them on the last ~3); readiness checked every
+# ADAPT_CHECK forwards.
 ADAPT_REPLICAS = _flag("OKC_MOE_ADAPTIVE_REPLICAS", "0")
 ADAPT_FIRST_TOKENS = int(os.environ.get("OKC_ADAPT_FIRST_TOKENS", "65536"))
 ADAPT_EVERY_TOKENS = int(os.environ.get("OKC_ADAPT_EVERY_TOKENS", "524288"))
 ADAPT_FIRST_VERIFY = int(os.environ.get("OKC_ADAPT_FIRST_VERIFY", "4096"))
-ADAPT_RING = int(os.environ.get("OKC_ADAPT_RING", "16"))
+ADAPT_RING = int(os.environ.get("OKC_ADAPT_RING", "64"))
 ADAPT_MIN_T = int(os.environ.get("OKC_ADAPT_MIN_T", "4096"))
 ADAPT_CHECK = int(os.environ.get("OKC_ADAPT_CHECK", "32"))
 # hysteresis: a slot change must lower the layer objective (% official) by more than ADAPT_THETA per expert copy;
