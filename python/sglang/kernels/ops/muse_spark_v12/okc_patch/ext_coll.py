@@ -52,7 +52,9 @@ def all_gather(shard: torch.Tensor, group_name: str, world: int):
     if st is None:
         return None
     out = st[0][:n]
-    torch.ops.symm_mem.multimem_all_gather_out(shard.contiguous(), group_name, out)
+    # torch checks out.dim() == input.dim() and out.size(0) == world x input.size(0): both flat (S15 step M: a 2-D
+    # shard into the 1-D buffer view raised "input/output dimension mismatch")
+    torch.ops.symm_mem.multimem_all_gather_out(shard.contiguous().view(-1), group_name, out)
     return out.view(world * shard.shape[0], shard.shape[1])
 
 
@@ -61,9 +63,11 @@ def all_gather(shard: torch.Tensor, group_name: str, world: int):
 # copied in), one symmetric-memory barrier, then every rank multimem.ld_reduce's its own T / world rows through the
 # multicast address with fp32 accumulation in the switch (.acc::f32: equal to the fp32 sum rounded once; NCCL's ring
 # sums in bf16 per hop, so ~half the elements differ from NCCL by an ulp: a reduction-order numerics change, default
-# off until a consistency read). Buffer reuse: consecutive reduce-scatters of a forward are separated by an
-# all-gather (the MoE section's, the next layer's qkv-in), which completes only after every peer finished its previous
-# ld_reduce, so the next write into a rank's buffer never meets a reader.
+# off until a consistency read). Buffer reuse: with OKC_EXT_RS_FENCE (default 1) a second barrier after the ld_reduce
+# keeps every rank from writing its buffer again before all peers finished reading it, so the call is safe whatever
+# runs around it (S15 step M: two back-to-back calls with nothing between raced at 8 MiB once). With it off, the
+# server's order still separates consecutive reduce-scatters by an all-gather (the MoE section's, the next layer's
+# qkv-in), which completes only after every peer's previous ld_reduce.
 _RS_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -160,6 +164,8 @@ def rs_finish(target: torch.Tensor, group_name: str, world: int, rank: int) -> t
     out = torch.empty((rows // world, cols), dtype=torch.bfloat16, device=target.device)
     hdl.barrier(channel=0)
     _rs_ext().okc_rsld_run(mc, out, rank * m)
+    if _sw.EXT_RS_FENCE:
+        hdl.barrier(channel=1)   # every peer done reading this rank's buffer before its next write
     return out
 
 
