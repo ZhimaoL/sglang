@@ -271,7 +271,7 @@ BETWEEN_CHUNK_MAX_REQS = int(os.environ.get("OKC_BETWEEN_CHUNK_MAX_REQS", "8"))
 # 32 first follow-ups, c32 p90 TTFT 42 s; serving/kernels/court/LOG.md C12). Folded follow-ups verify inside the next
 # chunk forward when ride-along is on (no forced decode steps); otherwise they get small-prefill-first's two. Implies
 # OKC_SW_BETWEEN_CHUNK. Same tokens per forward. Default off.
-SW_FOLLOWUP_ADMIT = _flag("OKC_SW_FOLLOWUP_ADMIT", "0")
+SW_FOLLOWUP_ADMIT = _flag("OKC_SW_FOLLOWUP_ADMIT", "1")
 
 # The running batch's DFLASH verify rides along in prefill / extend forwards (srt/managers/ride_along.py): its 8-row
 # blocks join the forward as extend segments instead of stalling behind it and reading the weights again. "0" off,
