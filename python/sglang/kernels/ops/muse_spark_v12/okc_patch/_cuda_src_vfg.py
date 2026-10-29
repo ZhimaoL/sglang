@@ -772,6 +772,7 @@ vfg_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
 #undef V_F3
   }
   V_STAMP(3);
+  if constexpr (SLIDE && !CL && !SCLT) { if (tick == nullptr) asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 #define V_P2S(i) do { } while (0)
   asm volatile("cp.async.wait_all;" ::: "memory");
   V_P2S(1);
@@ -876,13 +877,41 @@ vfgm_kernel(const float* __restrict__ ws, int NS, const __nv_bfloat16* __restric
   }
 }
 
-__global__ void __launch_bounds__(256, 1)
+__global__ void __launch_bounds__(256, 4)
 vfgm2_kernel(const float* __restrict__ ws, int NS, const __nv_bfloat16* __restrict__ qkv,
              __nv_bfloat16* __restrict__ out, float v_scale, float eps) {
   int const tok = (int)blockIdx.x, b = (int)blockIdx.y, tid = threadIdx.x;
   int const hq = tid >> 4, dq = (tid & 15) * 4, R = tok * V_HQ + hq;
   uint2 const graw = *reinterpret_cast<const uint2*>(qkv + ((long long)b * V_L + tok) * V_QKVW + (V_HQ + 2 * V_HKV) * V_D + hq * V_D + dq);
+  __nv_bfloat162 const g01 = *reinterpret_cast<const __nv_bfloat162*>(&graw.x);
+  __nv_bfloat162 const g23 = *reinterpret_cast<const __nv_bfloat162*>(&graw.y);
+  float const s0 = 1.f / (1.f + __expf(-__bfloat162float(g01.x))), s1 = 1.f / (1.f + __expf(-__bfloat162float(g01.y)));
+  float const s2 = 1.f / (1.f + __expf(-__bfloat162float(g23.x))), s3 = 1.f / (1.f + __expf(-__bfloat162float(g23.y)));
+  asm volatile("griddepcontrol.wait;" :: "f"(s0), "f"(s1), "f"(s2), "f"(s3) : "memory");
   float M = V_MINIT, Ls = 0.f, a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+  if (NS == 4) {
+    float2 ml[4];
+    float4 ov[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const float* rp = ws + (((long long)b * 4 + j) * (V_L * V_HQ) + R) * V_PREC;
+      ml[j] = __ldcg(reinterpret_cast<const float2*>(rp + V_MOFF));
+      if (V_PBF) {
+        uint2 const u = __ldcg(reinterpret_cast<const uint2*>(rp) + (dq >> 2));
+        float2 const f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+        float2 const f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+        ov[j] = make_float4(f0.x, f0.y, f1.x, f1.y);
+      } else {
+        ov[j] = __ldcg(reinterpret_cast<const float4*>(rp + dq));
+      }
+    }
+    M = fmaxf(fmaxf(ml[0].x, ml[1].x), fmaxf(ml[2].x, ml[3].x));
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float const wt = v_ex2(ml[j].x - M);
+      Ls += ml[j].y * wt; a0 += ov[j].x * wt; a1 += ov[j].y * wt; a2 += ov[j].z * wt; a3 += ov[j].w * wt;
+    }
+  } else
   for (int pb = 0; pb < NS; pb += 4) {
     float2 ml[4];
     float4 ov[4];
@@ -922,10 +951,6 @@ vfgm2_kernel(const float* __restrict__ ws, int NS, const __nv_bfloat16* __restri
 #pragma unroll
   for (int o2 = 1; o2 < 16; o2 <<= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o2);
   float const rn = rsqrtf(ss * (1.0f / V_D) + eps);
-  __nv_bfloat162 const g01 = *reinterpret_cast<const __nv_bfloat162*>(&graw.x);
-  __nv_bfloat162 const g23 = *reinterpret_cast<const __nv_bfloat162*>(&graw.y);
-  float const s0 = 1.f / (1.f + __expf(-__bfloat162float(g01.x))), s1 = 1.f / (1.f + __expf(-__bfloat162float(g01.y)));
-  float const s2 = 1.f / (1.f + __expf(-__bfloat162float(g23.x))), s3 = 1.f / (1.f + __expf(-__bfloat162float(g23.y)));
   __nv_bfloat162 const r01 = __floats2bfloat162_rn(a0 * rn * s0, a1 * rn * s1);
   __nv_bfloat162 const r23 = __floats2bfloat162_rn(a2 * rn * s2, a3 * rn * s3);
   uint2 r;
@@ -967,8 +992,21 @@ void vfg_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t seq_
   if (NS >= 32)
     vfgm_kernel<<<dim3(V_L * V_HQ, (unsigned)B), V_MW * 32, 0, st>>>(a_ws, (int)NS, a_qkv, a_out, (float)v_scale,
                                                                      (float)eps);
-  else
-    vfgm2_kernel<<<dim3(V_L, (unsigned)B), 256, 0, st>>>(a_ws, (int)NS, a_qkv, a_out, (float)v_scale, (float)eps);
+  else {
+    cudaLaunchConfig_t mc = {};
+    mc.gridDim = dim3(V_L, (unsigned)B);
+    mc.blockDim = dim3(256, 1, 1);
+    mc.dynamicSmemBytes = 0;
+    mc.stream = st;
+    cudaLaunchAttribute ma[1];
+    ma[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    ma[0].val.programmaticStreamSerializationAllowed = 1;
+    mc.attrs = ma;
+    mc.numAttrs = 1;
+    cudaError_t e = cudaLaunchKernelEx(&mc, vfgm2_kernel, (const float*)a_ws, (int)NS, (const __nv_bfloat16*)a_qkv, a_out,
+                                       (float)v_scale, (float)eps);
+    if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
+  }
 }
 
 namespace b1vp2 {
