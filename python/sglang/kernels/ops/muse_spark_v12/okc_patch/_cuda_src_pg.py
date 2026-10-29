@@ -565,6 +565,16 @@ DINL void release_rest(Ctx& c, int n) {
     }
 }
 
+DINL float okc_silu_mul(float a, float b, float ngl, float gsq) {   // (a b gsq) sigmoid(-a ngl / log2 e)
+    float e;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(fminf(a * ngl, 126.0f)));
+    const float d = 1.0f + e;
+    float r = __int_as_float(0x7EF311C7 - __float_as_int(d));
+    r = r * fmaf(-d, r, 2.0f);
+    r = r * fmaf(-d, r, 2.0f);
+    r = r * fmaf(-d, r, 2.0f);
+    return a * b * gsq * r;
+}
 // One item (block pm x w-tile wt) of width NV: mainloop + this warpgroup's epilogue. Same consumer structure as
 // wg12 (ptxas keeps the two A banks in distinct registers): item-scoped banks/accumulators, compile-time bank
 // selection, unconditional wait<1>, every consumer thread releases the stage of k-tile kt-1 (and the item's
@@ -605,6 +615,7 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
     if (GATED) {
         const float gsc = gsv * 256.0f;                  // 2^8 decode compensation x global scale
         const float hgs = 0.5f * gsc, gus = gsc * gsc * 0.5f;
+        const float ngl = -1.4426950408889634f * gsc, gsq = gsc * gsc;
         if (wtid == 0) bulk_wait_read0();                // previous item's bulk store finished reading epi
         named_bar_sync(bar, 128);
         // this warpgroup's 32 features = one 64 B row per token (SW64 half-tile, independent of the other WG):
@@ -616,11 +627,8 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
             unsigned r[2];
 #pragma unroll
             for (int i = 0; i < 2; i++) {
-                float t0, t1;
-                asm("tanh.approx.f32 %0, %1;" : "=f"(t0) : "f"(acc[4 * i] * hgs));
-                asm("tanh.approx.f32 %0, %1;" : "=f"(t1) : "f"(acc[4 * i + 1] * hgs));
-                const float p0 = acc[4 * i] * acc[4 * i + 2] * gus, p1 = acc[4 * i + 1] * acc[4 * i + 3] * gus;
-                r[i] = b2u32(__floats2bfloat162_rn(fmaf(p0, t0, p0), fmaf(p1, t1, p1)));
+                r[i] = b2u32(__floats2bfloat162_rn(okc_silu_mul(acc[4 * i], acc[4 * i + 2], ngl, gsq),
+                                                    okc_silu_mul(acc[4 * i + 1], acc[4 * i + 3], ngl, gsq)));
             }
             stsm_x2_trans(lanebase, r[0], r[1]);
         }
@@ -632,11 +640,16 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
             for (int m = 0; m < 4; m++) {
                 const int i = 4 * s + m;
                 // silu(g) u 2^-6 = (g u 2^-7)(1 + tanh(g / 2)), g / u = acc * gsc
+#ifdef PGN_WSET
+                r[m] = b2u32(__floats2bfloat162_rn(okc_silu_mul(acc[4 * i], acc[4 * i + 2], ngl, gsq),
+                                                    okc_silu_mul(acc[4 * i + 1], acc[4 * i + 3], ngl, gsq)));
+#else
                 float t0, t1;
                 asm("tanh.approx.f32 %0, %1;" : "=f"(t0) : "f"(acc[4 * i] * hgs));
                 asm("tanh.approx.f32 %0, %1;" : "=f"(t1) : "f"(acc[4 * i + 1] * hgs));
                 const float p0 = acc[4 * i] * acc[4 * i + 2] * gus, p1 = acc[4 * i + 1] * acc[4 * i + 3] * gus;
                 r[m] = b2u32(__floats2bfloat162_rn(fmaf(p0, t0, p0), fmaf(p1, t1, p1)));
+#endif
             }
             stsm_x4_trans(lanebase + s * 32 * 64, r[0], r[1], r[2], r[3]);
         }

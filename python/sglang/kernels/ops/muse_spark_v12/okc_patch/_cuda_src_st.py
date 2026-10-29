@@ -32,6 +32,16 @@ constexpr int VAMAX = ELOC + NUMEL_MAX / 8;   // passes (<= 8 tokens each): <= n
 constexpr int R = 4;              // partial ring slots
 
 DINL unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
+DINL float okc_silu_mul(float a, float b, float ngl, float gsq) {   // (a b gsq) sigmoid(-a ngl / log2 e)
+    float e;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(fminf(a * ngl, 126.0f)));
+    const float d = 1.0f + e;
+    float r = __int_as_float(0x7EF311C7 - __float_as_int(d));
+    r = r * fmaf(-d, r, 2.0f);
+    r = r * fmaf(-d, r, 2.0f);
+    r = r * fmaf(-d, r, 2.0f);
+    return a * b * gsq * r;
+}
 DINL void mbar_init(unsigned bar, unsigned count) {
     asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(bar), "r"(count));
 }
@@ -382,13 +392,9 @@ __global__ void __launch_bounds__(NTHR, 1) st_gemm(const __nv_bfloat16* __restri
         if (KIND == 1) {
             // pg gg1 epilogue: g / u = acc * gs * 2^8, silu(g) u = (g u / 2)(1 + tanh(g / 2))
             const float gsc = tb.gs[tb.va_e[va]] * 256.0f;
-            const float hgs = 0.5f * gsc, gus = gsc * gsc * 0.5f;
-            float t0, t1;
-            asm("tanh.approx.f32 %0, %1;" : "=f"(t0) : "f"(v.x * hgs));
-            asm("tanh.approx.f32 %0, %1;" : "=f"(t1) : "f"(v.y * hgs));
-            const float p0 = v.x * v.z * gus, p1 = v.y * v.w * gus;
-            scr[w][(2 * t) * 8 + g] = __bfloat16_as_ushort(__float2bfloat16_rn(fmaf(p0, t0, p0)));
-            scr[w][(2 * t + 1) * 8 + g] = __bfloat16_as_ushort(__float2bfloat16_rn(fmaf(p1, t1, p1)));
+            const float ngl = -1.4426950408889634f * gsc, gsq = gsc * gsc;
+            scr[w][(2 * t) * 8 + g] = __bfloat16_as_ushort(__float2bfloat16_rn(okc_silu_mul(v.x, v.z, ngl, gsq)));
+            scr[w][(2 * t + 1) * 8 + g] = __bfloat16_as_ushort(__float2bfloat16_rn(okc_silu_mul(v.y, v.w, ngl, gsq)));
             __syncwarp();
             if (lane < tb.va_n[va])                    // padded rows are never read (gg2 zeroes those columns)
                 *reinterpret_cast<uint4*>(out + (size_t)(va * 8 + lane) * H + wt * 64 + wi * 8) =
