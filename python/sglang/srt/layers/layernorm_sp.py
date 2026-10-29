@@ -358,6 +358,13 @@ def column_parallel_g_matmul(
             group_name=group_name,
         )
         return mm_outputs[0][:num_tokens]
+    if _okc_hopper.active:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
+
+        tp_group = get_parallel().tp_group
+        full = ext_coll.all_gather(input_parallel, tp_group.device_group.group_name, tp_group.world_size)
+        if full is not None:   # OKC_SW_EXT_AG: the extend's qkv-in gather on multimem (same bytes)
+            return linear.quant_method.apply(linear, full[:num_tokens], bias)
     gathered = sp_exit_gather(input_parallel, num_tokens=num_tokens)
     return linear.quant_method.apply(linear, gathered, bias)
 
@@ -398,6 +405,20 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
             scatter_dim=0,
             group_name=group_name,
         )
+    if _okc_hopper.active and bias is None and linear.weight.dtype is torch.bfloat16:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        tp_group = get_parallel().tp_group
+        gname = tp_group.device_group.group_name
+        target = (
+            ext_coll.rs_target(padded, linear.weight.shape[0], gname, tp_size)
+            if isinstance(linear.quant_method, UnquantizedLinearMethod)
+            else None
+        )
+        if target is not None:   # OKC_SW_EXT_RS: the GEMM straight into the symmetric buffer, then ld_reduce
+            torch.mm(x, linear.weight.t(), out=target)
+            return ext_coll.rs_finish(target, gname, tp_size, tp_group.rank_in_group)
     full = linear.quant_method.apply(linear, x, bias)
     output = full.new_empty((padded // tp_size, *full.shape[1:]))
     get_parallel().tp_group.reduce_scatter_tensor(output, full)

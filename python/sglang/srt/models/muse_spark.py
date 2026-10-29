@@ -1230,6 +1230,13 @@ class MuseSpark1xMoE(nn.Module):
                 full_input, full_scores, full_ids, self.experts.post_expert_norm
             )
         output = output.contiguous()
+        if okc_patch.SW_EXT_RS:   # extends: ld_reduce over the symmetric buffer (okc_patch/ext_coll.py)
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
+
+            rs = ext_coll.reduce_scatter(output, tp_group.device_group.group_name, tp_group.world_size,
+                                         tp_group.rank_in_group)
+            if rs is not None:
+                return rs
         shard = output.new_empty((expert_input.shape[0], *output.shape[1:]))
         tp_group.reduce_scatter_tensor(shard, output)
         return shard

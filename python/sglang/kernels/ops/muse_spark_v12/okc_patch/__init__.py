@@ -127,6 +127,14 @@ GEMM_AG_UNPOOLER_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_UNPOOLER_MAX_TOKEN
 # the 74K first turn -6.0% but cached follow-up TTFT +54 ms (bs 1) / +70 ms (bs 4) with it on every forward.
 SP_SYMM = _flag("OKC_SP_SYMM", "1")
 SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
+# SP forwards below that (the follow-up extends): the qkv-in all-gather as torch's multimem all-gather into a symmetric
+# buffer of OKC_EXT_AG_MAX_BYTES instead of NCCL's ring (okc_patch/ext_coll.py, extend E44; exact, a copy)
+SW_EXT_AG = _flag("OKC_SW_EXT_AG", "0")
+EXT_AG_MAX_BYTES = int(os.environ.get("OKC_EXT_AG_MAX_BYTES", str(4096 * 8192 * 2)))
+# ... and the extend's o-proj / MoE-out reduce-scatters as multimem.ld_reduce (fp32 in the switch) over a second
+# symmetric buffer of that size: differs from NCCL's ring in ~half the elements by an ulp (equal to the fp32 sum), so
+# off until a consistency read
+SW_EXT_RS = _flag("OKC_SW_EXT_RS", "0")
 # Those two collectives on copy-engine pushes with one barrier per matmul + reduce-scatter and one per
 # OKC_SP_CE_AG_GROUP all-gather steps (okc_patch/sp_tp_ce.py) instead of torch's fused ops (16 / 3 barriers per op):
 # session SI bench -0.12 ms per 16K layer-chunk (~-30 ms per first turn); the AG side only on 16K chunks.
@@ -299,7 +307,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
-           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
+           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_EXT_AG", "EXT_AG_MAX_BYTES", "SW_EXT_RS", "SP_CE_TP",
            "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
