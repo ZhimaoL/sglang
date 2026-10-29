@@ -53,7 +53,7 @@ def _jit_norm_module(n: int, world_size: int) -> Module:
         "muse_spark_v12_all_gather_norm",
         *args,
         cuda_files=["muse_spark_v12/all_gather.cuh"],
-        cuda_wrappers=[("run", f"MuseSparkAllGatherNorm<{args}>::run"), ("test", f"MuseSparkAllGatherNorm<{args}>::test")],
+        cuda_wrappers=[("run", f"MuseSparkAllGatherNorm<{args}>::run")],
         extra_cuda_cflags=["-O3"],
     )
 
@@ -181,9 +181,3 @@ def gemm_ag(
         return out
     return all_gather(comm, local, out, b, c)
 
-
-def row_norm_test(x: torch.Tensor, norm_weight: torch.Tensor, eps: float, world_size: int = 8) -> torch.Tensor:
-    """OKC 1-GPU check: the kNorm row math on [M, 4096] rows (no gather)."""
-    out = torch.empty_like(x)
-    _jit_norm_module(x.shape[1], world_size).test(x.contiguous(), norm_weight.contiguous(), eps, out)
-    return out
