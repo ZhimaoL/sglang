@@ -818,6 +818,11 @@ class MuseSpark1xMoE(nn.Module):
                 ),
                 replica_plan=replica_plan,
             )
+            self.experts._okc_layer_idx = layer_idx
+            if okc_patch.ADAPT_REPLICAS and self.experts.replica_plan is not None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import adaptive as okc_adaptive
+
+                okc_adaptive.attach_buffers(self.experts)
         else:
             self.experts = MuseSpark1xBf16Experts(
                 num_experts=self.num_experts,
@@ -1054,7 +1059,8 @@ class MuseSpark1xMoE(nn.Module):
             # route_small: reduce + routing in one launch (SP keeps the logits for its dispatcher)
             if okc_patch.SW_ROUTER and okc_patch.SW_ROUTE_FUSED and not sp_active:
                 routed_small = okc_router.route_small(
-                    self.gate, hidden_states, self._routing_op(), self.top_k
+                    self.gate, hidden_states, self._routing_op(), self.top_k,
+                    hist=getattr(self.experts, "_okc_adapt_vcnt", None) if self.ep_rank == 0 else None,
                 )
             if routed_small is not None:
                 topk_scores, topk_ids, packed_topk_ids = routed_small
@@ -1092,6 +1098,11 @@ class MuseSpark1xMoE(nn.Module):
 
         if _OKC_TOPK_DUMP_DIR:
             _okc_dump_topk(self.layer_idx, topk_ids, self.ep_rank, bool(sp_active))
+        if (okc_patch.ADAPT_REPLICAS and getattr(self.experts, "_okc_adapt_ring", None) is not None
+                and (sp_active or topk_ids.shape[0] >= okc_patch.ADAPT_MIN_T)):
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import adaptive as okc_adaptive
+
+            okc_adaptive.count_prefill(self.experts, topk_ids, bool(sp_active), self.ep_rank)
         if (capturer := get_global_experts_capturer()) is not None:
             # Capture on main after the router join, in full unpadded token order.
             # SP experts below still consume the local ids.

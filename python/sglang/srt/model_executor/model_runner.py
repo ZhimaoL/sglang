@@ -257,6 +257,7 @@ elif current_platform.is_out_of_tree():
 
 
 logger = logging.getLogger(__name__)
+_OKC_ADAPT = __import__("os").environ.get("OKC_MOE_ADAPTIVE_REPLICAS", "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -1747,6 +1748,10 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        if _OKC_ADAPT and not self.is_draft_worker:   # OKC adaptive replicas: refresh point between forwards
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import adaptive as _okc_adaptive
+
+            _okc_adaptive.maybe_refresh(self, forward_batch)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:

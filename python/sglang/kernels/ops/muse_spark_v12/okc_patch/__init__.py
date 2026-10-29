@@ -33,6 +33,15 @@ MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 # with fewer active experts (pg_moe.assign_replicas), longer ones (OKC_MOE_REP_PREFILL) split its routes between the
 # two holders at a token boundary that levels routed tokens (pg_moe.split_replicas).
 MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "1"))
+# runtime-adaptive replicas (okc_patch/adaptive.py): replica sets decided from the run's own routing counts, refreshed
+# between forwards; first after ADAPT_FIRST_TOKENS prefill tokens, then every ADAPT_EVERY_TOKENS; ring of the last
+# ADAPT_RING prefill forwards (SP shards or T >= ADAPT_MIN_T); readiness checked every ADAPT_CHECK forwards.
+ADAPT_REPLICAS = _flag("OKC_MOE_ADAPTIVE_REPLICAS", "0")
+ADAPT_FIRST_TOKENS = int(os.environ.get("OKC_ADAPT_FIRST_TOKENS", "65536"))
+ADAPT_EVERY_TOKENS = int(os.environ.get("OKC_ADAPT_EVERY_TOKENS", "524288"))
+ADAPT_RING = int(os.environ.get("OKC_ADAPT_RING", "16"))
+ADAPT_MIN_T = int(os.environ.get("OKC_ADAPT_MIN_T", "4096"))
+ADAPT_CHECK = int(os.environ.get("OKC_ADAPT_CHECK", "32"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
 MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
 # on the st chain the verify balancer weighs an expert by its st passes ceil(routes / 8); 0 = every active expert 1
@@ -296,7 +305,7 @@ RIDE_CORE = _flag("OKC_RIDE_CORE", "1")
 
 ANY_ATTN = SW_ATTN or SW_WST
 
-__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "MOE_REP_MAX_TOKENS",
+__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "MOE_REP_MAX_TOKENS",
            "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD", "PG_ROUTE_REPX",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",

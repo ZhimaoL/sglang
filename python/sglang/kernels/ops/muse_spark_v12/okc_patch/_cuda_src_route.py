@@ -55,7 +55,7 @@ __device__ __forceinline__ void cp16(void* sdst, const float* gsrc) {
 template <int SK>
 __global__ void __launch_bounds__(64) route_k(const float* __restrict__ P, int T, const float* __restrict__ bias,
                                               float* __restrict__ tw, int* __restrict__ ti, int* __restrict__ tp,
-                                              float mult, float scale, float eps) {
+                                              float mult, float scale, float eps, int* __restrict__ hist) {
   constexpr int EPL = 8, TOPK = 8, G = 128;
   __shared__ float4 s_sum[2][32];
   __shared__ float4 s_p[SK][2][32];
@@ -139,6 +139,7 @@ __global__ void __launch_bounds__(64) route_k(const float* __restrict__ P, int T
     tw[o] = weight;
     const __nv_bfloat16 wb = __float2bfloat16_rn(weight);
     tp[o] = (out_id << 16) | (int)__bfloat16_as_ushort(wb);
+    if (hist != nullptr) atomicAdd(hist + out_id, 1);   // adaptive replicas: this layer's verify route counts
   }
 }
 
@@ -146,7 +147,7 @@ __global__ void __launch_bounds__(64) route_k(const float* __restrict__ P, int T
 
 // P [SK, T, 256] fp32 split-K partials -> tw [T, 8] fp32, ti / tp [T, 8] int32
 void route(torch::Tensor P, torch::Tensor bias, torch::Tensor tw, torch::Tensor ti, torch::Tensor tp, int64_t T,
-           int64_t SK, double mult, double scale, double eps, int64_t pdl) {
+           int64_t SK, double mult, double scale, double eps, int64_t pdl, torch::Tensor hist) {
   // router.route_small allocates the outputs; it checks bias (fp32 [256], contiguous)
   TORCH_CHECK(P.is_contiguous() && P.numel() == SK * T * 256 && (SK == 16 || SK == 32), "okc route: P [16|32, T, 256]");
   if (T == 0) return;
@@ -162,6 +163,7 @@ void route(torch::Tensor P, torch::Tensor bias, torch::Tensor tw, torch::Tensor 
   auto k = SK == 16 ? okcr::route_k<16> : okcr::route_k<32>;
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k, (const float*)P.data_ptr<float>(), (int)T,
                                     (const float*)bias.data_ptr<float>(), tw.data_ptr<float>(), ti.data_ptr<int>(),
-                                    tp.data_ptr<int>(), (float)mult, (float)scale, (float)eps));
+                                    tp.data_ptr<int>(), (float)mult, (float)scale, (float)eps,
+                                    hist.numel() == 256 ? hist.data_ptr<int>() : (int*)nullptr));
 }
 """
