@@ -52,9 +52,13 @@ def plain_greedy(sampling_info: Optional[SamplingBatchInfo]) -> bool:
 
 
 class RideAlong:
-    def __init__(self, *, mode: int, block_size: int, max_tokens: Optional[int]):
+    def __init__(self, *, mode: int, block_size: int, max_tokens: Optional[int], max_load: Optional[int] = None):
         self.mode = mode
         self._block_size = block_size
+        # OKC_SW_RIDE_LOW: ride only while running + waiting + the chunked request <= max_load. A rider costs ~1.0-1.3
+        # ms of merged forward (S11B R11_fa wave), what one request's share of a bs 28-32 verify cycle costs, so at c32
+        # riding saves nothing (court C32.md section 4); at c4 / c16 the cycle it replaces is 1.7-4 ms per request.
+        self.max_load = max_load
         # Largest forward the prefill CUDA graph replays; a merged forward must fit it.
         self._max_tokens = max_tokens
         self._num_rides = 0
@@ -64,21 +68,25 @@ class RideAlong:
     def enabled(self) -> bool:
         return self.mode != MODE_OFF
 
-    def _can_carry(self, running_batch: ScheduleBatch) -> bool:
+    def would_ride(self, load: Optional[int]) -> bool:
+        """Whether riders ride at this scheduler load (None = not gated)."""
+        return self.enabled and (self.max_load is None or load is None or load <= self.max_load)
+
+    def _can_carry(self, running_batch: ScheduleBatch, load: Optional[int] = None) -> bool:
         return (
-            self.enabled
+            self.would_ride(load)
             and not running_batch.is_empty()
             and not running_batch.is_prefill_only
         )
 
     def reserve_tokens(
-        self, running_batch: ScheduleBatch, chunk_budget: Optional[int]
+        self, running_batch: ScheduleBatch, chunk_budget: Optional[int], load: Optional[int] = None
     ) -> int:
         """Prefill tokens to hold back so the chunk plus the riders' rows still fit one
         graph bucket; a budget that already leaves room (a small-first batch) is not
         shrunk."""
         if (
-            not self._can_carry(running_batch)
+            not self._can_carry(running_batch, load)
             or chunk_budget is None
             or self._max_tokens is None
         ):
@@ -87,11 +95,11 @@ class RideAlong:
         return max(0, chunk_budget + rows - self._max_tokens)
 
     def should_ride(
-        self, prefill_batch: ScheduleBatch, running_batch: ScheduleBatch
+        self, prefill_batch: ScheduleBatch, running_batch: ScheduleBatch, load: Optional[int] = None
     ) -> bool:
         """Whether the running batch's next verify step can join this prefill batch's
         forward."""
-        if not self._can_carry(running_batch):
+        if not self._can_carry(running_batch, load):
             return False
         if (
             prefill_batch.forward_mode != ForwardMode.EXTEND
