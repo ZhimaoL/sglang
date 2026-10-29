@@ -1,0 +1,438 @@
+"""OKC runtime-adaptive replicas (OKC_MOE_ADAPTIVE_REPLICAS, default 0; lane-moe P2-5, muse-opt
+serving/kernels/moe-graft LOG "P2-5"). Homes stay the shipped table; which experts get the R replica slots per rank is
+decided from the run's OWN routing counts and refreshed between forwards.
+
+Counting (graph-safe, every rank in step): per pg layer with replicas, a verify counter [256] (route_k adds its picks
+when given it: T <= 256, rank 0 only) and a ring of the last ADAPT_RING prefill / extend forwards' counts [K, 256]
+(T > 256: every rank under SP, whose ids are its own shard's; rank 0 only otherwise), advanced by a device-side slot.
+Refresh (ModelRunner.forward entry, target worker, never while capturing): when ADAPT_FIRST_TOKENS (then
+ADAPT_EVERY_TOKENS) prefill tokens have been forwarded since the last one, every rank all-reduces the counters (so all
+hold the exact global counts), halves its verify counters, and decides its share of the layers (layer i on rank i %
+world) in a background process with decide() below: placement_joint's objective greedy on those counts (verify
+stragglers, prefill straggler, extend; homes fixed, R per rank, never on the home rank). Every ADAPT_CHECK forwards
+the ranks all-gather readiness and, once all are done, the decisions; then apply(): each new (expert, rank) gets the
+expert's pg packs by NCCL send / recv from its home rank straight into a free replica slot and its global scale from
+an all-gathered table; the replica table is rebuilt and copied in place (captured graphs keep their addresses). A
+replica slot is a byte copy of the home's packs, so every expert's output is bit-identical on any holder.
+"""
+import logging
+import multiprocessing
+import os
+
+import numpy as np
+import torch
+
+logger = logging.getLogger(__name__)
+
+EP, NE, TOPK = 8, 256, 8
+C0, C1 = 13.5, 7.6                       # st cost: c0 + c1 x passes (moe-int ep_balance_sim)
+BM, NT = 256, 96
+FT_MS = 2109.0
+STRAG_CHUNKS = 4.9                       # 16K forwards per first turn (joint_search's calibration on session M)
+W_X = 0.217                              # % official per ms per extend
+RUNGS = {"c4": (0.37, 0.45, 3.25, 0.28, 0.11, 0.7), "c16": (0.53, 0.26, 13.3, 0.27, 0.11, 0.5),
+         "c32": (0.59, 0.20, 20.9, 0.45, 0.0, 0.0)}
+
+
+def _step_ms(bs):
+    return float(np.interp(bs, [1, 4, 16, 32], [9.77, 14.66, 24.5, 31.0]))
+
+
+W_P = sum(100 * w * F / FT_MS for F, _, _, w, _, _ in RUNGS.values())
+_W_RUNG = {r: 100 * (w * V + wt * k) / _step_ms(bs) for r, (F, V, bs, w, wt, k) in RUNGS.items()}
+GROUPS = [(3, _W_RUNG["c4"] / 2, "passes", True), (4, _W_RUNG["c4"] / 2, "passes", True),
+          (13, _W_RUNG["c16"], "distinct", False), (21, _W_RUNG["c32"], "distinct", False)]
+
+
+def route_counts(p, bs, beta, F, rng):
+    out = np.zeros((F, NE), int)
+    for f in range(F):
+        for _ in range(bs):
+            q = rng.dirichlet(beta * p * NE) if beta > 0 else p
+            g = rng.gumbel(size=(8, NE)) + np.log(q + 1e-30)[None, :]
+            np.add.at(out[f], np.argpartition(-g, TOPK, axis=-1)[:, :TOPK].reshape(-1), 1)
+    return out
+
+
+def rank_costs(cnt, home, pairs, metric, cost_passes):
+    F = cnt.shape[0]
+    passes = (cnt + 7) // 8
+    work = passes if cost_passes else (cnt > 0).astype(int)
+    lw = passes if metric == "passes" else (cnt > 0).astype(int)
+    nonrep = np.ones(NE, bool)
+    for e, _ in pairs:
+        nonrep[e] = False
+    oh = np.zeros((NE, EP)); oh[np.arange(NE), home] = 1
+    load = (lw * nonrep) @ oh
+    cost = (work * nonrep) @ oh
+    rows = np.arange(F)
+    for e, r in pairs:
+        h = home[e]
+        a = lw[:, e] > 0
+        pick = np.where(load[:, r] < load[:, h], r, h)
+        load[rows[a], pick[a]] += lw[a, e]
+        cost[rows[a], pick[a]] += work[a, e]
+    return np.where(cost > 0, C0 + C1 * cost, 0.0)
+
+
+def _block_us(n):
+    n = np.asarray(n, dtype=np.float64)
+    full = np.floor(n / BM)
+    tail = n - full * BM
+    tail_w = np.where(tail <= 0, 0, np.where(tail <= 64, 64, np.where(tail <= 128, 128, 256)))
+    item = lambda w: np.where(w > 0, 8 + 0.125 * w, 0.0)
+    return 96 * (full * item(256) + item(tail_w))
+
+
+def strag_us(c, home, pairs):
+    po = sorted(pairs, key=lambda x: -c[:, x[0]].sum())
+    F = c.shape[0]
+    rep = {e for e, _ in po}
+    fixed = np.array([e not in rep for e in range(NE)])
+    oh = np.zeros((NE, EP)); oh[np.arange(NE), home] = 1
+    tok = (c * fixed) @ oh
+    pg = (_block_us(c) * fixed) @ oh
+    rows = np.arange(F)
+    for e, r in po:
+        holders = [home[e], r]
+        left = c[:, e].astype(np.float64).copy()
+        share = np.zeros((F, 2))
+        base = tok[:, holders].copy()
+        while True:
+            act = left > 0
+            if not act.any():
+                break
+            j = np.argmin(base + share, axis=1)
+            give = np.minimum(left, BM)
+            share[rows[act], j[act]] += give[act]
+            left -= np.where(act, give, 0)
+        for k, h in enumerate(holders):
+            tok[:, h] += share[:, k]
+            pg[:, h] += _block_us(share[:, k])
+    pg = pg / 131.0
+    return (pg.max(1) - pg.mean(1)).mean()
+
+
+def _pg_us(n):
+    n = np.asarray(n, float)
+    full = np.floor(n / 128); tail = n - 128 * full
+    tw = np.where(tail <= 0, 0, np.where(tail <= 16, 16, np.where(tail <= 64, 64, 128)))
+    item = lambda w: np.where(w > 0, 8 + 0.125 * w, 0.0)
+    return NT * (full * item(128) + item(tw)) / 131.0
+
+
+def extend_slowest(cnt, home, pairs):
+    cost = _pg_us(cnt)
+    rep = dict(pairs)
+    oh = np.zeros((NE, EP)); oh[np.arange(NE), home] = 1
+    fixed = np.array([e not in rep for e in range(NE)], float)
+    load = (cost * fixed) @ oh
+    for f in range(cnt.shape[0]):
+        for e in sorted(rep, key=lambda x: (-cnt[f, x], x)):
+            if cnt[f, e] <= 0:
+                continue
+            h, r = home[e], rep[e]
+            j = r if load[f, r] < load[f, h] else h
+            load[f, j] += cost[f, e]
+    return load.max(1).mean()
+
+
+def _draw_ext(q, T, kappa, F, rng):
+    out = np.zeros((F, NE))
+    for f in range(F):
+        qq = rng.dirichlet(kappa * NE * q + 1e-6)
+        g = rng.gumbel(size=(T, NE)) + np.log(qq + 1e-30)[None, :]
+        np.add.at(out[f], np.argpartition(-g, TOPK, axis=1)[:, :TOPK].ravel(), 1)
+    return out
+
+
+def decide(home, verify_counts, prefill_counts, R, seed=0, prefill_chunks=None, F_v=(40, 40, 20, 20), F_p=16, F_x=16):
+    """home [256] rank, verify_counts / prefill_counts [256] route counts of the run -> R x 8 (expert, rank) pairs in
+    balancing order (hottest first by the verify marginal). prefill_chunks [F, 256] overrides the multinomial draws."""
+    rng = np.random.default_rng(seed)
+    home = np.asarray(home)
+    p = np.asarray(verify_counts, float) + 1e-3; p /= p.sum()
+    q = np.asarray(prefill_counts, float) + 1e-3; q /= q.sum()
+    vtr = [(route_counts(p, bs, 0.2, F, rng), w, met, cp) for (bs, w, met, cp), F in zip(GROUPS, F_v)]
+    ptr = prefill_chunks if prefill_chunks is not None else rng.multinomial(16384 * 8, q, size=F_p).astype(float)
+    xtr = _draw_ext(q, 1024, 8.49, F_x, rng)
+
+    def J(pairs):
+        v = sum(w * rank_costs(c, home, pairs, met, cp).max(1).mean() / 1e3 for c, w, met, cp in vtr)
+        return v + W_P * STRAG_CHUNKS * strag_us(ptr, home, pairs) / 1e3 + W_X * extend_slowest(xtr, home, pairs) / 1e3
+
+    cand = sorted(set(np.argsort(-p)[:48].tolist()) | set(np.argsort(-q)[:48].tolist()))
+    chosen, slots = {}, np.full(EP, R)
+    for _ in range(EP * R):
+        best = None
+        for e in cand:
+            if e in chosen:
+                continue
+            for r in range(EP):
+                if r == home[e] or slots[r] == 0:
+                    continue
+                trial = dict(chosen); trial[e] = r
+                val = J(sorted(trial.items(), key=lambda x: -p[x[0]]))
+                if best is None or val < best[0] - 1e-12:
+                    best = (val, e, r)
+        if best is None:
+            break
+        chosen[best[1]] = best[2]; slots[best[2]] -= 1
+    return [(int(e), int(r)) for e, r in sorted(chosen.items(), key=lambda x: -p[x[0]])]
+
+
+# ----------------------------------------------------------------------------------------------- runtime (serving)
+def _knobs():
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch as sw
+
+    return sw
+
+
+def attach_buffers(layer, device=None):
+    """Register the counters on a MuseSpark1xFp4Experts with replicas (called from its __init__)."""
+    K = _knobs().ADAPT_RING
+    layer.register_buffer("_okc_adapt_vcnt", torch.zeros(256, dtype=torch.int32, device=device), persistent=False)
+    layer.register_buffer("_okc_adapt_ring", torch.zeros((K, 256), dtype=torch.int32, device=device), persistent=False)
+    layer.register_buffer("_okc_adapt_slot", torch.zeros(1, dtype=torch.int64, device=device), persistent=False)
+
+
+def verify_hist(experts, ep_rank):
+    """route_k's counter for this layer (rank 0 only: the verify ids are rank-identical), else None."""
+    v = getattr(experts, "_okc_adapt_vcnt", None)
+    return v if (v is not None and ep_rank == 0) else None
+
+
+def count_prefill(experts, topk_ids, local_ids, ep_rank):
+    """T > 256 forwards: this forward's route counts into the ring's next slot. local_ids: SP shard ids (count on every
+    rank), else rank-identical ids (rank 0 counts)."""
+    ring = getattr(experts, "_okc_adapt_ring", None)
+    if ring is None or not (local_ids or ep_rank == 0):
+        return
+    slot = experts._okc_adapt_slot
+    idx = topk_ids.reshape(-1).long() + slot * 256
+    ring.view(-1).index_add_(0, idx, torch.ones(idx.shape, dtype=torch.int32, device=idx.device))
+    slot.add_(1).remainder_(ring.shape[0])
+
+
+def _decide_many(jobs):
+    """Background worker: [(layer, home, verify counts, ring counts, R, seed)] -> {layer: pairs}."""
+    out = {}
+    for li, home, v, ring, R, seed in jobs:
+        ring = np.asarray(ring, float)
+        chunks = ring[ring.sum(1) > 0]
+        pre = chunks.sum(0) if len(chunks) else np.ones(256)
+        out[li] = decide(np.asarray(home), np.asarray(v, float), pre, R, seed=seed,
+                         prefill_chunks=chunks if len(chunks) >= 4 else None)
+    return out
+
+
+def _worker_init():
+    for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ[k] = "1"
+
+
+class _State:
+    def __init__(self):
+        self.layers = None          # [(layer_idx, experts module)] with replicas, layer order
+        self.tokens = 0             # prefill tokens forwarded since the last trigger
+        self.refreshes = 0
+        self.pending = None         # AsyncResult of this rank's decisions
+        self.fwd = 0
+        self.gs = None              # {layer: [256] float global scales of every expert}
+        self.pool = None
+
+
+_S = _State()
+
+
+def _collect(model):
+    from sglang.srt.layers.muse_spark_fp4_moe import MuseSpark1xFp4Experts
+
+    out = []
+    for m in model.modules():
+        if isinstance(m, MuseSpark1xFp4Experts) and getattr(m, "_okc_adapt_ring", None) is not None \
+                and getattr(m, "_okc_rep_table", None) is not None and getattr(m, "_okc_moe_state", None) is not None:
+            out.append((int(m._okc_layer_idx), m))
+    return sorted(out, key=lambda x: x[0])
+
+
+def _placement_ranks(li):
+    from sglang.srt.layers import muse_spark_expert_placement as pl
+
+    return pl._placement()["layers"][str(li)]
+
+
+def maybe_refresh(model_runner, forward_batch):
+    """ModelRunner.forward entry (target worker). Host-side counters only, except at a trigger / check point."""
+    sw = _knobs()
+    if torch.cuda.is_current_stream_capturing():
+        return
+    st = _S
+    st.fwd += 1
+    mode = forward_batch.forward_mode
+    if mode.is_extend() and not mode.is_target_verify():
+        n = getattr(forward_batch, "extend_num_tokens", None)
+        st.tokens += int(n if n is not None else forward_batch.input_ids.numel())
+    if st.layers is None:
+        st.layers = _collect(model_runner.model)
+        if not st.layers:
+            logger.info("OKC adaptive replicas: no pg layer with replicas; off.")
+        else:
+            logger.info("OKC adaptive replicas on for %d layers (first after %d prefill tokens, then every %d).",
+                        len(st.layers), sw.ADAPT_FIRST_TOKENS, sw.ADAPT_EVERY_TOKENS)
+    if not st.layers:
+        return
+    if st.pending is None:
+        if st.tokens >= (sw.ADAPT_FIRST_TOKENS if st.refreshes == 0 else sw.ADAPT_EVERY_TOKENS):
+            _trigger()
+    elif st.fwd % sw.ADAPT_CHECK == 0:
+        _check()
+
+
+def _groups():
+    from sglang.srt.distributed import get_tp_group
+
+    g = get_tp_group()
+    return g.device_group, g.cpu_group, g.rank_in_group, g.world_size
+
+
+def _trigger():
+    st = _S
+    dev_g, cpu_g, rank, world = _groups()
+    import torch.distributed as dist
+
+    V = torch.stack([m._okc_adapt_vcnt for _, m in st.layers])
+    Rg = torch.stack([m._okc_adapt_ring for _, m in st.layers])
+    dist.all_reduce(V, group=dev_g)
+    dist.all_reduce(Rg, group=dev_g)
+    if st.gs is None:   # every expert's global scale: each rank's home slots, gathered once
+        G = torch.stack([m._okc_moe_state["w13_gs32"][: m.num_home_experts].float() for _, m in st.layers])
+        allg = [torch.empty_like(G) for _ in range(world)]
+        dist.all_gather(allg, G, group=dev_g)
+        allg = [a.cpu().numpy() for a in allg]
+        st.gs = {}
+        for i, (li, m) in enumerate(st.layers):
+            g = np.zeros(256, np.float32)
+            for r, ids in enumerate(_placement_ranks(li)):
+                g[np.asarray(ids)] = allg[r][i][: len(ids)]
+            st.gs[li] = g
+    Vh, Rh = V.cpu().numpy(), Rg.cpu().numpy()
+    for _, m in st.layers:
+        m._okc_adapt_vcnt.floor_divide_(2)
+    jobs = []
+    for i, (li, m) in enumerate(st.layers):
+        if i % world != rank:
+            continue
+        R = len(m.replica_plan["order"]) // world
+        jobs.append((li, list(m.replica_plan["home"]), Vh[i].tolist(), Rh[i].tolist(), R, 1000 + li))
+    if st.pool is None:
+        st.pool = multiprocessing.get_context("spawn").Pool(1, initializer=_worker_init)
+    st.pending = st.pool.apply_async(_decide_many, (jobs,))
+    st.tokens = 0
+    logger.info("OKC adaptive replicas: refresh %d decided in the background (%d layers here).", st.refreshes + 1, len(jobs))
+
+
+def _check():
+    import torch.distributed as dist
+
+    st = _S
+    _, cpu_g, rank, world = _groups()
+    flags = [None] * world
+    dist.all_gather_object(flags, bool(st.pending.ready()), group=cpu_g)
+    if not all(flags):
+        return
+    mine = st.pending.get()
+    parts = [None] * world
+    dist.all_gather_object(parts, mine, group=cpu_g)
+    plan = {}
+    for p in parts:
+        plan.update(p)
+    st.pending = None
+    st.refreshes += 1
+    n = apply(plan, _p2p_transfer)
+    logger.info("OKC adaptive replicas: refresh %d applied (%d expert copies).", st.refreshes, n)
+
+
+def _p2p_transfer(copies):
+    """copies: [(src_rank, dst_rank, src tensors, dst tensors)] in one global order -> NCCL send / recv."""
+    import torch.distributed as dist
+
+    dev_g, _, rank, _ = _groups()
+    ops = []
+    for src, dst, s_tens, d_tens in copies:
+        if rank == src:
+            ops += [dist.P2POp(dist.isend, t, dst, group=dev_g) for t in s_tens]
+        if rank == dst:
+            ops += [dist.P2POp(dist.irecv, t, src, group=dev_g) for t in d_tens]
+    if ops:
+        for w in dist.batch_isend_irecv(ops):
+            w.wait()
+
+
+def plan_slots(old_order, old_rank, new_pairs, world, R, nh):
+    """-> (new local replica list per rank [world][R] (slot nh + i holds entry i), copies [(expert, rank, slot)])
+    keeping every (expert, rank) that survives in its slot."""
+    old_local = [[e for e, r in zip(old_order, old_rank) if r == q] for q in range(world)]
+    new_by = [[e for e, r in new_pairs if r == q] for q in range(world)]
+    local, copies = [], []
+    for q in range(world):
+        keep = set(old_local[q]) & set(new_by[q])
+        slots = [e if e in keep else None for e in old_local[q]] + [None] * (R - len(old_local[q]))
+        for e in new_by[q]:
+            if e in keep:
+                continue
+            i = slots.index(None)
+            slots[i] = e
+            copies.append((e, q, nh + i))
+        local.append(slots)
+    return local, copies
+
+
+def apply(plan, transfer, rank=None, world=None):
+    """Install the decided replica sets: plan {layer: [(expert, replica rank)] in balancing order}. transfer(copies)
+    moves pack bytes (NCCL in serving; local copies in tests). Returns the number of expert copies."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.pg_moe import rep_table
+
+    st = _S
+    if rank is None:
+        _, _, rank, world = _groups()
+    copies_all, todo = [], []
+    for li, m in st.layers:
+        pairs = plan.get(li)
+        if not pairs:
+            continue
+        R = len(m.replica_plan["order"]) // world
+        home = m.replica_plan["home"]
+        if any(home[e] == r for e, r in pairs) or any(sum(1 for _, r in pairs if r == q) != R for q in range(world)) \
+                or len({e for e, _ in pairs}) != len(pairs):
+            logger.warning("OKC adaptive replicas: layer %d plan rejected (bad shape); kept.", li)
+            continue
+        nh = m.num_home_experts
+        local, copies = plan_slots(m.replica_plan["order"], m.replica_plan["rank"], pairs, world, R, nh)
+        ranks = _placement_ranks(li)
+        state = m._okc_moe_state
+        for e, q, slot in copies:
+            h = home[e]
+            src_slot = ranks[h].index(e)
+            s = [state["pg_wsf13"][src_slot], state["pg_wsf2"][src_slot]] if rank == h else []
+            d = [state["pg_wsf13"][slot], state["pg_wsf2"][slot]] if rank == q else []
+            copies_all.append((h, q, s, d))
+        todo.append((li, m, pairs, local, copies))
+    transfer(copies_all)
+    for li, m, pairs, local, copies in todo:
+        nh = m.num_home_experts
+        mine = local[rank]
+        gs = st.gs[li] if st.gs is not None else None
+        for e, q, slot in copies:
+            if q == rank and gs is not None:
+                m._okc_moe_state["w13_gs32"][slot] = float(gs[e])
+        ids = list(_placement_ranks(li)[rank]) + [e for e in mine if e is not None]
+        slot_of = [-1] * 256
+        for i, e in enumerate(ids):
+            slot_of[e] = i
+        order, holder = [e for e, _ in pairs], [r for _, r in pairs]
+        m._okc_rep_table.copy_(rep_table(m.replica_plan["home"], slot_of, order, holder).to(m._okc_rep_table.device))
+        m.replica_plan = dict(m.replica_plan, order=order, rank=holder, local=[e for e in mine if e is not None])
+        if getattr(m, "local_expert_ids", None) is not None:
+            m.local_expert_ids = ids
+    return len(copies_all)
