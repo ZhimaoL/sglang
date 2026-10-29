@@ -291,7 +291,7 @@ def maybe_refresh(model_runner, forward_batch):
 
 
 def _groups():
-    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.parallel_state import get_tp_group
 
     g = get_tp_group()
     return g.device_group, g.cpu_group, g.rank_in_group, g.world_size
