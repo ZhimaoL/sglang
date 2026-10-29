@@ -28,7 +28,6 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import (
-    PFMHA_EXACT,
     PFMHA_MIN_TOKENS,
     PFMHA_RAGGED,
     PFMHA_RAGGED_MAX_BS,
@@ -44,7 +43,6 @@ HQ, HKV, D = 16, 2, 64
 SLOTS4 = 132  # 1 CTA per SM
 IT_US = 1.41  # bank cost model: us per 128-key iteration per CTA
 EFF4 = 0.9  # 4-consumer-warpgroup kernel's per-token cost relative to the 3-warpgroup one
-PATH_STATS = os.environ.get("OKC_PATH_STATS", "0") == "1"
 # fmha = ran here; fa3 = declined (FA3 ran) although the call had >= the token threshold
 HITS = {"fmha": 0, "fmha_tokens": 0, "fa3": 0}
 _FIRED = set()
@@ -116,8 +114,6 @@ def pick_cfg(L: int, ntf: int):
 def _decline(tokens: int, threshold: int) -> None:
     if tokens >= threshold:
         HITS["fa3"] += 1
-        if PATH_STATS and _pow2(HITS["fa3"]):
-            logger.info("OKC prefill_fmha declined: %s (tokens %d)", HITS, tokens)
     return None
 
 
@@ -183,7 +179,7 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
         return _decline(tokens, threshold)
     # (expanded [bs, hkv] descale views of the layer's [] scale: data_ptr()[0] is that scale)
 
-    ext = fmha_ext(PFMHA_EXACT)
+    ext = fmha_ext()
     win = window_size[0] + 1 if is_swa else 0
     usable = out is not None and out.dtype is torch.bfloat16 and out.is_contiguous() and out.numel() == tokens * HQ * D
     # row blocks: one request of exactly the blocks, and no caller copy of an unwritten result (out is used)
@@ -202,8 +198,6 @@ def try_extend(backend, q, key_cache, value_cache, page_table, cache_seqlens, cu
     HITS["fmha_tokens"] += tokens
     _log_once("prefill_fmha" + ("_swa" if win else "") + ("_ragged" if bs > 1 else ""),
               f"(first bs={bs}, tokens={tokens}, len={reqs[-1][2]}, nc={nc}, split={split})")
-    if PATH_STATS and _pow2(HITS["fmha"]):
-        logger.info("OKC prefill_fmha hits: %s (layer %d, bs %d, tokens %d)", HITS, layer.layer_id, bs, tokens)
     return o
 
 

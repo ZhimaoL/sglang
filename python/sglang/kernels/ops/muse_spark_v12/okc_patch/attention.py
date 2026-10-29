@@ -39,7 +39,6 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_VFG_FULL1,
     SW_WST,
     VP2_MAX_BS,
-    WST_ACC16,
     WST_BAL_MIN_BS,
     WST_MIN_BS,
 )
@@ -329,7 +328,7 @@ def verify_core_rows(q, k_cache, v_cache, page_table, cache_seqlens, out, *, bs,
     if ws is None or ws["acc"].shape[0] < nrow:
         n = max(nrow, (G + 32) * 2 * LG)
         ws = {
-            "acc": torch.empty((n, 64), dtype=torch.bfloat16 if WST_ACC16 else torch.float32, device=device),
+            "acc": torch.empty((n, 64), dtype=torch.float32, device=device),
             "m": torch.empty((n,), dtype=torch.float32, device=device),
             "l": torch.empty((n,), dtype=torch.float32, device=device),
         }
@@ -443,7 +442,7 @@ def _wst_full(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     if ws is None or ws["acc"].shape[0] < nrow:
         n = max(nrow, (G + 32) * 2 * LG)
         ws = {
-            "acc": torch.empty((n, 64), dtype=torch.bfloat16 if WST_ACC16 else torch.float32, device=device),
+            "acc": torch.empty((n, 64), dtype=torch.float32, device=device),
             "m": torch.empty((n,), dtype=torch.float32, device=device),
             "l": torch.empty((n,), dtype=torch.float32, device=device),
         }

@@ -1845,10 +1845,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
         if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
-    # OKC_CUDA_MAX_CONNECTIONS=32: with 8 hardware work queues the HiCache write-through stream shares one with an SP
-    # peer-push stream, which then waits for the whole write-through (~7 ms, twice per first turn in S8 arm C;
-    # serving/kernels/ft-glue E2). The default keeps stock's 8.
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = os.environ.get("OKC_CUDA_MAX_CONNECTIONS", "8")
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels

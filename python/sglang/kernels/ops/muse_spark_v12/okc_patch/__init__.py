@@ -92,8 +92,6 @@ WST_MIN_BS = int(os.environ.get("OKC_WST_MIN_BS", "1"))
 # Dev box (serving/kernels/verify-attn LOG VA2 / VA3): wst_ct14 wins at bs 1-3, ties at 4, bal wins from 6 (by 18 % at
 # bs 16 when the batch's lengths spread over 30K-86K; wst_ct14 splits every request by the longest span).
 WST_BAL_MIN_BS = int(os.environ.get("OKC_WST_BAL_MIN_BS", "5"))
-# Their split-KV O partials: "0" (default) fp32 like FA3; "1" the attention bank's bf16 partials (a separate build).
-WST_ACC16 = _flag("OKC_WST_ACC16", "0")
 # Verify (q_len 8) on the attention lane's VFG / VP2 kernels (_cuda_src_vfg.py: QK norm + RoPE, new KV rows, FP8 attention,
 # merge, output norm and gate; fp32 split-KV partials): sliding layers at every bs (VP2 up to OKC_VP2_MAX_BS, VFG + merge
 # kernel above), and full layers at bs 1 in place of wst. "0": sliding layers on the stock path, full layers on wst.
@@ -176,9 +174,6 @@ PFMHA_SLIDING = _flag("OKC_PFMHA_SLIDING", "1")
 PFMHA_SLIDING_MIN_TOKENS = int(os.environ.get("OKC_PFMHA_SLIDING_MIN_TOKENS", "640"))
 PFMHA_RAGGED = _flag("OKC_PFMHA_RAGGED", "1")
 PFMHA_RAGGED_MAX_BS = int(os.environ.get("OKC_PFMHA_RAGGED_MAX_BS", "32"))
-# Every exp2 of the softmax on MUFU ex2.f16x2 (no piecewise-linear exp; the scores stay f16): a cleaner-numerics
-# build of the same kernels, compiled separately when on.
-PFMHA_EXACT = _flag("OKC_PREFILL_FMHA_EXACT", "0")
 
 # Verify-step glue (serving/kernels/verify-glue): at <= 2048 routes a pg-only layer runs one routing launch (pg_route:
 # local ids + block list, in place of the int32 cast / expert-map gather / moe_align / pg_tiles) and folds the
@@ -288,7 +283,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
-           "PFMHA_RAGGED_MAX_BS", "PFMHA_EXACT", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "WST_ACC16", "SW_VFG",
+           "PFMHA_RAGGED_MAX_BS", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SP_CE_TP",
            "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
