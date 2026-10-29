@@ -54,6 +54,35 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
     )
 
 
+# OKC_SW_HICACHE_WB_SPLIT (HC-DRAIN): (relayout stream, ready event) of the device -> host submission in flight, set by
+# L2TransferEngine; per staging buffer, the event after its last copies.
+_WB_SPLIT = None
+_WB_STAGING_FREE: dict = {}
+
+
+def set_write_back_split(split) -> None:
+    global _WB_SPLIT
+    _WB_SPLIT = split
+
+
+@cache_once
+def _jit_hicache_staged_part_module(
+    *, element_size: int, unroll: int, block_quota: int
+) -> Module:
+    args = make_cpp_args(element_size, unroll, block_quota, 1024)
+    return load_jit(
+        "hicache_staged_part",
+        *args,
+        cuda_files=["kvcacheio/staged_write_back.cuh"],
+        cuda_wrappers=[
+            (
+                "launch_all_lf_pf_staged_part",
+                f"&HiCacheStagedWriteBackKernel<{args}>::run_all_lf_pf_staged_part",
+            )
+        ],
+    )
+
+
 @cache_once
 def _jit_hicache_staged_module(
     *, element_size: int, unroll: int, block_quota: int
@@ -426,13 +455,47 @@ def transfer_hicache_all_layer_staged_lf_pf(
     element_size = element_size or (element_dim * staging_k.element_size())
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
     unroll = unroll or _default_unroll(element_size)
+    staging_page_capacity = staging_k.shape[0] // page_size
+    split = _WB_SPLIT
+    if split is not None and src_indices.numel() <= staging_page_capacity * page_size:
+        # one chunk: relayout on the second stream (waits on the ready event and this staging's last copies, never
+        # on a copy of this burst), copies here after it
+        relayout_stream, ready = split
+        part = _jit_hicache_staged_part_module(
+            element_size=element_size, unroll=unroll, block_quota=block_quota
+        )
+        key = staging_k.data_ptr()
+        tokens = src_indices.numel()
+        sk = staging_k.view(staging_k.shape[0], staging_k.shape[1], -1)[:tokens]
+        sv = staging_v.view(staging_v.shape[0], staging_v.shape[1], -1)[:tokens]
+        dk = dst_k.view(dst_k.shape[0], dst_k.shape[1], -1)
+        dv = dst_v.view(dst_v.shape[0], dst_v.shape[1], -1)
+        relayout_stream.wait_event(ready)
+        if key in _WB_STAGING_FREE:
+            relayout_stream.wait_event(_WB_STAGING_FREE[key])
+        with torch.cuda.stream(relayout_stream):
+            src_page_indices = src_indices[::page_size].contiguous()
+            part.launch_all_lf_pf_staged_part(
+                dk, dv, dst_indices, sk, sv, src_page_indices, k_ptr_src, v_ptr_src, page_size, 1
+            )
+            relayout_done = torch.cuda.Event()
+            relayout_done.record()
+        src_indices.record_stream(relayout_stream)
+        cur = torch.cuda.current_stream()
+        cur.wait_event(relayout_done)
+        part.launch_all_lf_pf_staged_part(
+            dk, dv, dst_indices, sk, sv, src_page_indices, k_ptr_src, v_ptr_src, page_size, 2
+        )
+        free = torch.cuda.Event()
+        free.record(cur)
+        _WB_STAGING_FREE[key] = free
+        return
     src_page_indices = src_indices[::page_size].contiguous()
     module = _jit_hicache_staged_module(
         element_size=element_size,
         unroll=unroll,
         block_quota=block_quota,
     )
-    staging_page_capacity = staging_k.shape[0] // page_size
     staging_k = staging_k.view(staging_k.shape[0], staging_k.shape[1], -1)
     staging_v = staging_v.view(staging_v.shape[0], staging_v.shape[1], -1)
     dst_k = dst_k.view(dst_k.shape[0], dst_k.shape[1], -1)

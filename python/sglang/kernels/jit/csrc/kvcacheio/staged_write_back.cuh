@@ -227,7 +227,8 @@ struct HiCacheStagedWriteBackKernel {
       const tvm::ffi::TensorView page_indices_src,
       const tvm::ffi::TensorView k_ptr_src,
       const tvm::ffi::TensorView v_ptr_src,
-      const int64_t page_size) {
+      const int64_t page_size,
+      const int64_t parts = 3) {   // bit 0: the relayout into staging, bit 1: the staging -> host copies
     using namespace host;
 
     auto T = SymbolicSize{"num_tokens"};
@@ -297,7 +298,12 @@ struct HiCacheStagedWriteBackKernel {
     };
     const auto device = device_.unwrap();
     const auto use_int32 = indices_dtype.unwrap().bits == 32;
-    launch_hicache_relayout_kernel<kElementSize, kIsMLA>(params, P.unwrap(), N.unwrap(), page_size, use_int32, device);
+    if (parts & 1) {
+      launch_hicache_relayout_kernel<kElementSize, kIsMLA>(params, P.unwrap(), N.unwrap(), page_size, use_int32, device);
+    }
+    if (!(parts & 2)) {
+      return;
+    }
 
     auto stream = LaunchKernel::resolve_device(device);
     const int64_t* dst_indices_ptr = static_cast<const int64_t*>(dst_indices_cpu.data_ptr());
@@ -342,6 +348,31 @@ struct HiCacheStagedWriteBackKernel {
         k_ptr_src,
         v_ptr_src,
         page_size);
+  }
+
+  // OKC_SW_HICACHE_WB_SPLIT: the relayout (parts 1) and the copies (parts 2) as separate launches, on two streams
+  static void run_all_lf_pf_staged_part(
+      const tvm::ffi::TensorView k_cache_dst,
+      const tvm::ffi::TensorView v_cache_dst,
+      const tvm::ffi::TensorView dst_indices_cpu,
+      const tvm::ffi::TensorView staging_k,
+      const tvm::ffi::TensorView staging_v,
+      const tvm::ffi::TensorView page_indices_src,
+      const tvm::ffi::TensorView k_ptr_src,
+      const tvm::ffi::TensorView v_ptr_src,
+      const int64_t page_size,
+      const int64_t parts) {
+    run_staged_impl<false>(
+        k_cache_dst,
+        v_cache_dst,
+        dst_indices_cpu,
+        staging_k,
+        staging_v,
+        page_indices_src,
+        k_ptr_src,
+        v_ptr_src,
+        page_size,
+        parts);
   }
 
   static void run_all_mla_lf_pf_staged(

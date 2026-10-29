@@ -55,6 +55,12 @@ class L2TransferEngine:
         self.io_backend = io_backend
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        # OKC HC-DRAIN: the staged write-back's relayouts on their own stream (kernels/ops/kvcache/hicache.py)
+        self._okc_relayout_stream = (
+            device_module.Stream() if okc_patch.SW_HICACHE_WB_SPLIT and device_module is torch.cuda else None
+        )
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
@@ -132,13 +138,24 @@ class L2TransferEngine:
         with self._submission(
             transfers, self.device_to_host_stream, "device_to_host"
         ) as (transfers, completion):
-            for transfer in transfers:
-                transfer.host_pool.backup_from_device_all_layer_physical(
-                    transfer.device_pool,
-                    transfer.host_indices,
-                    transfer.device_indices,
-                    self.io_backend,
-                )
+            split = self._okc_relayout_stream
+            if split is not None:
+                from sglang.kernels.ops.kvcache import hicache as okc_hicache
+
+                ready = device_module.Event()
+                ready.record(self.device_to_host_stream)   # after the index preparation, before any copy
+                okc_hicache.set_write_back_split((split, ready))
+            try:
+                for transfer in transfers:
+                    transfer.host_pool.backup_from_device_all_layer_physical(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        self.io_backend,
+                    )
+            finally:
+                if split is not None:
+                    okc_hicache.set_write_back_split(None)
         return completion
 
     def submit_host_to_device(
