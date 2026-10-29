@@ -25,6 +25,11 @@ _REPLICA_PATH = os.environ.get("OKC_MOE_REPLICA_FILE") or os.path.join(
 # (rank q replicates the first R experts of rank q + 1), no fitted table at all; with OKC_MOE_ADAPTIVE_REPLICAS the
 # replica sets then come from the run's own counts (okc_patch/adaptive.py).
 _CONTIGUOUS = os.environ.get("OKC_MOE_HOMES", "") == "contiguous"
+# OKC_MOE_ADAPT_INIT (adaptive replicas only): "neutral" (default) starts from the neutral plan on whatever homes are
+# active (rank q replicates the first R experts of rank q + 1), so the replica sets come from the run's own counts and
+# no fitted R table is used; "table" starts from the replica file (experiments only).
+_NEUTRAL_INIT = _CONTIGUOUS or (os.environ.get("OKC_MOE_ADAPTIVE_REPLICAS", "0") == "1"
+                                and os.environ.get("OKC_MOE_ADAPT_INIT", "neutral") == "neutral")
 
 
 @functools.cache
@@ -80,9 +85,8 @@ def replica_plan(
         return None
     ranks = placement["layers"].get(str(layer_idx))
     layer = plan["replicas"].get(str(count), {}).get(str(layer_idx))
-    if _CONTIGUOUS and ranks is not None:
-        n = num_experts // ep_size
-        layer = " ".join(f"{((q + 1) % ep_size) * n + j}:{q}" for j in range(count) for q in range(ep_size))
+    if _NEUTRAL_INIT and ranks is not None:
+        layer = " ".join(f"{ranks[(q + 1) % ep_size][j]}:{q}" for j in range(count) for q in range(ep_size))
     if ranks is None or layer is None:
         return None
     home = [-1] * num_experts
