@@ -145,22 +145,36 @@ def _draw_ext(q, T, kappa, F, rng):
     return out
 
 
-def decide(home, verify_counts, prefill_counts, R, seed=0, prefill_chunks=None, F_v=(40, 40, 20, 20), F_p=16, F_x=16):
-    """home [256] rank, verify_counts / prefill_counts [256] route counts of the run -> R x 8 (expert, rank) pairs in
-    balancing order (hottest first by the verify marginal). prefill_chunks [F, 256] overrides the multinomial draws."""
+ROUTES_16K = 16384 * 8
+
+
+def _context(home, verify_counts, prefill_counts, seed, prefill_chunks, F_v, F_p, F_x):
+    """(J, p, q, candidates): the objective on this run's counts. prefill_chunks rows (per-forward route counts) are
+    scaled to one 16K forward each, the unit STRAG_CHUNKS counts."""
     rng = np.random.default_rng(seed)
-    home = np.asarray(home)
     p = np.asarray(verify_counts, float) + 1e-3; p /= p.sum()
     q = np.asarray(prefill_counts, float) + 1e-3; q /= q.sum()
     vtr = [(route_counts(p, bs, 0.2, F, rng), w, met, cp) for (bs, w, met, cp), F in zip(GROUPS, F_v)]
-    ptr = prefill_chunks if prefill_chunks is not None else rng.multinomial(16384 * 8, q, size=F_p).astype(float)
+    if prefill_chunks is not None and len(prefill_chunks):
+        ptr = np.asarray(prefill_chunks, float)
+        ptr = np.round(ptr * (ROUTES_16K / np.maximum(ptr.sum(1, keepdims=True), 1.0)))
+    else:
+        ptr = rng.multinomial(ROUTES_16K, q, size=F_p).astype(float)
     xtr = _draw_ext(q, 1024, 8.49, F_x, rng)
 
     def J(pairs):
         v = sum(w * rank_costs(c, home, pairs, met, cp).max(1).mean() / 1e3 for c, w, met, cp in vtr)
         return v + W_P * STRAG_CHUNKS * strag_us(ptr, home, pairs) / 1e3 + W_X * extend_slowest(xtr, home, pairs) / 1e3
 
-    cand = sorted(set(np.argsort(-p)[:48].tolist()) | set(np.argsort(-q)[:48].tolist()))
+    cand = sorted(set(np.argsort(-p)[:32].tolist()) | set(np.argsort(-q)[:32].tolist()))
+    return J, p, q, cand
+
+
+def _order(pairs, p):
+    return [(int(e), int(r)) for e, r in sorted(pairs, key=lambda x: (-p[x[0]], x[0]))]
+
+
+def _greedy(J, p, cand, home, R):
     chosen, slots = {}, np.full(EP, R)
     for _ in range(EP * R):
         best = None
@@ -171,13 +185,60 @@ def decide(home, verify_counts, prefill_counts, R, seed=0, prefill_chunks=None, 
                 if r == home[e] or slots[r] == 0:
                     continue
                 trial = dict(chosen); trial[e] = r
-                val = J(sorted(trial.items(), key=lambda x: -p[x[0]]))
+                val = J(_order(trial.items(), p))
                 if best is None or val < best[0] - 1e-12:
                     best = (val, e, r)
         if best is None:
             break
         chosen[best[1]] = best[2]; slots[best[2]] -= 1
-    return [(int(e), int(r)) for e, r in sorted(chosen.items(), key=lambda x: -p[x[0]])]
+    return _order(chosen.items(), p)
+
+
+def _refine(J, p, cand, home, cur, theta, max_swaps):
+    """Local search from the current plan: one move = the expert in one (expert, rank) slot replaced by a candidate
+    not replicated yet (same rank, never its home); a move is taken only if it lowers J by more than theta (its copy
+    cost); at most max_swaps moves."""
+    cur = list(cur)
+    val = J(_order(cur, p))
+    for _ in range(max_swaps):
+        used = {e for e, _ in cur}
+        best = None
+        for i, (e0, r) in enumerate(cur):
+            for e in cand:
+                if e in used or home[e] == r:
+                    continue
+                trial = cur[:i] + [(e, r)] + cur[i + 1:]
+                v = J(_order(trial, p))
+                if best is None or v < best[0] - 1e-12:
+                    best = (v, trial)
+        if best is None or best[0] > val - theta:
+            break
+        val, cur = best
+    return _order(cur, p), val
+
+
+def decide(home, verify_counts, prefill_counts, R, seed=0, prefill_chunks=None, F_v=(20, 20, 10, 10), F_p=16, F_x=8,
+           current=None, theta=0.0, max_swaps=4, full=True):
+    """home [256] rank, the run's verify / prefill route counts [256] (+ per-forward prefill rows) -> R x 8
+    (expert, rank) pairs in balancing order. With current pairs: the incremental search (theta = objective units per
+    expert copy, at most max_swaps copies) and, if full, the from-scratch greedy too; the plan with the lower
+    J + theta x copies (vs current) wins, current itself included."""
+    home = np.asarray(home)
+    J, p, q, cand = _context(home, verify_counts, prefill_counts, seed, prefill_chunks, F_v, F_p, F_x)
+    if current is None:
+        return _greedy(J, p, cand, home, R)
+    cur = _order(current, p)
+    copies = lambda pl: len(set(pl) - set(cur))
+    best = (J(cur), cur)
+    inc, vi = _refine(J, p, cand, home, cur, theta, max_swaps)
+    if vi + theta * copies(inc) < best[0] - 1e-12:
+        best = (vi + theta * copies(inc), inc)
+    if full:
+        g = _greedy(J, p, cand, home, R)
+        vg = J(g) + theta * copies(g)
+        if vg < best[0] - 1e-12:
+            best = (vg, g)
+    return best[1]
 
 
 # ----------------------------------------------------------------------------------------------- runtime (serving)
@@ -208,6 +269,7 @@ def count_prefill(experts, topk_ids, local_ids, ep_rank):
     if ring is None:
         return
     slot = experts._okc_adapt_slot
+    ring.index_fill_(0, slot, 0)    # the slot's row holds one forward: clear what it held K forwards ago
     if local_ids or ep_rank == 0:   # every rank still advances the slot, so ring rows stay aligned across ranks
         idx = topk_ids.reshape(-1).long() + slot * 256
         ring.view(-1).index_add_(0, idx, torch.ones(idx.shape, dtype=torch.int32, device=idx.device))
@@ -215,14 +277,16 @@ def count_prefill(experts, topk_ids, local_ids, ep_rank):
 
 
 def _decide_many(jobs):
-    """Background worker: [(layer, home, verify counts, ring counts, R, seed)] -> {layer: pairs}."""
+    """Background worker: [(layer, home, verify counts, ring counts, R, seed, current pairs, theta, max_swaps, full)]
+    -> {layer: pairs}."""
     out = {}
-    for li, home, v, ring, R, seed in jobs:
+    for li, home, v, ring, R, seed, cur, theta, swaps, full in jobs:
         ring = np.asarray(ring, float)
         chunks = ring[ring.sum(1) > 0]
         pre = chunks.sum(0) if len(chunks) else np.ones(256)
         out[li] = decide(np.asarray(home), np.asarray(v, float), pre, R, seed=seed,
-                         prefill_chunks=chunks if len(chunks) >= 4 else None)
+                         prefill_chunks=chunks if len(chunks) >= 4 else None,
+                         current=[tuple(x) for x in cur], theta=theta, max_swaps=swaps, full=full)
     return out
 
 
@@ -235,6 +299,9 @@ class _State:
         self.fwd = 0
         self.gs = None              # {layer: [256] float global scales of every expert}
         self.last_counts = None
+        self.queue = []             # [(layer, pairs)] decided, not applied yet (trickled: ADAPT_TRICKLE copies per forward)
+        self.rec = None             # the refresh being applied (audit record)
+        self.warm = False
 
 
 _S = _State()
@@ -277,7 +344,12 @@ def maybe_refresh(model_runner, forward_batch):
                         len(st.layers), sw.ADAPT_FIRST_TOKENS, sw.ADAPT_EVERY_TOKENS)
     if not st.layers:
         return
-    if st.pending is None:
+    if not st.warm:   # NCCL's P2P connections between every pair, paid here (server warm-up), not at a refresh
+        st.warm = True
+        _p2p_warmup()
+    if st.queue:
+        _trickle(sw.ADAPT_TRICKLE)
+    elif st.pending is None:
         if st.tokens >= (sw.ADAPT_FIRST_TOKENS if st.refreshes == 0 else sw.ADAPT_EVERY_TOKENS):
             _trigger()
     elif st.fwd % sw.ADAPT_CHECK == 0:
@@ -292,6 +364,7 @@ def _groups():
 
 
 def _trigger():
+    sw = _knobs()
     st = _S
     dev_g, cpu_g, rank, world = _groups()
     import torch.distributed as dist
@@ -320,7 +393,9 @@ def _trigger():
         if i % world != rank:
             continue
         R = len(m.replica_plan["order"]) // world
-        jobs.append((li, list(m.replica_plan["home"]), Vh[i].tolist(), Rh[i].tolist(), R, 1000 + li))
+        cur = [list(x) for x in zip(m.replica_plan["order"], m.replica_plan["rank"])]
+        jobs.append((li, list(m.replica_plan["home"]), Vh[i].tolist(), Rh[i].tolist(), R, 1000 + li, cur,
+                     sw.ADAPT_THETA, sw.ADAPT_MAX_SWAPS, st.refreshes == 0))
     # a plain child interpreter (not multiprocessing: the scheduler process may be daemonic), numpy single-threaded
     import pickle
     import subprocess
@@ -331,7 +406,7 @@ def _trigger():
     pickle.dump(jobs, f); f.close()
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
     proc = subprocess.Popen([sys.executable, "-m", __name__, f.name, f.name + ".out"], env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=lambda: os.nice(10))
     st.pending = (proc, f.name, f.name + ".out")
     st.tokens = 0
     logger.info("OKC adaptive replicas: refresh %d decided in the background (%d layers here).", st.refreshes + 1, len(jobs))
@@ -369,38 +444,108 @@ def _check():
     st.refreshes += 1
     import hashlib
     import json
-    import time
 
-    t0 = time.perf_counter()
-    n = apply(plan, _p2p_transfer)
-    torch.cuda.current_stream().synchronize()
-    ms = (time.perf_counter() - t0) * 1e3
-    rec = {"refresh": st.refreshes, "forward": st.fwd, "copies": n, "apply_ms": round(ms, 2),
-           "plan": {str(k): [list(map(int, x)) for x in v] for k, v in sorted(plan.items())}}
-    digest = hashlib.md5(json.dumps(rec["plan"], sort_keys=True).encode()).hexdigest()[:12]
-    logger.info("OKC adaptive replicas: refresh %d applied (%d expert copies, %.1f ms, plan %s).", st.refreshes, n, ms, digest)
+    changed = []
+    for li, m in st.layers:
+        new = plan.get(li)
+        cur = [(int(e), int(r)) for e, r in zip(m.replica_plan["order"], m.replica_plan["rank"])]
+        if new and [tuple(x) for x in new] != cur:
+            changed.append((li, [tuple(map(int, x)) for x in new], len(set(map(tuple, new)) - set(cur))))
+    st.queue = [(li, pl) for li, pl, _ in changed]
+    full = {str(k): [list(map(int, x)) for x in v] for k, v in sorted(plan.items())}
+    digest = hashlib.md5(json.dumps(full, sort_keys=True).encode()).hexdigest()[:12]
+    ncopy = sum(c for _, _, c in changed)
+    st.rec = {"refresh": st.refreshes, "forward": st.fwd, "layers_changed": len(changed), "copies": ncopy,
+              "apply_ms": 0.0, "steps": 0, "md5": digest, "plan": full}
+    logger.info("OKC adaptive replicas: refresh %d decided (plan %s): %d layers change, %d expert copies, trickled.",
+                st.refreshes, digest, len(changed), ncopy)
     d = os.environ.get("OKC_ADAPT_LOG_DIR")
     if d and rank == 0:   # the audit trail: every refresh's plan and the counts it was decided on
         os.makedirs(d, exist_ok=True)
-        rec["md5"] = digest
         with open(os.path.join(d, f"refresh_{st.refreshes:03d}.json"), "w") as f:
-            json.dump(dict(rec, counts=st.last_counts), f)
+            json.dump(dict(st.rec, counts=st.last_counts), f)
+    if not st.queue:
+        st.rec = None
+
+
+def _trickle(budget):
+    """Apply queued layers, whole layers only, up to `budget` expert copies this forward (at least one layer): every
+    rank pops the same layers (the queue is identical everywhere), so the P2P pairs match."""
+    st = _S
+    take, n = {}, 0
+    while st.queue:
+        li, pl = st.queue[0]
+        m = dict(st.layers)[li]
+        cur = set(zip(m.replica_plan["order"], m.replica_plan["rank"]))
+        c = len(set(pl) - cur)
+        if take and n + c > budget:
+            break
+        take[li] = pl; n += c
+        st.queue.pop(0)
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    e0.record()
+    apply(take, _p2p_transfer)
+    e1.record()
+    if st.rec is not None:
+        st.rec.setdefault("_ev", []).append((e0, e1))
+        st.rec["steps"] += 1
+        if not st.queue:
+            e1.synchronize()
+            st.rec["apply_ms"] = round(sum(a.elapsed_time(b) for a, b in st.rec.pop("_ev")), 2)
+            logger.info("OKC adaptive replicas: refresh %d applied (%d expert copies over %d forwards, %.1f ms in all, "
+                        "plan %s).", st.rec["refresh"], st.rec["copies"], st.rec["steps"], st.rec["apply_ms"],
+                        st.rec["md5"])
+            st.rec = None
+
+
+def _p2p_warmup():
+    import torch.distributed as dist
+
+    dev_g, _, rank, world = _groups()
+    dev = torch.cuda.current_device()
+    ops = []
+    for q in range(world):
+        if q == rank:
+            continue
+        ops.append(dist.P2POp(dist.isend, torch.zeros(256, dtype=torch.uint8, device=dev), q, group=dev_g))
+        ops.append(dist.P2POp(dist.irecv, torch.empty(256, dtype=torch.uint8, device=dev), q, group=dev_g))
+    for w in dist.batch_isend_irecv(ops):
+        w.wait()
+    torch.cuda.current_stream().synchronize()
 
 
 def _p2p_transfer(copies):
-    """copies: [(src_rank, dst_rank, src tensors, dst tensors)] in one global order -> NCCL send / recv."""
+    """copies: [(src_rank, dst_rank, src tensors, dst tensors)] in one global order -> one NCCL message per (src, dst)
+    (the pair's packs concatenated), unpacked into the slots on arrival."""
     import torch.distributed as dist
 
     dev_g, _, rank, _ = _groups()
-    ops = []
+    groups = {}
     for src, dst, s_tens, d_tens in copies:
-        if rank == src:
-            ops += [dist.P2POp(dist.isend, t, dst, group=dev_g) for t in s_tens]
-        if rank == dst:
-            ops += [dist.P2POp(dist.irecv, t, src, group=dev_g) for t in d_tens]
+        g = groups.setdefault((src, dst), [[], []])
+        g[0] += s_tens; g[1] += d_tens
+    ops, unpack = [], []
+    for (src, dst), (s_tens, d_tens) in groups.items():
+        if rank == src and s_tens:
+            buf = torch.cat([t.reshape(-1).view(torch.uint8) for t in s_tens])
+            ops.append(dist.P2POp(dist.isend, buf, dst, group=dev_g))
+            unpack.append(buf)                      # keep alive until the send completes
+        if rank == dst and d_tens:
+            n = sum(t.numel() * t.element_size() for t in d_tens)
+            buf = torch.empty(n, dtype=torch.uint8, device=d_tens[0].device)
+            ops.append(dist.P2POp(dist.irecv, buf, src, group=dev_g))
+            unpack.append((buf, d_tens))
     if ops:
         for w in dist.batch_isend_irecv(ops):
             w.wait()
+    for u in unpack:
+        if isinstance(u, tuple):
+            buf, d_tens = u
+            off = 0
+            for t in d_tens:
+                k = t.numel() * t.element_size()
+                t.view(-1).view(torch.uint8).copy_(buf[off:off + k])
+                off += k
 
 
 def plan_slots(old_order, old_rank, new_pairs, world, R, nh):

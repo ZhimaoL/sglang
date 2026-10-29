@@ -42,6 +42,12 @@ ADAPT_EVERY_TOKENS = int(os.environ.get("OKC_ADAPT_EVERY_TOKENS", "524288"))
 ADAPT_RING = int(os.environ.get("OKC_ADAPT_RING", "16"))
 ADAPT_MIN_T = int(os.environ.get("OKC_ADAPT_MIN_T", "4096"))
 ADAPT_CHECK = int(os.environ.get("OKC_ADAPT_CHECK", "32"))
+# hysteresis: a slot change must lower the layer objective (% official) by more than ADAPT_THETA per expert copy;
+# at most ADAPT_MAX_SWAPS incremental changes per layer per refresh (the first refresh may also take the full
+# greedy plan); the applied changes trickle in at <= ADAPT_TRICKLE expert copies per forward (whole layers).
+ADAPT_THETA = float(os.environ.get("OKC_ADAPT_THETA", "0.003"))
+ADAPT_MAX_SWAPS = int(os.environ.get("OKC_ADAPT_MAX_SWAPS", "4"))
+ADAPT_TRICKLE = int(os.environ.get("OKC_ADAPT_TRICKLE", "8"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
 MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
 # on the st chain the verify balancer weighs an expert by its st passes ceil(routes / 8); 0 = every active expert 1
@@ -310,7 +316,7 @@ RIDE_MAX_LOAD = int(os.environ.get("OKC_RIDE_MAX_LOAD", "16"))
 
 ANY_ATTN = SW_ATTN or SW_WST
 
-__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "MOE_REP_MAX_TOKENS",
+__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "ADAPT_THETA", "ADAPT_MAX_SWAPS", "ADAPT_TRICKLE", "MOE_REP_MAX_TOKENS",
            "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD", "PG_ROUTE_REPX",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
