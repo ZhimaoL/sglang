@@ -1343,7 +1343,7 @@ class Scheduler(
         )
 
     def init_ride_along(self):
-        from sglang.kernels.ops.muse_spark_v12.okc_patch import RIDE_ALONG
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import RIDE_ALONG, RIDE_MAX_LOAD, SW_RIDE_LOW
 
         # The ride-along path mirrors the overlap scheduler's spec-v2 forward of one
         # TP group; every other topology keeps prefill and decode apart.
@@ -1361,18 +1361,26 @@ class Scheduler(
             and not get_exec().features.enable_return_indexer_topk
             and self.model_worker.supports_ride_along()
         )
+        mode = RIDE_ALONG or (MODE_MERGED if SW_RIDE_LOW else MODE_OFF)
         self.ride_along = RideAlong(
-            mode=RIDE_ALONG if supported else MODE_OFF,
+            mode=mode if supported else MODE_OFF,
             block_size=int(get_spec().speculative_num_draft_tokens or 0),
             max_tokens=self.chunked_prefill_size,
+            max_load=RIDE_MAX_LOAD if SW_RIDE_LOW else None,
         )
         self.small_prefill_first.fold_rides_along = self.ride_along.enabled
         if self.ride_along.enabled:
             logger.info(
-                "Ride-along verify on (mode %d): running requests verify inside "
+                "Ride-along verify on (mode %d%s): running requests verify inside "
                 "prefill forwards.",
                 self.ride_along.mode,
+                "" if self.ride_along.max_load is None else f", while the load is <= {self.ride_along.max_load}",
             )
+
+    def _okc_ride_load(self, running_batch: ScheduleBatch) -> int:
+        """Requests the scheduler holds (running + waiting + the one being chunked): the low-load ride-along gate.
+        Scheduler state only, so every TP rank decides the same."""
+        return running_batch.batch_size() + len(self.waiting_queue) + (self.chunked_req is not None)
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -3815,6 +3823,10 @@ class Scheduler(
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
             if new_batch is not None:
+                # A fold skips its two decode steps only when the riders will verify in the next chunk forward.
+                self.small_prefill_first.fold_rides_along = self.ride_along.would_ride(
+                    self._okc_ride_load(running_batch)
+                )
                 self.small_prefill_first.on_prefill_scheduled(
                     batch=new_batch,
                     chunked_req=self.chunked_req,
@@ -3840,7 +3852,7 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
-            if self.ride_along.should_ride(new_batch, running_batch):
+            if self.ride_along.should_ride(new_batch, running_batch, self._okc_ride_load(running_batch)):
                 # The running batch verifies inside this prefill's forward instead of
                 # waiting for it: prepare its decode step as a decode iteration would.
                 running_batch = self.update_running_batch(running_batch)
@@ -4036,7 +4048,9 @@ class Scheduler(
             (
                 running_bs
                 if self.is_mixed_chunk
-                else self.ride_along.reserve_tokens(running_batch, chunked_prefill_size)
+                else self.ride_along.reserve_tokens(
+                    running_batch, chunked_prefill_size, self._okc_ride_load(running_batch)
+                )
             ),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
