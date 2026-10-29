@@ -1310,7 +1310,6 @@ class Scheduler(
 
         self.small_prefill_first = SmallPrefillFirst(
             enabled=bool(get_schedule().small_prefill_first),
-            mid_chunk_enabled=bool(get_schedule().mid_chunk_prefill_admission),
             between_chunk_enabled=okc_patch.SW_BETWEEN_CHUNK,
             between_chunk_max_reqs=okc_patch.BETWEEN_CHUNK_MAX_REQS,
             fold_enabled=okc_patch.SW_FOLLOWUP_ADMIT,
@@ -4035,17 +4034,6 @@ class Scheduler(
                 if fold is not None:
                     self.waiting_queue, adder.chunked_req_limit = fold
                     self._okc_fold_batch = True
-            if adder.chunked_req_limit is None and not self._okc_fold_batch:
-                mid_chunk = self.small_prefill_first.mid_chunk_order(
-                    chunked_req=self.chunked_req,
-                    waiting_queue=self.waiting_queue,
-                    tree_cache=self.tree_cache,
-                    budget=adder.rem_chunk_tokens or 0,
-                    page_size=self.page_size,
-                    num_running=running_batch.batch_size(),
-                )
-                if mid_chunk is not None:
-                    self.waiting_queue, adder.chunked_req_limit = mid_chunk
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
