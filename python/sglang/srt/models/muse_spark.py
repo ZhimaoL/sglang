@@ -1028,6 +1028,7 @@ class MuseSpark1xMoE(nn.Module):
         if use_side_stream:
             side_stream.wait_stream(main_stream)
         # nn.Linear bypasses the bf16 GEMM dispatcher.
+        expert_prenormed = False
         if self.pre_expert_proj is None:
             expert_input = hidden_states
         elif _is_cpu:
@@ -1040,7 +1041,10 @@ class MuseSpark1xMoE(nn.Module):
                 and large_m_capable(hidden_states.device, hidden_states.shape[0], okc_patch.GEMM_AG_POOLER_MAX_TOKENS)
                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight, okc_patch.GEMM_AG_POOLER_MAX_TOKENS)
             ):
-                expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
+                pn = self._okc_ag_prenorm(hidden_states.shape[0])
+                expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight,
+                                       norm_weight=pn[0] if pn else None, norm_eps=pn[1] if pn else 0.0)
+                expert_prenormed = pn is not None
             else:
                 expert_input = bf16_gemm_dispatch(
                     hidden_states, self.pre_expert_proj.weight, None
@@ -1124,7 +1128,7 @@ class MuseSpark1xMoE(nn.Module):
                 topk_scores,
                 topk_ids,
                 self.experts.post_expert_norm,
-                pre_expert_norm=self.pre_expert_norm,
+                pre_expert_norm=None if expert_prenormed else self.pre_expert_norm,
                 prepared_input=prepared_input,
                 packed_topk_ids=packed_topk_ids,
                 ar_workspace=ar_workspace,
@@ -1141,6 +1145,25 @@ class MuseSpark1xMoE(nn.Module):
                 ar_workspace=ar_workspace,
             )
         return output
+
+    def _okc_ag_prenorm(self, tokens: int):
+        """OKC_SW_AG_PRENORM: (weight, eps) when the pooler's gather can emit the pre-expert norm itself, i.e. when the
+        experts would run st with the norm folded (T <= OKC_MOE_ST_MAX_TOKENS): the norm is then computed once per token
+        instead of in every st CTA at each pass switch (same values: torch's rms_norm order in both). Else None."""
+        if not (okc_patch.SW_AG_PRENORM and okc_patch.SW_ST_NORM_FOLD and self.nvfp4_checkpoint):
+            return None
+        state = getattr(self.experts, "_okc_moe_state", None)
+        if state is None or not state["pg_only"] or self.expert_hidden_size != 4096:
+            return None
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
+
+        if not okc_moe.dispatch_path(self.experts, tokens, self.pre_expert_norm).startswith("st"):
+            return None
+        probe = getattr(self, "_okc_ag_prenorm_w", None)
+        if probe is None:   # the fold's own weight checks, once
+            probe = self._okc_ag_prenorm_w = okc_moe._norm_fold(
+                torch.empty((1, self.expert_hidden_size), dtype=torch.bfloat16), self.pre_expert_norm) or ()
+        return probe or None
 
     def _okc_prenorm_shard(self) -> bool:
         state = getattr(self.experts, "_okc_moe_state", None)

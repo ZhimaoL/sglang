@@ -45,6 +45,19 @@ def _jit_module(n: int, world_size: int) -> Module:
     )
 
 
+@cache_once
+def _jit_norm_module(n: int, world_size: int) -> Module:
+    """OKC: the gather with the pre-expert RMSNorm fused (all_gather.cuh kNorm)."""
+    args = make_cpp_args(n, world_size, is_arch_support_pdl())
+    return load_jit(
+        "muse_spark_v12_all_gather_norm",
+        *args,
+        cuda_files=["muse_spark_v12/all_gather.cuh"],
+        cuda_wrappers=[("run", f"MuseSparkAllGatherNorm<{args}>::run"), ("test", f"MuseSparkAllGatherNorm<{args}>::test")],
+        extra_cuda_cflags=["-O3"],
+    )
+
+
 def large_m_capable(
     device=None, num_tokens: Optional[int] = None, max_tokens: Optional[int] = None
 ) -> bool:
@@ -155,9 +168,22 @@ def gemm_ag(
     b: Optional[torch.Tensor] = None,
     c: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 0.0,
 ) -> torch.Tensor:
-    """``x @ weight.T (+ b) (+ c)``; ``weight`` is the FULL replicated [N, K]."""
+    """``x @ weight.T (+ b) (+ c)``; ``weight`` is the FULL replicated [N, K]. OKC: with ``norm_weight`` (N == 4096,
+    no b / c) the gathered rows come out RMSNorm-ed: F.rms_norm(row, (N,), norm_weight, norm_eps), bit for bit."""
     local = gemm_local(comm, x, weight)
     if out is None:
         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+    if norm_weight is not None:
+        _jit_norm_module(out.shape[1], comm.world_size).run(comm.obj, local.contiguous(), norm_weight, norm_eps, out)
+        return out
     return all_gather(comm, local, out, b, c)
+
+
+def row_norm_test(x: torch.Tensor, norm_weight: torch.Tensor, eps: float, world_size: int = 8) -> torch.Tensor:
+    """OKC 1-GPU check: the kNorm row math on [M, 4096] rows (no gather)."""
+    out = torch.empty_like(x)
+    _jit_norm_module(x.shape[1], world_size).test(x.contiguous(), norm_weight.contiguous(), eps, out)
+    return out
