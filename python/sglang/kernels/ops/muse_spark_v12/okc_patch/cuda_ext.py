@@ -9,6 +9,7 @@ _lock = threading.Lock()
 _PG_EXT = None
 _PG_NARROW_EXT = None
 _PG_NARROW64_EXT = None
+_PG_N4_EXT = None
 _PG_RS_EXT = {}
 _ST_EXT = None
 _PROJ_EXT = None
@@ -84,10 +85,11 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import QK_FOLD, SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_N4, QK_FOLD, SW_M1RS
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
-    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("ftnorm_ext",) if QK_FOLD else ())
+    names = (_PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("pg_n4_ext",) if PG64_N4 else ())
+             + (("ftnorm_ext",) if QK_FOLD else ()))
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -198,6 +200,28 @@ def pg_narrow64_ext():
                     ["-DPGN_WSET=24", "-DPGN_NST=7", "-DPGN_XNT=64"],
                 )
     return _PG_NARROW64_EXT
+
+
+def pg_n4_ext():
+    """OKC_PG64_N4: the narrow64 build's text followed by _cuda_src_pgn4's (pg_n4: gg1 on four consumer warpgroups) in one
+    module of its own exporting gg1n4 only, so the served pg modules keep their text and builds."""
+    global _PG_N4_EXT
+    if _PG_N4_EXT is None:
+        with _lock:
+            if _PG_N4_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pgn4 import _CUDA_SRC_N4
+
+                _PG_N4_EXT = _load_inline(
+                    name="okc_pg_moe_n24x64s7_n4s5_v1",
+                    cpp_sources=f"void gg1n4({', '.join(_ARG[c] for c in _PG_SIG['gg1'])});\n",
+                    cuda_sources=[_CUDA_SRC, _CUDA_SRC_N4],
+                    functions=["gg1n4"],
+                    extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a", "-DPGN_WSET=24",
+                                       "-DPGN_NST=7", "-DPGN_XNT=64"],
+                    verbose=False,
+                )
+    return _PG_N4_EXT
 
 
 def pg_rs_ext(narrow: bool):
