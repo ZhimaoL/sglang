@@ -141,6 +141,9 @@ DINL void stsm_x4_trans(unsigned addr, unsigned r0, unsigned r1, unsigned r2, un
 #ifndef PGN_XNT
 #define PGN_XNT 128
 #endif
+#if PGN_XNT == 64 && !defined(PG_M1RS)
+#define PG_M1_STORE 1                    // M1 (OKC_SW_M1) runs on the 64-block build only (moe._moe_pg_small: bm == 64)
+#endif
 constexpr int XNT = PGN_XNT;             // tokens per block (narrow build: the widest item)
 #else   // PGN_WSET
 // ------------------------------------------------------------------ geometry
@@ -708,8 +711,8 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
                 if (rid < numel) {
                     const uint4 v = *reinterpret_cast<const uint4*>(epp + row * EPI2_PITCH + ch * 16);
                     const size_t off = (size_t)rid * (NWT * 128) + wt * 128 + cw * 64 + ch * 8;
-#if defined(PGN_XNT) && !defined(PG_M1RS)   // M1 (the PGN_WSET builds, which all define PGN_XNT; never with M1-RS,
-                                             // whose m1 is the home table): the row goes into every rank's slot buffer
+#ifdef PG_M1_STORE   // M1 (the 64-block build; never with M1-RS, whose m1 is the home table): the row goes into
+                     // every rank's slot buffer
                     if (m1 != nullptr)
                         asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1, %2, %3, %4};"
                                      :: "l"(m1 + off), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
@@ -1046,7 +1049,7 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
 #endif  // PGN_WSET
     }
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
-#if defined(PGN_XNT) || defined(PG_M1RS)
+#if defined(PG_M1_STORE) || defined(PG_M1RS)
     if (!GATED && m1_ep != nullptr) {                   // M1 / M1-RS: one release per CTA on every rank's epoch word
         named_bar_sync(3, 256);
         if (c.ctid == 0)
