@@ -76,9 +76,9 @@ def _build_packs(layer) -> dict | None:
             if _sw.PG64_MAX_T >= _sw.PG_NARROW_MIN_T:
                 pg_moe.pg_narrow64_ext()
         if _sw.SW_MOE_ST:
-            from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext
+            from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext, st_fused_ext
 
-            st_ext()
+            (st_fused_ext if _sw.ST_FUSE else st_ext)()
 
     # pack_wsf wants the raw stacked [gate; up] rows and raw e4m3 scale bytes; gs13 is the
     # per-expert scale Marlin also uses (its constant gain is cancelled by the post-expert norm).

@@ -11,6 +11,7 @@ _PG_NARROW_EXT = None
 _PG_NARROW64_EXT = None
 _PG_RS_EXT = {}
 _ST_EXT = None
+_ST_FUSED_EXT = None
 _PROJ_EXT = None
 _SMALLM_EXT = None
 _FMHA_EXT = None
@@ -83,10 +84,10 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import ST_FUSE, SW_M1RS
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
-    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ())
+    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("st_fused_ext",) if ST_FUSE else ())
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -250,6 +251,29 @@ def st_ext():
                     verbose=False,
                 )
     return _ST_EXT
+
+
+def st_fused_ext():
+    """OKC_ST_FUSE: _cuda_src_st's text followed by _cuda_src_stf's (st_fused: both st GEMMs in one cooperative launch) in a
+    module of its own exporting st_moe_fused only (st_moe's arguments), so st_ext keeps its text and build."""
+    global _ST_FUSED_EXT
+    if _ST_FUSED_EXT is None:
+        with _lock:
+            if _ST_FUSED_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_st import _CUDA_SRC
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_stf import _CUDA_SRC_STF
+
+                _ST_FUSED_EXT = _load_inline(
+                    name="okc_st_moe_c8_s16_e64_f1",
+                    cpp_sources="void st_moe_fused(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, torch::Tensor, torch::Tensor, int64_t, torch::Tensor, double, torch::Tensor, "
+                    "int64_t, int64_t, torch::Tensor);",
+                    cuda_sources=[_CUDA_SRC, _CUDA_SRC_STF],
+                    functions=["st_moe_fused"],
+                    extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+                    verbose=False,
+                )
+    return _ST_FUSED_EXT
 
 
 def route_ext():
