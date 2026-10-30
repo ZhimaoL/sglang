@@ -61,6 +61,9 @@ def _load_inline(**kw):
 # together, at most half the CPUs at a time.
 _PREBUILD = ("smallm_ext", "lt", "pg_ext", "pg_narrow_ext", "pg_narrow64_ext", "st_ext", "draft_ext", "fmha_ext",
              "proj_ext", "glue_ext", "route_ext", "vfg_ext", "wst_ext")
+# M1-RS's two gg2 + receiver modules (pg_rs_ext), only with OKC_SW_M1RS on: left to their first call they built serially
+# inside the prefill capture, ~50 s each on the cold boot's critical path (S23 CB 612 s vs cand13's 512)
+_PREBUILD_M1RS = ("pg_rs_main_ext", "pg_rs_narrow_ext")
 _PREBUILD_RUN = """import sys
 from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext, lt
 try:
@@ -71,18 +74,21 @@ except Exception:
 
 
 def prebuild() -> None:
-    """Start the okc extension builds now, one CPU-only process each, min(13, ncpu / 2) at a time (once per node, at
-    worker init, before the weights load). Each process runs the loader itself: same sources, flags, arch and build
-    directory, so the server's own call finds the build finished (or waits on torch's build lock for it) and what it
-    loads is unchanged. With warm caches each process finds its build up to date and exits."""
+    """Start the okc extension builds now, one CPU-only process each, min(13, ncpu / 2) at a time (15 with M1-RS; once
+    per node, at worker init, before the weights load). Each process runs the loader itself: same sources, flags, arch
+    and build directory, so the server's own call finds the build finished (or waits on torch's build lock for it) and
+    what it loads is unchanged. With warm caches each process finds its build up to date and exits."""
     import queue
     import subprocess
     import sys
     import threading
 
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_M1RS
+
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ())
     todo = queue.Queue()
-    for f in _PREBUILD:
+    for f in names:
         todo.put(f)
 
     def worker():   # daemon: a build not started when the process exits is left to the server's own call
@@ -94,7 +100,7 @@ def prebuild() -> None:
             subprocess.run([sys.executable, "-c", _PREBUILD_RUN, f], env=env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
-    for _ in range(max(1, min(len(_PREBUILD), (os.cpu_count() or 2) // 2))):
+    for _ in range(max(1, min(len(names), (os.cpu_count() or 2) // 2))):
         threading.Thread(target=worker, daemon=True, name="okc-prebuild").start()
 
 _PROJ_CPP = """
@@ -208,6 +214,16 @@ def pg_rs_ext(narrow: bool):
                     "okc_pg_moe_n17x128s7_int_d3_m1rs" if narrow else "okc_pg_moe_c350_int_d3_m1rs", _CUDA_SRC,
                     ["gg2", "m1_recv"], ["-DPGN_WSET=17", "-DPGN_NST=7", "-DPG_M1RS"] if narrow else ["-DPG_M1RS"])
     return ext
+
+
+def pg_rs_main_ext():
+    """pg_rs_ext(False), by name for prebuild()."""
+    return pg_rs_ext(False)
+
+
+def pg_rs_narrow_ext():
+    """pg_rs_ext(True), by name for prebuild()."""
+    return pg_rs_ext(True)
 
 
 def st_ext():
