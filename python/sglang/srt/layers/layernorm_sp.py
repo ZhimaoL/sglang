@@ -269,6 +269,9 @@ def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states.tensor_split(tp_size)[tp_group.rank_in_group].contiguous()
 
 
+_okc_entry_rs_logged: list = []
+
+
 def okc_entry_reduce_scatter(embed, norm, input_ids: torch.Tensor, forward_mode) -> Optional[torch.Tensor]:
     """OKC_SP_EMB_RS: the SP entry as one reduce-scatter. The vocab-parallel embedding's masked local lookup [M, h]
     (zeros where another rank owns the token's row) is padded like ``sp_entry_scatter`` and reduce-scattered, then
@@ -285,6 +288,9 @@ def okc_entry_reduce_scatter(embed, norm, input_ids: torch.Tensor, forward_mode)
             or get_attn_tp_context().input_scattered or not runs_sp(forward_mode, num_tokens=num_tokens)):
         return None
     set_sp_num_tokens(num_tokens)
+    if not _okc_entry_rs_logged:
+        _okc_entry_rs_logged.append(num_tokens)
+        logger.info("OKC SP entry reduce-scatter active (first T=%d).", num_tokens)
     maybe_detect_oob(input_ids, 0, embed.num_embeddings, "VocabParallelEmbedding input id")
     partial = embed._embed_local_shard(input_ids)
     padded = ceil_align(num_tokens, tp_size)
