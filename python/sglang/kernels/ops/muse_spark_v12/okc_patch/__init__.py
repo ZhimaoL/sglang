@@ -53,6 +53,12 @@ ADAPT_CHECK = int(os.environ.get("OKC_ADAPT_CHECK", "32"))
 ADAPT_THETA = float(os.environ.get("OKC_ADAPT_THETA", "0.001"))
 ADAPT_MAX_SWAPS = int(os.environ.get("OKC_ADAPT_MAX_SWAPS", "4"))
 ADAPT_TRICKLE = int(os.environ.get("OKC_ADAPT_TRICKLE", "8"))
+# The adaptive decision's objective: "fixed" (default) = the slowest rank's MoE time at verify bs 3 / 4 / 13 / 21 plus the
+# prefill / extend straggler, weighted per load (adaptive.RUNGS); "live" = the same costs weighted by the run's own traffic
+# since the last refresh (the verify forwards' batch-size histogram, the 16K-chunk-equivalent prefill forwards, the extend
+# forwards), i.e. the expected slowest-rank MoE time of the traffic actually served, in ms, against ADAPT_THETA_MS per copy.
+ADAPT_OBJ = os.environ.get("OKC_ADAPT_OBJ", "fixed")
+ADAPT_THETA_MS = float(os.environ.get("OKC_ADAPT_THETA_MS", "0.1"))
 ADAPT_FULL_GROWTH = float(os.environ.get("OKC_ADAPT_FULL_GROWTH", "4"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
 MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
@@ -326,7 +332,7 @@ FU_MERGE_MIN_LOAD = int(os.environ.get("OKC_FU_MERGE_MIN_LOAD", "9"))
 
 ANY_ATTN = SW_ATTN or SW_WST
 
-__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_FIRST_VERIFY", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "ADAPT_THETA", "ADAPT_MAX_SWAPS", "ADAPT_TRICKLE", "ADAPT_FULL_GROWTH", "MOE_REP_MAX_TOKENS",
+__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_FIRST_VERIFY", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "ADAPT_THETA", "ADAPT_MAX_SWAPS", "ADAPT_TRICKLE", "ADAPT_OBJ", "ADAPT_THETA_MS", "ADAPT_FULL_GROWTH", "MOE_REP_MAX_TOKENS",
            "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_AG_PRENORM", "SW_M1", "M1_MIN_T", "M1_MAX_T", "SW_M1RS", "M1RS_MIN_T", "M1RS_MAX_T", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD", "PG_ROUTE_REPX",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
