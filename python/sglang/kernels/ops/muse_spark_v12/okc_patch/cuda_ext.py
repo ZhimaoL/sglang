@@ -194,7 +194,7 @@ def pg_narrow64_ext():
 
 
 def pg_rs_ext(narrow: bool):
-    """M1-RS (okc_patch.m1rs): gg2 + the receiver of the main (256-token blocks) or narrow (128) build with -DPG_M1RS,
+    """M1-RS (okc_patch.m1 rs_*): gg2 + the receiver of the main (256-token blocks) or narrow (128) build with -DPG_M1RS,
     gg2's rows going to their tokens' home ranks. Separate modules, built only when OKC_SW_M1RS is on, so the served
     builds carry no M1-RS code."""
     ext = _PG_RS_EXT.get(narrow)

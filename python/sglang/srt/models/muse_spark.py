@@ -1215,7 +1215,7 @@ class MuseSpark1xMoE(nn.Module):
             output = self.experts(
                 full_input, full_scores, full_ids, self.experts.post_expert_norm
             )
-        if getattr(self.experts, "_okc_m1rs_shard", False):   # okc_patch.m1rs: the receiver returned this rank's shard
+        if getattr(self.experts, "_okc_m1rs_shard", False):   # okc_patch.m1 rs_receive: this rank's shard
             self.experts._okc_m1rs_shard = False
             return output
         output = output.contiguous()

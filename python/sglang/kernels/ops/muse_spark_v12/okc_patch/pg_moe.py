@@ -199,7 +199,7 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded
     come from moe_align_block_size(local_ids, bm, ...) or align_local with -1 for non-local routes; bm 256 runs the
     shipped build, 128 the narrow one (block_m(T)). The local slot count (32 home + replicas) is wsf13's.
-    rs = (home table address, epoch multicast address): M1-RS (okc_patch.m1rs), gg2 from its own build stores each row
+    rs = (home table address, epoch multicast address): M1-RS (okc_patch.m1 rs_*), gg2 from its own build stores each row
     into its token's home rank's slot buffer instead of y (y is then not written)."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
