@@ -32,7 +32,7 @@ MOE_PACK_MAX_LAYERS = 1 << 30 if _pack_layers == "all" else int(_pack_layers)
 # most active experts): forwards of <= OKC_MOE_REP_MAX_TOKENS tokens give each active replicated expert to the holder
 # with fewer active experts (pg_moe.assign_replicas), longer ones (OKC_MOE_REP_PREFILL) split its routes between the
 # two holders at a token boundary that levels routed tokens (pg_moe.split_replicas).
-MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "2"))
+MOE_REPLICAS = int(os.environ.get("OKC_MOE_REPLICAS", "4"))
 # runtime-adaptive replicas (okc_patch/adaptive.py): replica sets decided from the run's own routing counts, refreshed
 # between forwards; first after ADAPT_FIRST_TOKENS prefill tokens and ADAPT_FIRST_VERIFY verify tokens (so the first,
 # full decision sees verify counts; prefill-only traffic such as max_new_tokens 1 never fires it), then every
