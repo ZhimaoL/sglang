@@ -76,7 +76,7 @@ PG_NARROW_MAX_T = int(os.environ.get("OKC_PG_NARROW_MAX_T", "3072"))
 PG64_MAX_T = int(os.environ.get("OKC_PG64_MAX_T", "256"))
 # ... and that instance's gg1 on four consumer warpgroups on the small front's calls (cuda_ext.pg_n4_ext / _cuda_src_pgn4.py:
 # the prefill lane's pg_n4, 256-row items over shared X k-tiles, bit-identical); 0 = the 2-warpgroup kernel.
-PG64_N4 = _flag("OKC_PG64_N4", "0")
+PG64_N4 = _flag("OKC_PG64_N4", "1")
 # pg_gather_norm (the small front end's normed token images) splits each block's token rows over this many CTAs: the
 # per-warp row loop was the kernel's latency chain (LOG E21: 11-14 -> 7-10 us at T 96-256, outputs unchanged).
 PG_GN_SPLIT = int(os.environ.get("OKC_PG_GN_SPLIT", "2"))
