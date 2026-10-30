@@ -13,6 +13,7 @@ _PG_RS_EXT = {}
 _ST_EXT = None
 _PROJ_EXT = None
 _SMALLM_EXT = None
+_WSM_EXT = None
 _FMHA_EXT = None
 _GLUE_EXT = None
 _WST_EXT = None
@@ -64,6 +65,8 @@ _PREBUILD = ("smallm_ext", "lt", "pg_ext", "pg_narrow_ext", "pg_narrow64_ext", "
 # M1-RS's two gg2 + receiver modules (pg_rs_ext), only with OKC_SW_M1RS on: left to their first call they built serially
 # inside the prefill capture, ~50 s each on the cold boot's critical path (S23 CB 612 s vs cand13's 512)
 _PREBUILD_M1RS = ("pg_rs_main_ext", "pg_rs_narrow_ext")
+# the W-staged small-m GEMM, only with OKC_SW_WSTAGE on
+_PREBUILD_WSTAGE = ("wsm_ext",)
 _PREBUILD_RUN = """import sys
 from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext, lt
 try:
@@ -83,10 +86,10 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_M1RS, SW_WSTAGE
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
-    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ())
+    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (_PREBUILD_WSTAGE if SW_WSTAGE else ())
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -365,6 +368,27 @@ def smallm_ext():
                     verbose=False,
                 )
     return _SMALLM_EXT
+
+
+def wsm_ext():
+    """The W-staged small-m GEMM (OKC_SW_WSTAGE): its own module, smallm_ext's flags; smallm's text is untouched."""
+    global _WSM_EXT
+    if _WSM_EXT is None:
+        with _lock:
+            if _WSM_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_wsm import _CUDA_SRC_WSM
+
+                _WSM_EXT = _load_inline(
+                    name="okc_smallm_wsm_v1",
+                    cpp_sources="void wsm_launch(torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, "
+                    "int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);",
+                    cuda_sources=[_CUDA_SRC_WSM],
+                    functions=["wsm_launch"],
+                    extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+                    extra_ldflags=["-lcuda"],
+                    verbose=False,
+                )
+    return _WSM_EXT
 
 
 _WST_CPP = """

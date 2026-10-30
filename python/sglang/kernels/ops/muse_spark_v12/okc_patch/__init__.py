@@ -111,6 +111,11 @@ SW_PROJ = _flag("OKC_SW_PROJ", "1")
 # for qkv_gate (m <= 16) and the gemm_ag pooler / unpooler slices (m <= 64 / 32); off, those take F.linear (the old
 # qkv_gate MMA-pack route measured the same 16.7 us at m 8 and is not carried).
 SW_SMALLM = _flag("OKC_SW_SMALLM", "1")
+# ... and with OKC_SW_WSTAGE, smallm's calls run the W-staged kernel (_cuda_src_wsm.py: the same math, bitwise; PDL-launched,
+# the weight slice's first stages TMA'd before griddepcontrol.wait, x after it), so a GEMM streams W while the kernel in
+# front of it (a collective or a norm) still runs, once that kernel triggers its dependents early (muse-opt
+# serving/kernels/wstage). Default off.
+SW_WSTAGE = _flag("OKC_SW_WSTAGE", "0")
 # Pinned cuBLASLt configs (okc_patch/lt.py) at measured verify (N, K, m) entries outside smallm's range, each >= 5 %
 # per call over F.linear in two runs (serving/kernels/lt/RESULTS.md); dispatched after smallm.
 SW_LT = _flag("OKC_SW_LT", "1")
@@ -329,7 +334,7 @@ ANY_ATTN = SW_ATTN or SW_WST
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_FIRST_VERIFY", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "ADAPT_THETA", "ADAPT_MAX_SWAPS", "ADAPT_TRICKLE", "ADAPT_FULL_GROWTH", "MOE_REP_MAX_TOKENS",
            "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_AG_PRENORM", "SW_M1", "M1_MIN_T", "M1_MAX_T", "SW_M1RS", "M1RS_MIN_T", "M1RS_MAX_T", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD", "PG_ROUTE_REPX",
-           "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
+           "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_WSTAGE", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
