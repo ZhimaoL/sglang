@@ -510,6 +510,13 @@ def _trickle(budget):
     e0.record()
     apply(take, _p2p_transfer)
     e1.record()
+    if _knobs().ADAPT_SLOT_CHECK:
+        for li, m in st.layers:
+            bad = check_slots(m) if li in take else []
+            if bad:
+                logger.error("OKC adaptive replicas: slot check FAILED, layer %d (expert, slot, held): %s", li, bad[:6])
+                if _knobs().ADAPT_SLOT_CHECK >= 2:
+                    raise RuntimeError(f"OKC adaptive replicas: layer {li} replica slots do not hold their experts")
     if st.rec is not None:
         st.rec.setdefault("_ev", []).append((e0, e1))
         st.rec["steps"] += 1
@@ -572,10 +579,15 @@ def _p2p_transfer(copies):
                 off += k
 
 
-def plan_slots(old_order, old_rank, new_pairs, world, R, nh):
+def plan_slots(old_order, old_rank, new_pairs, world, R, nh, me=None, mine=None):
     """-> (new local replica list per rank [world][R] (slot nh + i holds entry i), copies [(expert, rank, slot)])
-    keeping every (expert, rank) that survives in its slot."""
+    keeping every (expert, rank) that survives in its slot. mine: rank me's slots as they are (its replica_plan
+    "local"). Without it rank q's slots are taken to hold its replicas in old_order, which is true only until the first
+    apply (later plans re-sort the order, while kept experts stay put). The (expert, rank) copies and their order depend
+    on the sets only, so every rank still makes the same copies; only the receiver's slot follows its real layout."""
     old_local = [[e for e, r in zip(old_order, old_rank) if r == q] for q in range(world)]
+    if mine is not None:
+        old_local[me] = list(mine)
     new_by = [[e for e, r in new_pairs if r == q] for q in range(world)]
     local, copies = [], []
     for q in range(world):
@@ -589,6 +601,28 @@ def plan_slots(old_order, old_rank, new_pairs, world, R, nh):
             copies.append((e, q, nh + i))
         local.append(slots)
     return local, copies
+
+
+def _slot_tags(m, li, rank):
+    """OKC_ADAPT_SLOT_CHECK: int32 [local slots] expert id of the packs each slot holds, made at the first apply from
+    the boot layout (homes, then replica_plan "local"); None when the check is off."""
+    if not _knobs().ADAPT_SLOT_CHECK:
+        return None
+    tag = getattr(m, "_okc_slot_eid", None)
+    if tag is None:
+        ids = list(_placement_ranks(li)[rank]) + list(m.replica_plan["local"])
+        tag = m._okc_slot_eid = torch.tensor(ids, dtype=torch.int32, device=m._okc_rep_table.device)
+    return tag
+
+
+def check_slots(m):
+    """[(expert, slot, held expert)] where the rep table sends this rank's routes of an expert to a slot whose tag
+    (carried with the packs) names another expert; [] when clean or the check is off (synchronizes the stream)."""
+    tag = getattr(m, "_okc_slot_eid", None)
+    if tag is None:
+        return []
+    tab, held = m._okc_rep_table[:256].tolist(), tag.tolist()
+    return [(e, v & 0xFF, held[v & 0xFF]) for e, v in enumerate(tab) if (v & 0xFF) != 0xFF and held[v & 0xFF] != e]
 
 
 def apply(plan, transfer, rank=None, world=None):
@@ -611,14 +645,19 @@ def apply(plan, transfer, rank=None, world=None):
             logger.warning("OKC adaptive replicas: layer %d plan rejected (bad shape); kept.", li)
             continue
         nh = m.num_home_experts
-        local, copies = plan_slots(m.replica_plan["order"], m.replica_plan["rank"], pairs, world, R, nh)
+        local, copies = plan_slots(m.replica_plan["order"], m.replica_plan["rank"], pairs, world, R, nh,
+                                   me=rank, mine=m.replica_plan["local"])
         ranks = _placement_ranks(li)
         state = m._okc_moe_state
+        tag = _slot_tags(m, li, rank)
         for e, q, slot in copies:
             h = home[e]
             src_slot = ranks[h].index(e)
             s = [state["pg_wsf13"][src_slot], state["pg_wsf2"][src_slot]] if rank == h else []
             d = [state["pg_wsf13"][slot], state["pg_wsf2"][slot]] if rank == q else []
+            if tag is not None:   # the expert id travels with its packs
+                s += [tag[src_slot:src_slot + 1]] if rank == h else []
+                d += [tag[slot:slot + 1]] if rank == q else []
             copies_all.append((h, q, s, d))
         todo.append((li, m, pairs, local, copies))
     transfer(copies_all)
