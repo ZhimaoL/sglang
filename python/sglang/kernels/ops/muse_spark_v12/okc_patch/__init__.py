@@ -310,7 +310,7 @@ SW_FOLLOWUP_ADMIT = _flag("OKC_SW_FOLLOWUP_ADMIT", "1")
 
 # Bounded merge of follow-up extends (court C30 / C31): at load >= FU_MERGE_MIN_LOAD, with requests decoding and
 # only follow-ups waiting, hold them up to FU_MERGE_PASSES scheduler passes so later ones join one extend.
-SW_FU_MERGE = _flag("OKC_SW_FU_MERGE", "0")
+SW_FU_MERGE = _flag("OKC_SW_FU_MERGE", "1")
 FU_MERGE_PASSES = int(os.environ.get("OKC_FU_MERGE_PASSES", "6"))
 FU_MERGE_MIN_LOAD = int(os.environ.get("OKC_FU_MERGE_MIN_LOAD", "9"))
 
