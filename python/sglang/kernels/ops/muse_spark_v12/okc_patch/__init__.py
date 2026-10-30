@@ -85,7 +85,7 @@ MOE_ST_MAX_TOKENS = min(128, int(os.environ.get("OKC_MOE_ST_MAX_TOKENS", "72")))
 MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 # st as one launch (cuda_ext.st_fused_ext / _cuda_src_stf.py): both GEMMs in one cooperative kernel with a grid barrier,
 # so the down phase starts without a launch, a residency wait or a second routing table (bit-identical).
-ST_FUSE = _flag("OKC_ST_FUSE", "0")
+ST_FUSE = _flag("OKC_ST_FUSE", "1")
 # st folds the pre-expert RMSNorm into its gate/up kernel (bit-identical to F.rms_norm, as pg_gather_norm), saving the
 # separate norm launch on every st layer.
 SW_ST_NORM_FOLD = _flag("OKC_SW_ST_NORM_FOLD", "1")
