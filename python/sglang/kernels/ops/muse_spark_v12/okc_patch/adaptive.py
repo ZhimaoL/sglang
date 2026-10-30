@@ -184,7 +184,8 @@ def _context(home, verify_counts, prefill_counts, seed, prefill_chunks, F_v, F_p
     q = np.asarray(prefill_counts, float) + 1e-3; q /= q.sum()
     if live is not None:
         groups = live_groups(live["vhist"])
-        vtr = [(route_counts(p, bs, 0.2, 10, rng), n, met, cp) for bs, n, met, cp in groups]
+        # st-regime groups (passes metric, a few routes per draw) need more draws than pg's for the same accuracy
+        vtr = [(route_counts(p, bs, 0.2, 30 if cp else 10, rng), n, met, cp) for bs, n, met, cp in groups]
         w_p, w_x = float(live["n_pre"]), float(live["n_ext"])
     else:
         vtr = [(route_counts(p, bs, 0.2, F, rng), w, met, cp) for (bs, w, met, cp), F in zip(GROUPS, F_v)]
