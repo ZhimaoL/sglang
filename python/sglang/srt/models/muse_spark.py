@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -627,6 +628,54 @@ class MuseSpark1xMLP(nn.Module):
         return output
 
 
+# Diagnostic (never on in serving): OKC_TOPK_DUMP_DIR keeps, for eager forwards (run with
+# --disable-decode-cuda-graph --cuda-graph-backend-prefill=disabled so they run eager):
+# - verify-sized TP batches (<= 256 tokens), EP rank 0: the top-k ids in <dir>/topk_rank0.pt: {T: {layer: int16
+#   [forwards, T, 8]}} (<= 3000 forwards per T);
+# - larger forwards (prefill chunks, extends), every rank: per-forward expert counts of the ids it routes (its SP shard,
+#   or the whole TP batch) in <dir>/counts_rank<r>.pt: {layer: {"T": [F], "sp": [F], "c": int32 [F, 256]}} (<= 3000
+#   forwards per layer); a chunk's counts = the ranks' sum when sp, else rank 0's.
+# A failed save logs once and turns the capture off. Feeds the EP-placement / replica fits (muse-opt
+# serving/kernels/moe-int/topk_capture_read.py, prefill_counts_read.py).
+_OKC_TOPK_DUMP_DIR = os.environ.get("OKC_TOPK_DUMP_DIR")
+_okc_topk: dict = {}
+_okc_cnt: dict = {}
+
+
+def _okc_dump_topk(layer_idx: int, topk_ids: torch.Tensor, rank: int, sp: bool) -> None:
+    global _OKC_TOPK_DUMP_DIR
+    n = topk_ids.shape[0]
+    if not _OKC_TOPK_DUMP_DIR or torch.cuda.is_current_stream_capturing():
+        return
+    if n <= 256 and not sp:
+        if rank != 0:
+            return
+        store, rows = _okc_topk, _okc_topk.setdefault(n, {}).setdefault(layer_idx, [])
+        item, first, every, name = topk_ids.to(torch.int16).cpu(), min(_okc_topk[n]), 50, "topk_rank0.pt"
+    else:
+        ids = topk_ids.reshape(-1).long()
+        c = torch.bincount(ids[(ids >= 0) & (ids < 256)], minlength=256).to(torch.int32).cpu()
+        store, rows = _okc_cnt, _okc_cnt.setdefault(layer_idx, [])
+        item, first, every, name = (n, int(sp), c), min(_okc_cnt), 20, f"counts_rank{rank}.pt"
+    if len(rows) >= 3000:
+        return
+    rows.append(item)
+    if layer_idx == first and len(rows) % every == 0:
+        try:  # a diagnostic: a failed save turns the hook off instead of failing the forward
+            if store is _okc_topk:
+                out = {t: {li: torch.stack(v) for li, v in d.items()} for t, d in _okc_topk.items()}
+            else:
+                out = {li: {"T": torch.tensor([x[0] for x in v]), "sp": torch.tensor([x[1] for x in v]),
+                            "c": torch.stack([x[2] for x in v])} for li, v in _okc_cnt.items()}
+            os.makedirs(_OKC_TOPK_DUMP_DIR, exist_ok=True)
+            path = os.path.join(_OKC_TOPK_DUMP_DIR, name)
+            torch.save(out, path + ".tmp")
+            os.replace(path + ".tmp", path)
+        except Exception as e:
+            logger.warning("OKC_TOPK_DUMP_DIR: save failed (%r); top-k capture off", e)
+            _OKC_TOPK_DUMP_DIR = None
+
+
 class MuseSpark1xMoE(nn.Module):
     def __init__(
         self,
@@ -1051,6 +1100,8 @@ class MuseSpark1xMoE(nn.Module):
                 if tensor is not None:
                     tensor.record_stream(main_stream)
 
+        if _OKC_TOPK_DUMP_DIR:
+            _okc_dump_topk(self.layer_idx, topk_ids, self.ep_rank, bool(sp_active))
         # the ring holds whole prefill forwards of >= ADAPT_MIN_T tokens (SP: shard rows x ranks; every rank alike):
         # small SP extends (ext_coll) would otherwise fill it with 1K-token rows and understate the prefill straggler
         if (okc_patch.ADAPT_REPLICAS and getattr(self.experts, "_okc_adapt_ring", None) is not None
