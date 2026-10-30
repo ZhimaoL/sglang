@@ -17,9 +17,13 @@ replica balancer: split_replicas / the extend balancer), so each slot is written
 with the SP attention's collectives in place of the o-proj all-reduce, and layer L + 1's own epoch wait also orders it
 (every rank's L + 1 gg2 follows its L receiver).
 """
+import logging
+
 import torch
 
 from sglang.kernels.ops.muse_spark_v12 import okc_patch as _sw
+
+logger = logging.getLogger(__name__)
 
 # Why two buffers by layer parity are enough (no per-use handshake):
 # - A slot buffer (and its epoch word) is reused two MoE layers later: layer L writes buffer L % 2, so rank A's gg2 of
@@ -112,11 +116,14 @@ def rs_receive(layer, m, topk_scores):
     """M1-RS: the home rank's shard [T / tp, 4096] from its slot rows (m from rs_slot)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext
 
-    rows, _, e, _, want, rank, _ = m
+    rows, _, e, _, want, rank, world = m
     S = rows.shape[0] // 8
     out = torch.empty((S, 4096), dtype=torch.bfloat16, device=rows.device)
     cuda_ext.pg_rs_ext(False).m1_recv(rows, topk_scores[rank * S:(rank + 1) * S].float().contiguous(),
                                       layer._post_expert_norm_weight, out, float(layer._post_expert_norm_eps),
                                       1 if layer._post_expert_norm_weight_first else 0, e.data_ptr(), want)
     layer._okc_m1rs_shard = True
+    if not _STATE.get("rs_logged"):
+        _STATE["rs_logged"] = True
+        logger.info("OKC M1-RS active (first T=%d, %d home rows per rank).", S * world, rows.shape[0])
     return out
