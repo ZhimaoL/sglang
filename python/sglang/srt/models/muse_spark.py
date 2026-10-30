@@ -1284,6 +1284,9 @@ def _okc_rows_first(moe, x):
     st = _okc_rf_state.get(x.device)
     if st is None:
         st = _okc_rf_state[x.device] = torch.cuda.Stream(device=x.device)
+    if not _okc_rf_state.get("logged"):
+        _okc_rf_state["logged"] = True
+        logger.info("OKC SP rows-first MoE gather active (first T=%d).", x.shape[0] * world)
     x = x.contiguous()
     st.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(st), pyn.change_state(enable=True):
@@ -1295,36 +1298,24 @@ def _okc_rows_first(moe, x):
 
 
 def _okc_ids_buffer(tp_group, device):
-    """The symmetric bf16 buffer of the rows-first scores / ids gather (multicast checked, agreed over TP), made once
-    outside capture, or None."""
-    key = tp_group.device_group.group_name
-    st = _okc_rf_state.get(key, False)
-    if st is not False:
-        return st
-    if torch.cuda.is_current_stream_capturing():
-        return None
+    """The rows-first scores / ids gather's symmetric buffer: ext_coll's multimem-gather buffer (its agreed setup over
+    the TP ranks, made once outside capture; a failed or partial setup on any rank gives None on all of them, so the
+    section gathers as usual; the symmfail overlay's alloc / mc points cover it), or None."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
 
-    st = None
-    if ext_coll._symm_ok():
-        import torch.distributed._symmetric_memory as symm_mem
-
-        n = okc_patch.SP_AG_ROWSFIRST_MAX_TOKENS * 32   # the largest gathered call's [T, 16] words as bf16
-        buf = ext_coll.agreed(lambda: symm_mem.empty(n, dtype=torch.bfloat16, device=device))
-        hdl = buf is not None and ext_coll.agreed(lambda: ext_coll._mc_handle(buf, key))
-        if hdl and ext_coll.agreed(lambda: ext_coll._mc_gather_ok(hdl, buf, key)):
-            st = buf
-    _okc_rf_state[key] = st
-    return st
+    st = ext_coll._buffer(tp_group.device_group.group_name, device)
+    return st[0] if st is not None and st[1] >= okc_patch.SP_AG_ROWSFIRST_MAX_TOKENS * 32 else None
 
 
 def _okc_ids_gather(tp_group, scores, ids):
     """[S, 8] fp32 scores + [S, 8] int32 ids of every rank -> ([world S, 8], [world S, 8]) in rank order: one multimem
     gather of the packed [S, 16] words through _okc_ids_buffer (exact bytes), copied out of the buffer. Buffer reuse:
     a peer's next call into this buffer comes after the section's reduce-scatter, which needs this rank's gg2 and so
-    follows these copies."""
+    follows these copies (ext_coll's extend gathers take the buffer only below SP_SYMM_MIN_TOKENS rows)."""
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
+
     key = tp_group.device_group.group_name
-    buf, w, s = _okc_rf_state[key], tp_group.world_size, ids.shape[0]
+    buf, w, s = ext_coll._STATE[key][0], tp_group.world_size, ids.shape[0]
     packed = torch.cat([scores.contiguous().view(torch.int32), ids.contiguous()], dim=1).view(torch.bfloat16)
     out = buf[: w * s * 32]
     torch.ops.symm_mem.multimem_all_gather_out(packed.reshape(-1), key, out)
