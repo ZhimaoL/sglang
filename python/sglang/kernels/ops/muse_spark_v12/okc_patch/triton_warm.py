@@ -68,4 +68,71 @@ def warm(scheduler) -> None:
     except Exception as e:   # best effort: a variant not warmed compiles at its first use, as before
         logger.warning("OKC Triton warm-up stopped after %d variants: %r", n, e)
         return
+    for step in (_warm_swa_pages, _warm_bf16_moe):   # court C65: the 3 compiles S20 CB still saw after /health
+        try:
+            n += step(scheduler, dev)
+        except Exception as e:
+            logger.warning("OKC Triton warm-up: %s stopped: %r", step.__name__, e)
+    torch.cuda.synchronize(dev)
     logger.info("OKC Triton warm-up: %d stock kernel variants compiled (bs buckets up to %d).", n, max_bs)
+
+
+def _warm_swa_pages(scheduler, dev) -> int:
+    """get_and_clear_swa_pages_kernel for both FULL-page representative dtypes its callers pass (int32 / int64);
+    constexprs as get_and_clear_swa_pages derives them (contiguous representatives, the server's page size, no
+    page-mapping checks)."""
+    import triton
+
+    from sglang.kernels.ops.memory.allocator import get_and_clear_swa_pages_kernel
+
+    ps = int(getattr(scheduler, "page_size", 1) or 1)
+    bo = triton.next_power_of_2(ps)
+    bp = max(1, 256 // bo)
+    mapping = torch.zeros(64, dtype=torch.int64, device=dev)
+    pages = torch.zeros(4, dtype=torch.int64, device=dev)
+    peers = torch.zeros(4, dtype=torch.bool, device=dev)
+    for dt in (torch.int32, torch.int64):
+        rep = torch.zeros(4, dtype=dt, device=dev)
+        get_and_clear_swa_pages_kernel.warmup(rep, mapping, pages, peers, peers, 4, 1, ps, False, bp, bo, grid=(1,))
+    return 2
+
+
+def _moe_keys():
+    import glob
+    import json
+    import os
+
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    keys = set()
+    for f in glob.glob(os.path.join(os.path.dirname(okc_patch.__file__), "moe_configs", "*.json")):
+        with open(f) as fh:
+            keys |= {int(k) for k in json.load(fh)}
+    return sorted(keys) or [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
+
+
+def _warm_bf16_moe(scheduler, dev) -> int:
+    """The BF16 expert layers' fused_moe_kernel (Triton path, layers 0 / 61): the layer's own forward on dummy rows at
+    every M key of the config table and key + 1, i.e. each config at num_valid_tokens = M x top_k a multiple of 16 and
+    not (S20 CB: the odd case first compiled at the first follow-up after /health). Zero hidden rows, global ids inside
+    this rank's local range, the layer's post-expert norm; no AR workspace, so no collective. Outputs are dropped."""
+    from sglang.srt.layers.muse_spark_bf16_moe import MuseSpark1xBf16Experts
+
+    model = scheduler.tp_worker.model_runner.model
+    layer = next((m for m in model.modules() if isinstance(m, MuseSpark1xBf16Experts) and m.use_triton), None)
+    if layer is None:
+        return 0
+    keys = _moe_keys()
+    top = max(keys)
+    ms = sorted({m for k in keys for m in (k, k + 1) if m <= top} | {top - 1})
+    w = layer.gate_up_proj
+    k = layer.top_k
+    x = torch.zeros((top, w.shape[-1]), dtype=w.dtype, device=w.device)
+    scores = torch.full((top, k), 1.0 / k, dtype=torch.float32, device=w.device)
+    ids = (torch.arange(top * k, device=w.device, dtype=torch.int32) % layer.num_local_experts
+           + layer.local_expert_offset).view(top, k)
+    with torch.inference_mode():
+        for m in ms:
+            layer(x[:m], scores[:m], ids[:m].contiguous(), layer.post_expert_norm)
+    del x, scores, ids
+    return len(ms)
