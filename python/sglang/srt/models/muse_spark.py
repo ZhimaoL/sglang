@@ -322,6 +322,7 @@ def _okc_attn_rs(q, k, v, o_gate, attn_out, layer_id, rows, fold, save_kv_cache,
     are not exactly the blocks (padded, ragged) run whole."""
     m = _OKC_ATTN[layer_id]
     a = m.attn
+    layernorm_sp.okc_boundary_mark(layer_id)
     with okc_prefill_fmha.defer_row_blocks(rows, attn_out.shape[0] // rows):
         if fb is None:
             from sglang.srt.layers.radix_attention import unified_attention_with_output
@@ -1556,6 +1557,8 @@ class MuseSpark1xModel(nn.Module):
         self.embed_norm = MuseSpark1xRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, has_weight=False
         )
+        if okc_patch.SW_BOUNDARY_EARLY:
+            layernorm_sp.okc_boundary_layer(config.num_hidden_layers - okc_patch.BOUNDARY_EARLY_LAYERS)
         self.layers = nn.ModuleList()
         # Safe to share: each MoE joins its side work before returning.
         # torch.cuda.Stream() raises outright in a CPU-only build, so the CPU

@@ -337,6 +337,12 @@ BETWEEN_CHUNK_MAX_REQS = int(os.environ.get("OKC_BETWEEN_CHUNK_MAX_REQS", "8"))
 # 32 first follow-ups, c32 p90 TTFT 42 s; serving/kernels/court/LOG.md C12). Folded follow-ups get small-prefill-first's two
 # forced decode steps. Implies OKC_SW_BETWEEN_CHUNK. Same tokens per forward. Default off.
 SW_FOLLOWUP_ADMIT = _flag("OKC_SW_FOLLOWUP_ADMIT", "1")
+# ... and its wait at a chunk boundary on an event the forward records at the attention of layer N - OKC_BOUNDARY_EARLY_LAYERS
+# (~13 ms before a 16K chunk's forward ends), not after the forward: the host's pick and launch of the next batch (~9 ms)
+# then run under the last layers instead of leaving the GPU idle at every boundary (review-1030/FIRSTTURN.md §2f). Timing
+# only; a follow-up arriving in those last ms waits one more chunk (c4 replay: worst TTFT 0.549 -> 0.547 s).
+SW_BOUNDARY_EARLY = _flag("OKC_SW_BOUNDARY_EARLY", _FTB)
+BOUNDARY_EARLY_LAYERS = int(os.environ.get("OKC_BOUNDARY_EARLY_LAYERS", "2"))
 
 # Bounded merge of follow-up extends (court C30 / C31): at load >= FU_MERGE_MIN_LOAD, with requests decoding and
 # only follow-ups waiting, hold them up to FU_MERGE_PASSES scheduler passes so later ones join one extend.
@@ -358,7 +364,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
-           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_HICACHE_WB_SPLIT", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
+           "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_HICACHE_WB_SPLIT", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT", "SW_BOUNDARY_EARLY", "BOUNDARY_EARLY_LAYERS",
            "SW_FU_MERGE", "FU_MERGE_PASSES", "FU_MERGE_MIN_LOAD", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
            "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "RS_ATTN_BLOCKS_FULL",
            "RS_ATTN_BLOCKS_PADDED",
