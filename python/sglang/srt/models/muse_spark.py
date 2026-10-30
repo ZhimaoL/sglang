@@ -639,22 +639,25 @@ class MuseSpark1xMLP(nn.Module):
 # serving/kernels/moe-int/topk_capture_read.py, prefill_counts_read.py).
 # - OKC_TOPK_DUMP_SP_IDS=N (with the dir): also the per-token ids of the first N SP forwards per layer, every rank (its
 #   shard): <dir>/ids_rank<r>.pt: {layer: {"n": [F] shard rows, "T": [F] chunk tokens, "ids": int16 [F, max n, 8]
-#   (-1 pad)}}, rewritten every 8 SP forwards of the lowest layer (the dedup-AG check, muse-opt
-#   serving/kernels/moe-graft/dedup_f.py --cap).
+#   (-1 pad)}}, rewritten every 8 SP forwards of the lowest layer and complete at the first SP forward after the cap
+#   (the dedup-AG check, muse-opt serving/kernels/moe-graft/dedup_f.py --cap).
 _OKC_TOPK_DUMP_DIR = os.environ.get("OKC_TOPK_DUMP_DIR")
 _OKC_TOPK_SP_IDS = int(os.environ.get("OKC_TOPK_DUMP_SP_IDS", "0"))
 _okc_topk: dict = {}
 _okc_cnt: dict = {}
 _okc_spids: dict = {}
+_okc_spids_done = False
 
 
 def _okc_dump_spids(layer_idx: int, topk_ids: torch.Tensor, rank: int) -> None:
-    global _OKC_TOPK_SP_IDS
+    global _OKC_TOPK_SP_IDS, _okc_spids_done
     rows = _okc_spids.setdefault(layer_idx, [])
-    if len(rows) >= _OKC_TOPK_SP_IDS:
-        return
-    rows.append((topk_ids.shape[0], int(layernorm_sp.sp_num_tokens()), topk_ids.to(torch.int16).cpu()))
-    if layer_idx == min(_okc_spids) and (len(rows) % 8 == 0 or len(rows) == _OKC_TOPK_SP_IDS):
+    full = len(rows) >= _OKC_TOPK_SP_IDS
+    if not full:
+        rows.append((topk_ids.shape[0], int(layernorm_sp.sp_num_tokens()), topk_ids.to(torch.int16).cpu()))
+    # the lowest layer saves (the other layers trail it by one forward); the first forward after the cap saves all
+    if layer_idx == min(_okc_spids) and (len(rows) % 8 == 0 if not full else not _okc_spids_done):
+        _okc_spids_done = full
         try:
             out = {}
             for li, v in _okc_spids.items():
