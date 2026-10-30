@@ -298,8 +298,10 @@ AR_TP8_GRAPH_2PUSH_MAX_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_2PUSH_MAX_BY
 # hardware queue's head, and a push stream aliased to it (8 connections) waits for the whole burst (~8 ms, twice per
 # first turn). On: every staged call is one staging chunk (16384 pages: ~267 MiB of staging per rank, taken before KV
 # sizing) and its relayout runs on a second stream that waits only on the submission's ready event, so no kernel waits
-# on a copy. Same bytes to host.
-SW_HICACHE_WB_SPLIT = _flag("OKC_SW_HICACHE_WB_SPLIT", "0")
+# on a copy. Same bytes to host. Default on (first-turn bundle x-ftb3: with OKC_SW_BOUNDARY_EARLY the next forward starts
+# while the finished chunk's write-back is still queued, and this keeps the relayout off the copy's queue);
+# OKC_SW_HICACHE_WB_SPLIT=0 restores the single-stream write-back and 1024 staging pages.
+SW_HICACHE_WB_SPLIT = _flag("OKC_SW_HICACHE_WB_SPLIT", "1")
 HICACHE_STAGING_PAGES = max(1, int(os.environ.get("OKC_HICACHE_STAGING_PAGES", "16384" if SW_HICACHE_WB_SPLIT else "1024")))
 
 # DFLASH prefill -> verify hand-off without a host sync: the extend branch's extend / prefix lengths go to the device
@@ -326,8 +328,9 @@ SW_FOLLOWUP_ADMIT = _flag("OKC_SW_FOLLOWUP_ADMIT", "1")
 # ... and its wait at a chunk boundary on an event the forward records at the attention of layer N - OKC_BOUNDARY_EARLY_LAYERS
 # (~13 ms before a 16K chunk's forward ends), not after the forward: the host's pick and launch of the next batch (~9 ms)
 # then run under the last layers instead of leaving the GPU idle at every boundary (review-1030/FIRSTTURN.md §2f). Timing
-# only; a follow-up arriving in those last ms waits one more chunk (c4 replay: worst TTFT 0.549 -> 0.547 s).
-SW_BOUNDARY_EARLY = _flag("OKC_SW_BOUNDARY_EARLY", "0")
+# only; a follow-up arriving in those last ms waits one more chunk (c4 replay: worst TTFT 0.549 -> 0.547 s). Default on
+# (x-ftb3; FTB2 with W1a + F1: prefill_bench -31 ms, identity equal); OKC_SW_BOUNDARY_EARLY=0 records after the forward.
+SW_BOUNDARY_EARLY = _flag("OKC_SW_BOUNDARY_EARLY", "1")
 BOUNDARY_EARLY_LAYERS = int(os.environ.get("OKC_BOUNDARY_EARLY_LAYERS", "2"))
 
 # Bounded merge of follow-up extends (court C30 / C31): at load >= FU_MERGE_MIN_LOAD, with requests decoding and
