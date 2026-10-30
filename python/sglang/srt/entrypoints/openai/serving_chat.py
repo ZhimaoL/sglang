@@ -46,6 +46,7 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
     encoding_dsv41,
 )
+from sglang.srt.entrypoints.openai.parallel_tokenize import build_parallel_encoder
 from sglang.srt.entrypoints.openai.prefix_token_cache import build_prefix_token_cache
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
@@ -390,6 +391,19 @@ class OpenAIServingChat(OpenAIServingBase):
                     else {}
                 ),
                 max_entries=_PREFIX_TOKEN_CACHE_MAX_ENTRIES,
+            )
+        )
+        # Long cache misses (cold first turns) encode on a thread pool, cut where the pre-tokenizer cuts: same ids.
+        self._parallel_encoder = (
+            None
+            if self._prompt_text_round_trip_is_lossy
+            else build_parallel_encoder(
+                tokenizer=self.tokenizer_manager.tokenizer,
+                encode_kwargs=(
+                    {"add_special_tokens": False}
+                    if self._tokenizer_auto_adds_specials
+                    else {}
+                ),
             )
         )
 
@@ -1890,12 +1904,13 @@ class OpenAIServingChat(OpenAIServingBase):
         self, *, rendered_prompt: str, encode_kwargs: Dict[str, Any]
     ) -> List[int]:
         tokenizer = self.tokenizer_manager.tokenizer
+        encode = lambda part: tokenizer.encode(part, **encode_kwargs)
+        par = self._parallel_encoder
+        if par is not None and par.tokenizer is tokenizer and par.encode_kwargs == encode_kwargs:
+            encode = par.wrap(encode)
         if self._prefix_token_cache is None:
-            return tokenizer.encode(rendered_prompt, **encode_kwargs)
-        return self._prefix_token_cache.encode(
-            text=rendered_prompt,
-            encode=lambda part: tokenizer.encode(part, **encode_kwargs),
-        )
+            return encode(rendered_prompt)
+        return self._prefix_token_cache.encode(text=rendered_prompt, encode=encode)
 
     def _apply_conversation_template(
         self,
