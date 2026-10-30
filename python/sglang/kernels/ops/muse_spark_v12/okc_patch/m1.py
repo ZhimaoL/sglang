@@ -12,6 +12,16 @@ import torch
 
 from sglang.kernels.ops.muse_spark_v12 import okc_patch as _sw
 
+# Why two buffers by layer parity are enough (no per-use handshake):
+# - A slot buffer (and its epoch word) is reused two MoE layers later: layer L writes buffer L % 2, so rank A's gg2 of
+#   layer L + 2 is the next writer after layer L.
+# - Between them, layer L + 1 runs the attention o-proj all-reduce (custom push AR) on every rank. A rank pushes into
+#   that all-reduce only after its own earlier kernels on the stream are done, so rank B's layer-L receiver (and its
+#   epoch reset) has finished before B's push.
+# - Rank A completes that all-reduce only after B's push arrives, and A's layer L + 2 gg2 runs after it.
+# - So no rank overwrites buffer L % 2 or bumps its epoch while any rank still reads it for layer L.
+# - The same holds across verify steps (the last MoE layer of a step and the next step's first are two or more
+#   all-reduces apart) and between graphs.
 _STATE = {}
 
 
