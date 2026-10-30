@@ -10,7 +10,8 @@ the finalize applies unchanged. Graph-capturable; OKC_MOE_ST_PDL launches the do
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext
+from sglang.kernels.ops.muse_spark_v12.okc_patch import ST_FUSE
+from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import st_ext, st_fused_ext
 
 MAX_TOKENS = 128    # the kernels' table holds 1024 routes (top-8)
 
@@ -42,6 +43,8 @@ def grouped_st(x, local_ids, *, wsf13, gs13, wsf2, pdl=False, norm_weight=None, 
         norm_weight = _empty(torch.bfloat16, x.device)
     tab, me, passes = rep if rep is not None else (_empty(torch.int32, x.device), 0, 0)
     lids = torch.empty(local_ids.shape, dtype=torch.int32, device=x.device) if rep is not None else tab
-    st_ext().st_moe(x, local_ids.reshape(-1), wsf13, gs13, wsf2, h, y, 1 if pdl else 0, norm_weight, float(norm_eps),
-                    tab, me, 1 if passes else 0, lids)
+    # OKC_ST_FUSE: both GEMMs in one launch (same arguments, same bits)
+    (st_fused_ext().st_moe_fused if ST_FUSE else st_ext().st_moe)(
+        x, local_ids.reshape(-1), wsf13, gs13, wsf2, h, y, 1 if pdl else 0, norm_weight, float(norm_eps), tab, me,
+        1 if passes else 0, lids)
     return y if rep is None else (y, lids)
