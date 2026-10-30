@@ -1050,6 +1050,8 @@ class MuseSpark1xMoE(nn.Module):
         prenormed = okc_patch.SP_PRENORM_EARLY and sp_active and layernorm_sp.okc_hopper_sp() and self._okc_prenorm_shard()
         if prenormed:
             expert_input = self.pre_expert_norm(expert_input)
+        # OKC_SP_AG_ROWSFIRST: the rows' gather leaves now, under the router's tail, on its own stream
+        rows_first = _okc_rows_first(self, expert_input) if prenormed and okc_patch.SP_AG_ROWSFIRST else None
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -1080,7 +1082,7 @@ class MuseSpark1xMoE(nn.Module):
             capturer.capture(layer_id=self.layer_idx, topk_indices=capture_topk_ids)
         if getattr(get_forward(), "sp_active", False):
             return self._forward_sp_experts(
-                expert_input, topk_scores, topk_ids, router_logits, prenormed=prenormed
+                expert_input, topk_scores, topk_ids, router_logits, prenormed=prenormed, rows_first=rows_first
             )
         if self.nvfp4_checkpoint:
             output = self.experts(
@@ -1139,10 +1141,12 @@ class MuseSpark1xMoE(nn.Module):
         router_logits: torch.Tensor,
         *,
         prenormed: bool = False,
+        rows_first=None,
     ) -> torch.Tensor:
         """Return combined source-token shards, before the nonlinear FFN tail."""
         if layernorm_sp.okc_hopper_sp():
-            return self._forward_gathered_experts(expert_input, topk_scores, topk_ids, prenormed=prenormed)
+            return self._forward_gathered_experts(expert_input, topk_scores, topk_ids, prenormed=prenormed,
+                                                  rows_first=rows_first)
         if self.pre_expert_norm is not None:
             expert_input = self.pre_expert_norm(expert_input)
         if self.use_megamoe:
@@ -1174,10 +1178,12 @@ class MuseSpark1xMoE(nn.Module):
         topk_ids: torch.Tensor,
         *,
         prenormed: bool = False,
+        rows_first=None,
     ) -> torch.Tensor:
         """SP prefill without the A2A dispatcher: every rank runs its local experts on the whole
         sequence, exactly the non-SP EP, and reduce-scatters the partial sums back to the shards.
-        Shards are [M_pad / tp, ...] in rank order, so gathering along dim 0 restores token order."""
+        Shards are [M_pad / tp, ...] in rank order, so gathering along dim 0 restores token order.
+        rows_first: (gathered rows, their stream) from _okc_rows_first; the scores / ids follow by _okc_ids_gather."""
         global _okc_sp_logged
         if not _okc_sp_logged:
             _okc_sp_logged = True
@@ -1200,7 +1206,18 @@ class MuseSpark1xMoE(nn.Module):
         prenorm_shard = self._okc_prenorm_shard()
         if prenorm_shard and not prenormed:
             expert_input = self.pre_expert_norm(expert_input)
-        grouped = _okc_push_gather(tp_group, expert_input, topk_scores, topk_ids)
+        if rows_first is not None:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
+
+            full_input, rows_stream = rows_first
+            full_scores, full_ids = _okc_ids_gather(tp_group, topk_scores, topk_ids)
+            okc_moe.rows_first_prep(self.experts, full_ids)   # pg's routing prep (ids only) under the rows
+            torch.cuda.current_stream().wait_stream(rows_stream)
+            if not torch.cuda.is_current_stream_capturing():
+                full_input.record_stream(torch.cuda.current_stream())
+            grouped = (full_input, full_scores, full_ids)
+        else:
+            grouped = _okc_push_gather(tp_group, expert_input, topk_scores, topk_ids)
         if grouped is None and okc_patch.SP_AG_GROUP:
             grouped = _okc_grouped_gather(tp_group, (expert_input, topk_scores, topk_ids))
         if grouped is not None:
@@ -1254,6 +1271,73 @@ def _okc_push_gather(tp_group, x, scores, ids):
             and comm.config.num_push_blocks >= 2):
         return None
     return pg_moe.ag_rows(comm, x.contiguous(), scores.contiguous(), ids.contiguous())
+
+
+_okc_rf_state: dict = {}
+
+
+def _okc_rows_first(moe, x):
+    """OKC_SP_AG_ROWSFIRST: start the SP MoE section's row gather [S, 4096] -> [world S, 4096] on its own stream now,
+    on the pynccl communicator _okc_grouped_gather uses -> (rows, stream), or None (the section gathers as usual).
+    Only for pg-only fp4 layers, gathered calls of SP_AG_ROWSFIRST_MIN..MAX_TOKENS rows, and when the scores / ids can
+    go by the symmetric-memory gather (_okc_ids_buffer). The predicate is the same on every rank."""
+    tp_group = get_tp_group()
+    pyn, world = tp_group.pynccl_comm, tp_group.world_size
+    state = getattr(moe.experts, "_okc_moe_state", None)
+    if (not moe.nvfp4_checkpoint or state is None or not state["pg_only"] or world <= 1
+            or not okc_patch.SP_AG_ROWSFIRST_MIN_TOKENS <= x.shape[0] * world <= okc_patch.SP_AG_ROWSFIRST_MAX_TOKENS
+            or pyn is None or not (not pyn.disabled or tp_group.is_symmetric_memory_enabled())
+            or _okc_ids_buffer(tp_group, x.device) is None):
+        return None
+    st = _okc_rf_state.get(x.device)
+    if st is None:
+        st = _okc_rf_state[x.device] = torch.cuda.Stream(device=x.device)
+    x = x.contiguous()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st), pyn.change_state(enable=True):
+        full = x.new_empty((x.shape[0] * world, x.shape[1]))
+        pyn.all_gather(full, x)
+    if not torch.cuda.is_current_stream_capturing():
+        x.record_stream(st)
+    return full, st
+
+
+def _okc_ids_buffer(tp_group, device):
+    """The symmetric bf16 buffer of the rows-first scores / ids gather (multicast checked, agreed over TP), made once
+    outside capture, or None."""
+    key = tp_group.device_group.group_name
+    st = _okc_rf_state.get(key, False)
+    if st is not False:
+        return st
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
+
+    st = None
+    if ext_coll._symm_ok():
+        import torch.distributed._symmetric_memory as symm_mem
+
+        n = okc_patch.SP_AG_ROWSFIRST_MAX_TOKENS * 32   # the largest gathered call's [T, 16] words as bf16
+        buf = ext_coll.agreed(lambda: symm_mem.empty(n, dtype=torch.bfloat16, device=device))
+        hdl = buf is not None and ext_coll.agreed(lambda: ext_coll._mc_handle(buf, key))
+        if hdl and ext_coll.agreed(lambda: ext_coll._mc_gather_ok(hdl, buf, key)):
+            st = buf
+    _okc_rf_state[key] = st
+    return st
+
+
+def _okc_ids_gather(tp_group, scores, ids):
+    """[S, 8] fp32 scores + [S, 8] int32 ids of every rank -> ([world S, 8], [world S, 8]) in rank order: one multimem
+    gather of the packed [S, 16] words through _okc_ids_buffer (exact bytes), copied out of the buffer. Buffer reuse:
+    a peer's next call into this buffer comes after the section's reduce-scatter, which needs this rank's gg2 and so
+    follows these copies."""
+    key = tp_group.device_group.group_name
+    buf, w, s = _okc_rf_state[key], tp_group.world_size, ids.shape[0]
+    packed = torch.cat([scores.contiguous().view(torch.int32), ids.contiguous()], dim=1).view(torch.bfloat16)
+    out = buf[: w * s * 32]
+    torch.ops.symm_mem.multimem_all_gather_out(packed.reshape(-1), key, out)
+    words = out.view(w * s, 32).view(torch.int32)
+    return words[:, :8].contiguous().view(torch.float32), words[:, 8:].contiguous()
 
 
 def _okc_grouped_gather(tp_group, shards):
