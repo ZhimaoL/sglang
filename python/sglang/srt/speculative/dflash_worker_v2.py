@@ -232,6 +232,24 @@ def _between_chunk() -> bool:
     return okc_patch.SW_BETWEEN_CHUNK or okc_patch.SW_FOLLOWUP_ADMIT
 
 
+def _boundary_arm():
+    """OKC_SW_BOUNDARY_EARLY: a fresh event armed for the target forward's layer N - 2 attention break, or None."""
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+    from sglang.srt.layers import layernorm_sp
+
+    if not okc_patch.SW_BOUNDARY_EARLY:
+        return None
+    ev = torch.cuda.Event()
+    layernorm_sp.okc_boundary_arm(ev)
+    return ev
+
+
+def _boundary_take() -> bool:
+    from sglang.srt.layers import layernorm_sp
+
+    return layernorm_sp.okc_boundary_take()
+
+
 def host_ints_to_device(values, device) -> torch.Tensor:
     """int32 device copy of a host int list with no stream sync.
 
@@ -2446,6 +2464,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            early = _boundary_arm() if _between_chunk() else None
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -2455,9 +2474,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if _between_chunk():
                 # Between-chunk admission waits on this, not on the whole batch: the draft-KV write below is still
-                # queued behind it when the scheduler picks the next batch.
-                batch_output.okc_target_done = torch.cuda.Event()
-                batch_output.okc_target_done.record()
+                # queued behind it when the scheduler picks the next batch (OKC_SW_BOUNDARY_EARLY: recorded inside the
+                # forward, two layers before its end, when that layer's attention break ran).
+                done = early
+                if early is None or not _boundary_take():
+                    done = torch.cuda.Event()
+                    done.record()
+                batch_output.okc_target_done = done
             kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 
             logits_output, next_token_ids = (

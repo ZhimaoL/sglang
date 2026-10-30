@@ -261,6 +261,32 @@ def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states.tensor_split(tp_size)[tp_group.rank_in_group].contiguous()
 
 
+# OKC_SW_BOUNDARY_EARLY: the DFlash worker arms an event before a target prefill forward; the forward records it in the
+# per-layer attention eager break of layer _BOUNDARY["layer"] (set by the target model), which runs on every replay.
+_BOUNDARY = {"layer": None, "ev": None, "fired": False}
+
+
+def okc_boundary_layer(layer_id: int) -> None:
+    _BOUNDARY["layer"] = layer_id
+
+
+def okc_boundary_arm(ev) -> None:
+    _BOUNDARY.update(ev=ev, fired=False)
+
+
+def okc_boundary_mark(layer_id: int) -> None:
+    if _BOUNDARY["ev"] is not None and not _BOUNDARY["fired"] and layer_id == _BOUNDARY["layer"]:
+        _BOUNDARY["ev"].record()
+        _BOUNDARY["fired"] = True
+
+
+def okc_boundary_take() -> bool:
+    """Disarm; True when the armed event was recorded inside the forward."""
+    fired = _BOUNDARY["fired"]
+    _BOUNDARY.update(ev=None, fired=False)
+    return fired
+
+
 def sp_exit_gather(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """g: all-gather the per-rank shards back to the full sequence along dim 0,
     then narrow to ``num_tokens`` (dropping the entry-scatter padding)."""
