@@ -224,9 +224,13 @@ def custom_all_reduce(
     *,
     graph_params: torch.Tensor | None = None,
     use_multicast: bool = False,
+    early_trigger: bool = False,
+    carveout: int = -1,
 ) -> torch.Tensor:
+    """``early_trigger`` / ``carveout`` (push algorithms only; OKC_SW_WSC): trigger the dependents right after the
+    grid-dependency wait, and launch with that preferred shared-memory carveout in percent (< 0: none)."""
     module = get_all_reduce_module(input.dtype, comm.world_size)
-    result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
+    result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast, early_trigger, carveout)
     return torch.from_dlpack(result)
 
 

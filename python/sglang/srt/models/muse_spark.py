@@ -52,6 +52,9 @@ if _OKC_RSB:
         eager_on_graph,
         is_in_breakable_cuda_graph,
     )
+if okc_patch.SW_WSC:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import smallm as okc_smallm
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import wsc as okc_wsc
 from sglang.kernels.ops.muse_spark_v12.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
@@ -901,7 +904,11 @@ class MuseSpark1xMoE(nn.Module):
             and not getattr(get_forward(), "sp_active", False)
             and not already_reduced
         ):
-            output = tensor_model_parallel_all_reduce(output)
+            if okc_patch.SW_WSC:   # a W-staged unpooler slice behind it: carveout + early trigger
+                with okc_wsc.ar_scope(self._okc_wsc_unpool(output)):
+                    output = tensor_model_parallel_all_reduce(output)
+            else:
+                output = tensor_model_parallel_all_reduce(output)
         if self.post_expert_proj is not None:
             if _is_cpu:
                 output, _ = self.post_expert_proj(output)
@@ -916,6 +923,15 @@ class MuseSpark1xMoE(nn.Module):
                 return gemm_ag(comm, output, self.post_expert_proj.weight)
             output = bf16_gemm_dispatch(output, self.post_expert_proj.weight, None)
         return output
+
+    def _okc_wsc_unpool(self, output: torch.Tensor) -> bool:
+        """OKC_SW_WSC: whether the unpooler GEMM after the combine all-reduce is a W-staged gemm_ag slice."""
+        if self.post_expert_proj is None or _is_cpu or getattr(get_forward(), "sp_active", False):
+            return False
+        w = self.post_expert_proj.weight
+        if not gemm_ag_supported(get_tp_group().ca_comm, output, w, okc_patch.GEMM_AG_UNPOOLER_MAX_TOKENS):
+            return False
+        return okc_smallm.wsc_staged(w.shape[0] // self.tp_size, w.shape[1], output.shape[0])
 
     def _defers_unpool_gather(self, comm, num_tokens: int) -> bool:
         boundary = self.unpool_gather_boundary
@@ -1340,6 +1356,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
         # OKC (OKC_NORM_PREFETCH): at TP > 1 this boundary's predecessor is the o-proj all-reduce, so the norm may load
         # the stream and its weights before griddepcontrol.wait
         self._fused_attn_boundary._okc_prefetch_stream = get_parallel().tp_size > 1
+        # OKC_SW_WSC: the GEMM behind this boundary is the pooler's gemm_ag slice (MoE layers)
+        pre = getattr(self.mlp, "pre_expert_proj", None) if self.is_moe_layer else None
+        if okc_patch.SW_WSC and pre is not None and get_parallel().tp_size > 1:
+            self._fused_attn_boundary._okc_wsc_next = (pre.weight.shape[0] // get_parallel().tp_size,
+                                                       pre.weight.shape[1])
         self._fused_ffn_boundary = None
         self._next_layer = None
         # OKC: the model's final norm, bound on the last layer only (not a submodule: the model owns it).
@@ -1373,6 +1394,10 @@ class MuseSpark1xDecoderLayer(nn.Module):
     def bind_next_layer(self, next_layer: MuseSpark1xDecoderLayer) -> None:
         # Not a submodule: the model owns it. The Helion verify tail computes its QKV.
         object.__setattr__(self, "_next_layer", next_layer)
+        # OKC_SW_WSC: the GEMM behind the FFN boundary is the next layer's qkv
+        w = getattr(getattr(next_layer.self_attn, "qkv_proj", None), "weight", None)
+        if okc_patch.SW_WSC and self._fused_ffn_boundary is not None and w is not None and w.dim() == 2:
+            self._fused_ffn_boundary._okc_wsc_next = tuple(w.shape)
 
     def forward(
         self,

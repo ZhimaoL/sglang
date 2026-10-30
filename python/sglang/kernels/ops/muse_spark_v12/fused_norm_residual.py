@@ -462,7 +462,10 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         self._ensure_cached_weights(branch_dtype)
 
         from sglang.kernels.ops.muse_spark_v12 import okc_patch
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import wsc as okc_wsc
 
+        # OKC_SW_WSC: a W-staged GEMM behind this boundary (the model sets _okc_wsc_next)
+        early_trigger, carveout = okc_wsc.boundary_opts(self, stream.shape[0])
         return _jit_fused_norm_residual(
             branch,
             stream,
@@ -478,6 +481,8 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             # OKC: set by the model on the post-attention boundary only (predecessor = the o-proj all-reduce)
             prefetch_stream=okc_patch.NORM_PREFETCH and getattr(self, "_okc_prefetch_stream", False),
             branch_slots=branch_slots,
+            early_trigger=early_trigger,
+            carveout=carveout,
         )
 
     def jit_selected(self) -> bool:
@@ -497,7 +502,11 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         self, stream: torch.Tensor, local: torch.Tensor, comm
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply the boundary to the TP all-gather of bf16 column slices ``local``."""
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import wsc as okc_wsc
+
         self._ensure_cached_weights(torch.bfloat16)
+        # OKC_SW_WSC: the carveout only; the all-gather norm already triggers its dependents right after its wait
+        _, carveout = okc_wsc.boundary_opts(self, stream.shape[0])
         return all_gather_norm_residual(
             comm,
             local,
@@ -509,4 +518,5 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             pre_weight=self._cc_pre_weight if self._pre_norm.has_weight else None,
             alpha=self._cc_alpha if self._use_residual_gate else None,
             beta=self._cc_beta if self._use_residual_gate else None,
+            carveout=carveout,
         )

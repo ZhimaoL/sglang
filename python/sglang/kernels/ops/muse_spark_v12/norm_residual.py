@@ -161,6 +161,8 @@ def fused_norm_residual(
     cluster_size: Optional[int] = None,
     prefetch_stream: bool = False,
     branch_slots: Optional[torch.Tensor] = None,
+    early_trigger: bool = False,
+    carveout: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Return ``(output, new_stream, router_out)`` for a ``[M, H]`` row batch.
 
@@ -174,6 +176,8 @@ def fused_norm_residual(
     for callers whose predecessor kernel does not write ``stream`` and triggers after its own wait.
     ``branch_slots`` (OKC rsfold): contiguous bf16 ``[W, M, H]`` whose sum over dim 0 is the branch. The kernel sums
     them in torch's order (bit-equal to ``branch_slots.sum(dim=0)``) and leaves ``branch`` unwritten.
+    ``early_trigger`` / ``carveout`` (OKC_SW_WSC): trigger the dependents right after griddepcontrol.wait, and launch
+    with that preferred shared-memory carveout in percent (< 0: none), for a W-staged GEMM behind this norm.
     """
     assert branch.dtype == torch.bfloat16 and stream.dtype == torch.float32
     assert branch.dim() == 2 and stream.shape == branch.shape
@@ -254,5 +258,7 @@ def fused_norm_residual(
         float(post_eps),
         float(pre_eps),
         bool(pre_norm_bf16),
+        bool(early_trigger),
+        int(carveout),
     )
     return output, new_stream_out, router_out

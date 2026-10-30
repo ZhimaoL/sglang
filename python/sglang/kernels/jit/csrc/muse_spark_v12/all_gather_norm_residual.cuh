@@ -527,7 +527,8 @@ struct MuseSparkAllGatherNormResidual {
       const tvm::ffi::Optional<tvm::ffi::TensorView> alpha,
       const tvm::ffi::Optional<tvm::ffi::TensorView> beta,
       double post_eps,
-      double pre_eps) {
+      double pre_eps,
+      int64_t carveout) {
     using namespace host;
     const auto& push = ref.get()->get_push_obj();
 
@@ -608,7 +609,8 @@ struct MuseSparkAllGatherNormResidual {
     const auto device = device_.unwrap();
     if constexpr (kClusterSize == 1) {
       LaunchKernel(grid, kNumThreads, device)
-          .config({.use_pdl = kUsePDL})(
+          .config({.use_pdl = kUsePDL})
+          .enable_carveout(carveout)(
               muse_spark_all_gather_norm_residual_row_kernel<
                   kHidden,
                   kWorld,
@@ -650,7 +652,8 @@ struct MuseSparkAllGatherNormResidual {
           .config({
               .use_pdl = kUsePDL,
               .cluster_dim = dim3(kClusterSize, 1, 1),
-          })(kernel, params);
+          })
+          .enable_carveout(carveout)(kernel, params);
     }
   }
 };

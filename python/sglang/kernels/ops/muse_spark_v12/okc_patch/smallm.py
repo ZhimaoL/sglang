@@ -14,7 +14,7 @@ pack route (a 2.2 GiB per rank copy), which is no longer carried. Everything els
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_WSTAGE
+from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_WSC
 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_smallm import TABLE
 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_wsm import TABLE_WS
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import smallm_ext, wsm_ext
@@ -30,8 +30,17 @@ def claims(n: int, k: int, m: int) -> bool:
 def prepare() -> None:
     """Build the extension at weight load (outside any CUDA-graph capture)."""
     smallm_ext()
-    if SW_WSTAGE:
+    if SW_WSC:
         wsm_ext()
+
+
+def wsc_staged(n: int, k: int, m: int) -> bool:
+    """Whether gemm() runs the W-staged kernel for an [m, k] x [n, k]^T call (OKC_SW_WSC): the kernel in front of it
+    then launches with okc_patch.wsc's carveout and early trigger (bf16 / contiguity declines are not seen here; a
+    declined call only leaves its predecessor with an unused carveout)."""
+    if not SW_WSC or not claims(n, k, m):
+        return False
+    return next(t for t in _NTS if t >= m) in TABLE_WS[(n, k)]
 
 
 def gemm(x, weight):
@@ -55,7 +64,7 @@ def gemm(x, weight):
     if cfg is None:
         return None
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    if SW_WSTAGE:
+    if SW_WSC:
         NT, NST, S, KT, RT, NWG, PIPE = TABLE_WS[(n, k)][nt]
         wsm_ext().wsm_launch(weight, x2, out, NT, NST, S, KT, RT, NWG, PIPE, 1)
     else:

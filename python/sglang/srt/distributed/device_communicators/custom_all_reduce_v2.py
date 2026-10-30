@@ -427,12 +427,19 @@ class CustomAllReduceV2:
             assert config is not None, f"No config for {nbytes = }"
             algo, use_graph, use_multicast = config
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
+        # OKC_SW_WSC: inside okc_patch.wsc.ar_scope (the combine all-reduce before a W-staged unpooler slice) a push
+        # all-reduce triggers its dependents right after its wait and launches with a big shared-memory carveout
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import wsc as okc_wsc
+
+        early_trigger, carveout = okc_wsc.ar_opts() if algo.is_push() else okc_wsc.NONE
         return custom_all_reduce(
             self.obj,
             input,
             algo=algo,
             graph_params=graph_params,
             use_multicast=use_multicast,
+            early_trigger=early_trigger,
+            carveout=carveout,
         )
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:

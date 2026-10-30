@@ -136,7 +136,10 @@ struct MultiCastImpl {
 
 #define ALL_REDUCE_KERNEL __global__ __launch_bounds__(1024, 1)
 
-template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
+// kEarlyTrigger (OKC_SW_WSC): trigger the dependents right after the grid-dependency wait instead of at the end, so a
+// PDL-launched GEMM behind this all-reduce streams its weights while the all-reduce runs (the dependent still waits for
+// this grid's completion before it reads the output). The false instantiation is the stock kernel.
+template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL, bool kEarlyTrigger = false>
 ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllReducePushParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
@@ -156,6 +159,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
   const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
   const auto global_tid = global_warp_id * kWarpThreads + lane_id;
   PDLWaitPrimary<kUsePDL>();
+  if constexpr (kEarlyTrigger) PDLTriggerSecondary<kUsePDL>();
   const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
 
   // push to peer
@@ -215,7 +219,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
 /// `chunk_vecs` halves: [0, chunk) takes src's partial of chunk dst, and
 /// [chunk, 2 * chunk) takes src's reduced chunk src. The (r, r) slot is unused:
 /// the owner reads its own partial straight from the input.
-template <typename T, uint32_t kWorldSize, bool kUsePDL>
+template <typename T, uint32_t kWorldSize, bool kUsePDL, bool kEarlyTrigger = false>
 ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllReducePushParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
@@ -233,6 +237,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
   const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
   const auto global_tid = global_warp_id * kWarpThreads + lane_id;
   PDLWaitPrimary<kUsePDL>();
+  if constexpr (kEarlyTrigger) PDLTriggerSecondary<kUsePDL>();
   const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
 
   // Each warp serves one peer, starting at r + 1 so every peer's ingress is
@@ -423,7 +428,9 @@ struct AllReduceKernel {
       const Tensor in,
       const std::string algo,
       const tvm::ffi::Optional<TensorView> graph_params_opt,
-      const bool use_multicast) {
+      const bool use_multicast,
+      const bool early_trigger,
+      const int64_t carveout) {
     using namespace host;
     const auto& comm = *comm_ref.get();
     CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push") << algo;
@@ -452,8 +459,10 @@ struct AllReduceKernel {
           .ws = push.get_workspace<kWorldSize>(two_shot ? int64_t{2} * chunk_vecs * 16 : nbytes),
       };
       using Impl = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
-      const auto kernel = two_shot ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>
-                                   : all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL>;
+      const auto kernel = two_shot ? (early_trigger ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL, true>
+                                                    : all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>)
+                                   : (early_trigger ? all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL, true>
+                                                    : all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL>);
       // the grid is bound to the counter array and must stay constant
       auto block_size = choose_block_size(num_vecs);
       if (two_shot) {
@@ -461,7 +470,8 @@ struct AllReduceKernel {
         block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));
       }
       LaunchKernel(push.num_blocks, block_size, stream)  //
-          .enable_pdl(kUsePDL)(kernel, params);
+          .enable_pdl(kUsePDL)
+          .enable_carveout(carveout)(kernel, params);
       return out;
     }
 

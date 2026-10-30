@@ -1,4 +1,4 @@
-"""CUDA source of the W-staged small-m GEMM (OKC_SW_WSTAGE; okc_patch/smallm.py dispatches it): _cuda_src_smallm's rmw
+"""CUDA source of the W-staged small-m GEMM (OKC_SW_WSC; okc_patch/smallm.py dispatches it): _cuda_src_smallm's rmw
 kernel with a PDL-aware producer. The weight slice does not depend on the previous kernel, so the producer TMA's the
 first NST stages of W before griddepcontrol.wait and x after it; launched with programmatic stream serialization, the
 CTAs land while the predecessor (a collective or a norm) still runs and stream W under its latency. The consumer loop,

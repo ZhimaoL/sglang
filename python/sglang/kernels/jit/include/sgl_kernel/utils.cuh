@@ -488,6 +488,22 @@ struct LaunchKernel {
     return *this;
   }
 
+  /// OKC (OKC_SW_WSC): a per-launch preferred shared-memory carveout in percent, so a PDL dependent that needs a big
+  /// shared-memory split can land beside this kernel's CTAs; pct < 0 leaves the launch unchanged.
+  auto enable_carveout(int64_t pct) -> LaunchKernel& {
+#ifndef USE_ROCM
+    if (pct >= 0) {
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributePreferredSharedMemoryCarveout;
+      attr.val.sharedMemCarveout = static_cast<unsigned int>(pct);
+      m_config.attrs = m_attrs;
+    }
+#else
+    (void)pct;
+#endif
+    return *this;
+  }
+
   /**
    * \brief Configure the kernel launch with the given options.
    * \param config The kernel configuration options.
@@ -551,7 +567,7 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[2];
+  cudaLaunchAttribute m_attrs[3];
   int m_device_id;
   bool m_prefer_l1 = false;
 };

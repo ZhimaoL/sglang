@@ -121,7 +121,8 @@ template <
     bool kHasRouter,
     bool kPostWeight,
     bool kGate,
-    int kSlots = 0>
+    int kSlots = 0,
+    bool kEarlyTrigger = false>   // OKC_SW_WSC: trigger the dependents right after the wait (false: the stock kernel)
 __global__ void __launch_bounds__(kNumThreads)
     muse_spark_norm_residual_kernel(const __grid_constant__ NormResidualParams params) {
   using namespace device;
@@ -161,6 +162,7 @@ __global__ void __launch_bounds__(kNumThreads)
   BF16Vec pre_w_pf[kPreSlots];
 
   PDLWaitPrimary<kUsePDL>();
+  if constexpr (kEarlyTrigger) PDLTriggerSecondary<kUsePDL>();
 
   float sum_sq = 0.0f;
 #pragma unroll
@@ -458,7 +460,8 @@ template <
     bool kHasRouter,
     bool kPostWeight,
     bool kGate,
-    bool kPrefetchStream>
+    bool kPrefetchStream,
+    bool kEarlyTrigger = false>   // OKC_SW_WSC: trigger the dependents right after the wait (false: the stock kernel)
 __global__ void __launch_bounds__(kNumThreads)
     muse_spark_norm_residual_cluster(const __grid_constant__ NormResidualParams params) {
   using namespace device;
@@ -538,6 +541,7 @@ __global__ void __launch_bounds__(kNumThreads)
   }
 
   PDLWaitPrimary<kUsePDL>();
+  if constexpr (kEarlyTrigger) PDLTriggerSecondary<kUsePDL>();
 
   float branch_sum = 0.0f;
   float residual_sum = 0.0f;
@@ -726,7 +730,9 @@ struct MuseSparkNormResidual {
       const tvm::ffi::Optional<tvm::ffi::TensorView> beta,
       double post_eps,
       double pre_eps,
-      bool pre_norm_bf16) {
+      bool pre_norm_bf16,
+      bool early_trigger,
+      int64_t carveout) {
     using namespace host;
 
     auto M = SymbolicSize{"num_tokens"};
@@ -792,10 +798,11 @@ struct MuseSparkNormResidual {
 
     if constexpr (kClusterSize > 1) RuntimeCheck(!pre_norm_bf16, "Cluster path requires FP32 pre-norm input");
 
-    const auto launch = [&]<bool kHasPostWeight, bool kHasGate>() {
+    const auto launch = [&]<bool kHasPostWeight, bool kHasGate, bool kEarly>() {
       if constexpr (kClusterSize == 1) {
         LaunchKernel(num_rows, kNumThreads, device)
-            .config({.use_pdl = kUsePDL})(
+            .config({.use_pdl = kUsePDL})
+            .enable_carveout(carveout)(
                 muse_spark_norm_residual_kernel<
                     kHidden,
                     kNumThreads,
@@ -805,7 +812,8 @@ struct MuseSparkNormResidual {
                     kHasRouter,
                     kHasPostWeight,
                     kHasGate,
-                    kSlots>,
+                    kSlots,
+                    kEarly>,
                 params);
       } else {
         constexpr auto kernel = muse_spark_norm_residual_cluster<
@@ -818,7 +826,8 @@ struct MuseSparkNormResidual {
             kHasRouter,
             kHasPostWeight,
             kHasGate,
-            kPrefetchStream>;
+            kPrefetchStream,
+            kEarly>;
         [[maybe_unused]] static const bool cluster_configured = [kernel] {
           if constexpr (kClusterSize > 8) {
             RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
@@ -840,20 +849,28 @@ struct MuseSparkNormResidual {
             .config({
                 .use_pdl = kUsePDL,
                 .cluster_dim = dim3(kClusterSize, 1, 1),
-            })(kernel, params);
+            })
+            .enable_carveout(carveout)(kernel, params);
       }
     };
 
+    // OKC_SW_WSC: early_trigger picks the kEarly instantiation; the false one is the stock kernel
+    const auto launch_early = [&]<bool kHasPostWeight, bool kHasGate>() {
+      if (early_trigger)
+        launch.template operator()<kHasPostWeight, kHasGate, true>();
+      else
+        launch.template operator()<kHasPostWeight, kHasGate, false>();
+    };
     if (post_weight.has_value()) {
       if (gate)
-        launch.template operator()<true, true>();
+        launch_early.template operator()<true, true>();
       else
-        launch.template operator()<true, false>();
+        launch_early.template operator()<true, false>();
     } else {
       if (gate)
-        launch.template operator()<false, true>();
+        launch_early.template operator()<false, true>();
       else
-        launch.template operator()<false, false>();
+        launch_early.template operator()<false, false>();
     }
   }
 };
