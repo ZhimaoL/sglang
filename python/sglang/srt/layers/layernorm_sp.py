@@ -72,6 +72,7 @@ class _OkcHopperSP:
     symm_ok: bool = False   # the startup probe passed (gates every symm-mem path: fused, ext_coll, copy-engine)
     symm_min_tokens: int = 0
     min_tokens: int = 0
+    rows_buf = None   # OKC_SP_AG_ROWSFIRST: the rows gather's persistent [MAX_TOKENS, moe width] bf16 output
 
 
 _okc_hopper = _OkcHopperSP()
@@ -173,6 +174,7 @@ def initialize_layernorm_sp(*, model_config) -> None:
             SW_M1,
             SW_M1RS,
             SP_AG_ROWSFIRST,
+            SP_AG_ROWSFIRST_MAX_TOKENS,
         )
 
         _okc_hopper.min_tokens = SP_MIN_TOKENS
@@ -196,6 +198,13 @@ def initialize_layernorm_sp(*, model_config) -> None:
 
             ext_coll._buffer(get_parallel().tp_group.device_group.group_name,
                              torch.device("cuda", torch.cuda.current_device()))
+            # ... and the rows' gather output, made once here (before graph capture and KV sizing) and reused by every
+            # gathered call: a per-call buffer on the rows' stream, freed behind record_stream events, piled up while the
+            # host ran ahead in the eager warmup that sizes the graph pool's pre-carve (+2.1 GiB, ~364K KV tokens, FTB2)
+            cfg = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+            width = getattr(cfg, "moe_hidden_size", None) or cfg.hidden_size
+            _okc_hopper.rows_buf = torch.empty((SP_AG_ROWSFIRST_MAX_TOKENS, width), dtype=torch.bfloat16,
+                                               device=torch.device("cuda", torch.cuda.current_device()))
     get_flags().sp.enabled = bool(
         (get_parallel().enable_layernorm_sp or _okc_hopper.active)
         and architectures
