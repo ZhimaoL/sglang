@@ -18,6 +18,7 @@ _GLUE_EXT = None
 _WST_EXT = None
 _VFG_EXT = None
 _DRAFT_EXT = None
+_FTNORM_EXT = None
 _ROUTE_EXT = None
 
 def _build_dir(name: str):
@@ -83,10 +84,10 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import QK_FOLD, SW_M1RS
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
-    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ())
+    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("ftnorm_ext",) if QK_FOLD else ())
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -463,3 +464,22 @@ def draft_ext():
                     verbose=False,
                 )
     return _DRAFT_EXT
+
+
+def ftnorm_ext():
+    """OKC_QK_FOLD: the folded qk-norm kernel (_cuda_src_ftnorm.py); no fast math (the replaced kernels' fp32 sequence)."""
+    global _FTNORM_EXT
+    if _FTNORM_EXT is None:
+        with _lock:
+            if _FTNORM_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_ftnorm import _CPP_SRC, _CUDA_SRC
+
+                _FTNORM_EXT = _load_inline(
+                    name="okc_ftnorm_v2",
+                    cpp_sources=_CPP_SRC,
+                    cuda_sources=[_CUDA_SRC],
+                    functions=["qk_fold"],
+                    extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+                    verbose=False,
+                )
+    return _FTNORM_EXT
