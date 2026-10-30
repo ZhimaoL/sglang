@@ -708,7 +708,8 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
                 if (rid < numel) {
                     const uint4 v = *reinterpret_cast<const uint4*>(epp + row * EPI2_PITCH + ch * 16);
                     const size_t off = (size_t)rid * (NWT * 128) + wt * 128 + cw * 64 + ch * 8;
-#ifdef PGN_XNT   // M1 (verify-size build only): the row goes into every rank's slot buffer (NVLS multicast)
+#if defined(PGN_XNT) && !defined(PG_M1RS)   // M1 (the PGN_WSET builds, which all define PGN_XNT; never with M1-RS,
+                                             // whose m1 is the home table): the row goes into every rank's slot buffer
                     if (m1 != nullptr)
                         asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1, %2, %3, %4};"
                                      :: "l"(m1 + off), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
@@ -717,6 +718,9 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
 #ifdef PG_M1RS   // M1-RS (its own builds): the row goes to its token's home rank (SP shard rid / (numel / 8))
                     if (m1 != nullptr) {
                         const int home = (int)(((unsigned long long)rid * rs_mg) >> 40);
+#ifdef PG_M1RS_CHECK   // debug builds: a home outside the 8-entry table traps instead of storing through garbage
+                        if ((unsigned)home >= 8u) __trap();
+#endif
                         __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(
                             __ldg(reinterpret_cast<const unsigned long long*>(m1) + home));
                         *reinterpret_cast<uint4*>(dst + (off - (size_t)home * rs_rows * (NWT * 128))) = v;
