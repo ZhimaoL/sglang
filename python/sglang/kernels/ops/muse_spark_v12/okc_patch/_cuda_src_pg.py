@@ -704,10 +704,12 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
                 if (rid < numel) {
                     const uint4 v = *reinterpret_cast<const uint4*>(epp + row * EPI2_PITCH + ch * 16);
                     const size_t off = (size_t)rid * (NWT * 128) + wt * 128 + cw * 64 + ch * 8;
-                    if (m1 != nullptr)   // M1: the row goes into every rank's slot buffer (NVLS multicast)
+#ifdef PGN_XNT   // M1 (verify-size build only): the row goes into every rank's slot buffer (NVLS multicast)
+                    if (m1 != nullptr)
                         asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1, %2, %3, %4};"
                                      :: "l"(m1 + off), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
                     else
+#endif
                         *reinterpret_cast<uint4*>(yp + off) = v;
                 }
             }
@@ -1028,12 +1030,14 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
 #endif  // PGN_WSET
     }
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
+#ifdef PGN_XNT
     if (!GATED && m1_ep != nullptr) {                   // M1: one release per CTA on every rank's epoch word
         named_bar_sync(3, 256);
         if (c.ctid == 0)
             asm volatile("fence.acq_rel.sys;\n\tmultimem.red.release.sys.global.add.u32 [%0], %1;"
                          :: "l"(m1_ep), "r"(1u) : "memory");
     }
+#endif
 }
 
 
