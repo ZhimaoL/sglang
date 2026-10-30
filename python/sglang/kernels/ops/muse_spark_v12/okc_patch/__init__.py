@@ -268,6 +268,16 @@ SW_CAND_AG_MERGE = _flag("OKC_SW_CAND_AG_MERGE", "1")
 # DFlash draft glue (okc_patch.draft_glue, bit-identical): candidate pack / merge; one-launch draft-KV commit.
 SW_CAND_FUSE = _flag("OKC_SW_CAND_FUSE", "1")
 SW_DRAFT_KV_FUSE = _flag("OKC_SW_DRAFT_KV_FUSE", "1")
+# DFlash draft-graph L2 prefetch (okc_patch.draft_pf, bitwise: the GEMMs and collectives are unchanged): a side-stream
+# kernel loads the bytes the next GEMMs read first into L2 while HBM idles. Bits: 1 = layer start (attention conv's
+# kernel_projection slice + qkv), 2 = after qkv (o_proj, under the attention), 4 = after o_proj's all-reduce (MLP conv's
+# kernel_projection slice + gate_up's first DRAFT_PF_GU_COLS columns). 0 = off.
+DRAFT_PF = int(os.environ.get("OKC_DRAFT_PF", "0"))
+DRAFT_PF_GU_COLS = int(os.environ.get("OKC_DRAFT_PF_GU_COLS", "2048"))
+DRAFT_PF_CTAS = int(os.environ.get("OKC_DRAFT_PF_CTAS", "32"))
+# dpf kernel mode: bit 0 = cp.async.bulk prefetch from one thread per CTA (else per-thread prefetch.global.L2),
+# bit 1 = L2::evict_last (else evict_normal)
+DRAFT_PF_MODE = int(os.environ.get("OKC_DRAFT_PF_MODE", "0"))
 
 # Hopper cluster cap for sglang's fused norm-residual boundary (norm_residual.py): upstream runs the one-CTA-per-row
 # kernel unless capability >= 10; > 1 allows the cluster kernel (GB300 policy C = 16 / 8 / 4 / 2 at M <= 8 / 16 / 32
@@ -336,7 +346,8 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_EXT_AG", "EXT_AG_MAX_BYTES", "SW_EXT_RS", "EXT_RS_FENCE", "SP_CE_TP",
            "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS",
-           "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
+           "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "DRAFT_PF",
+           "DRAFT_PF_GU_COLS", "DRAFT_PF_CTAS", "DRAFT_PF_MODE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT",
            "SW_FU_MERGE", "FU_MERGE_PASSES", "FU_MERGE_MIN_LOAD", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",

@@ -18,6 +18,7 @@ _GLUE_EXT = None
 _WST_EXT = None
 _VFG_EXT = None
 _DRAFT_EXT = None
+_DPF_EXT = None
 _ROUTE_EXT = None
 
 def _build_dir(name: str):
@@ -83,10 +84,10 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import DRAFT_PF, SW_M1RS
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
-    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ())
+    names = _PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("dpf_ext",) if DRAFT_PF else ())
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -463,3 +464,22 @@ def draft_ext():
                     verbose=False,
                 )
     return _DRAFT_EXT
+
+
+def dpf_ext():
+    """OKC_DRAFT_PF: the draft-graph L2 prefetch kernel (_cuda_src_dpf.py, issue and exit)."""
+    global _DPF_EXT
+    if _DPF_EXT is None:
+        with _lock:
+            if _DPF_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_dpf import _CPP_SRC, _CUDA_SRC
+
+                _DPF_EXT = _load_inline(
+                    name="okc_draft_pf_v1",
+                    cpp_sources=_CPP_SRC,
+                    cuda_sources=[_CUDA_SRC],
+                    functions=["dpf_issue"],
+                    extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+                    verbose=False,
+                )
+    return _DPF_EXT

@@ -142,6 +142,16 @@ def _project_candidate_logits(
     return logits
 
 
+def _okc_pf(site: str, mod=None) -> None:
+    """OKC (OKC_DRAFT_PF): the draft graph's L2 prefetch fork points and join (okc_patch.draft_pf, bitwise)."""
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    if okc_patch.DRAFT_PF:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import draft_pf
+
+        getattr(draft_pf, site)(mod)
+
+
 def _okc_candidate_unary(hidden, lm_head, k, mult, cap, ids_out=None):
     """OKC (OKC_SW_CAND_FUSE): candidate_topk's merged-gather path + DFlash2's unary transform, bit-identical, with the
     pack and the post-gather chain one launch each -> (ids, unary) [N, k]; None = take candidate_topk."""
@@ -435,6 +445,7 @@ class DFlashAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        _okc_pf("after_qkv", self)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
@@ -678,6 +689,7 @@ class DFlashDecoderLayer(nn.Module):
             if residual is None:
                 residual = hidden_states
             return hidden_states, residual
+        _okc_pf("layer_start", self)
 
         # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
         if residual is None:
@@ -695,6 +707,7 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        _okc_pf("after_attn", self)
         if attention_kernel is not None:
             attn_out = self.attention_conv.finish(attn_out, attention_kernel)
 
@@ -945,10 +958,12 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
+        _okc_pf("begin")
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+        _okc_pf("join")
 
         if hidden_states.numel() != 0:
             if residual is None:
