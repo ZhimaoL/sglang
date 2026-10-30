@@ -1,5 +1,5 @@
-"""OKC runtime-adaptive replicas (OKC_MOE_ADAPTIVE_REPLICAS, default 0; lane-moe P2-5, muse-opt
-serving/kernels/moe-graft LOG "P2-5"). Homes stay the shipped table; which experts get the R replica slots per rank is
+"""OKC runtime-adaptive replicas (OKC_MOE_ADAPTIVE_REPLICAS, default 1; lane-moe P2-5, muse-opt
+serving/kernels/moe-graft LOG "P2-5"). Homes stay as placed (contiguous by default); which experts get the R replica slots per rank is
 decided from the run's OWN routing counts and refreshed between forwards.
 
 Counting (graph-safe, every rank in step): per pg layer with replicas, a verify counter [256] (route_k adds its picks

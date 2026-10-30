@@ -257,7 +257,7 @@ elif current_platform.is_out_of_tree():
 
 
 logger = logging.getLogger(__name__)
-_OKC_ADAPT = __import__("os").environ.get("OKC_MOE_ADAPTIVE_REPLICAS", "0") == "1"
+_OKC_ADAPT = __import__("os").environ.get("OKC_MOE_ADAPTIVE_REPLICAS", "1") == "1"
 
 
 @dataclass(frozen=True)
