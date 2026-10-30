@@ -1700,16 +1700,24 @@ class MuseSpark1xModel(nn.Module):
         # okc_patch caches per-forward metadata here; CUDA-graph capture runs warmup forwards on the same batch
         # first, so a cache left from them would keep the captured graph from recomputing it on every replay.
         forward_batch.okc_fs_meta = None
-        hidden_states = (
-            self.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        )
-        if input_embeds is None and self.embed_norm is not None:
-            hidden_states = self.embed_norm(hidden_states)
-        sp_active = layernorm_sp.runs_sp(
-            forward_batch.forward_mode, num_tokens=hidden_states.shape[0]
-        )
+        shard = None
+        if input_embeds is None and okc_patch.SP_EMB_RS:
+            shard = layernorm_sp.okc_entry_reduce_scatter(
+                self.embed_tokens, self.embed_norm, input_ids, forward_batch.forward_mode
+            )
+        if shard is not None:
+            hidden_states, sp_active = shard, True
+        else:
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            if input_embeds is None and self.embed_norm is not None:
+                hidden_states = self.embed_norm(hidden_states)
+            sp_active = layernorm_sp.runs_sp(
+                forward_batch.forward_mode, num_tokens=hidden_states.shape[0]
+            )
         get_forward().set("sp_active", sp_active)
-        if sp_active:
+        if sp_active and shard is None:
             hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
         stream = hidden_states.to(self.residual_dtype)
         attn_input = self.layers[0].self_attn_input_norm(stream)

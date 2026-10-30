@@ -22,6 +22,10 @@ def _flag(name: str, default: str) -> bool:
     return os.environ.get(name, default) == "1"
 
 
+# First-turn bundle (docs/serving/review-1030/FIRSTTURN.md): the default of SP_AG_ROWSFIRST, SW_HICACHE_WB_SPLIT and
+# SP_EMB_RS, the bit-exact first-turn pieces; each piece's own switch, when set, still wins. Default 0 until the A/B.
+SW_FTB = _flag("OKC_SW_FTB", "0")
+_FTB = "1" if SW_FTB else "0"
 SW_MOE_PG = _flag("OKC_SW_MOE_PG", "1")
 # Measured on 8x H200: the pg pair beats Marlin on 16K-token chunks; Marlin keeps smaller prefills.
 MOE_PG_MIN_TOKENS = int(os.environ.get("OKC_MOE_PG_MIN_TOKENS", "1536"))
@@ -191,6 +195,9 @@ RS_ATTN_BLOCKS_PADDED = _flag("OKC_RS_ATTN_BLOCKS_PADDED", "1")
 SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
 # ... issued before the router side-stream join, under the router's tail (extend E23).
 SP_PRENORM_EARLY = _flag("OKC_SP_PRENORM_EARLY", "1")
+# SP entry: the vocab embedding's masked partials reduce-scattered to the token shard (half the all-reduce's bytes) and
+# the embedding norm on the shard (1/tp of the rows). Bit-exact: every row has one nonzero partial, the norm is per row.
+SP_EMB_RS = _flag("OKC_SP_EMB_RS", _FTB)
 # pg calls of >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS tokens align their routes with the prefill bank's local-slot align
 # (pg_moe.align_local: one count into the local-slot counters) instead of the cast + map gather + 256-expert
 # moe_align_block_size chain (1xH200: 16K-token call 127.7 -> 19.7 us GPU, bit-identical pg rows).
@@ -213,7 +220,7 @@ SP_AG_PUSH_MAX_TOKENS = int(os.environ.get("OKC_SP_AG_PUSH_MAX_TOKENS", "2048"))
 # without waiting for the router; the top-k scores / ids follow as a symmetric-memory multimem gather (not the same NCCL
 # comm, which would queue them behind the rows) and pg's routing prep runs under the rows. Gathered calls of at least
 # SP_AG_ROWSFIRST_MIN_TOKENS..MAX_TOKENS rows; same kernels, same inputs.
-SP_AG_ROWSFIRST = _flag("OKC_SP_AG_ROWSFIRST", "0")
+SP_AG_ROWSFIRST = _flag("OKC_SP_AG_ROWSFIRST", _FTB)
 SP_AG_ROWSFIRST_MIN_TOKENS = int(os.environ.get("OKC_SP_AG_ROWSFIRST_MIN_TOKENS", "4096"))
 SP_AG_ROWSFIRST_MAX_TOKENS = int(os.environ.get("OKC_SP_AG_ROWSFIRST_MAX_TOKENS", "16384"))
 
@@ -306,7 +313,7 @@ AR_TP8_GRAPH_2PUSH_MAX_BYTES = int(os.environ.get("OKC_AR_TP8_GRAPH_2PUSH_MAX_BY
 # first turn). On: every staged call is one staging chunk (16384 pages: ~267 MiB of staging per rank, taken before KV
 # sizing) and its relayout runs on a second stream that waits only on the submission's ready event, so no kernel waits
 # on a copy. Same bytes to host.
-SW_HICACHE_WB_SPLIT = _flag("OKC_SW_HICACHE_WB_SPLIT", "0")
+SW_HICACHE_WB_SPLIT = _flag("OKC_SW_HICACHE_WB_SPLIT", _FTB)
 HICACHE_STAGING_PAGES = max(1, int(os.environ.get("OKC_HICACHE_STAGING_PAGES", "16384" if SW_HICACHE_WB_SPLIT else "1024")))
 
 # DFLASH prefill -> verify hand-off without a host sync: the extend branch's extend / prefix lengths go to the device
@@ -347,7 +354,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "PFMHA_RAGGED_MAX_BS", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_EXT_AG", "EXT_AG_MAX_BYTES", "SW_EXT_RS", "EXT_RS_FENCE", "SP_CE_TP",
-           "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SP_AG_ROWSFIRST", "SP_AG_ROWSFIRST_MIN_TOKENS", "SP_AG_ROWSFIRST_MAX_TOKENS", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
+           "SW_FTB", "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "SP_EMB_RS", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SP_AG_ROWSFIRST", "SP_AG_ROWSFIRST_MIN_TOKENS", "SP_AG_ROWSFIRST_MAX_TOKENS", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
