@@ -586,12 +586,12 @@ DINL float okc_silu_mul(float a, float b, float ngl, float gsq) {   // (a b gsq)
 #ifdef PGN_WSET
 template <int GATED, int NST, int MODE, int NV, int PAIR64, int ACC = XNT / 2, int N4 = 0>
 DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB)[16], int pm, int wt, float gsv,
-                    const int* rids, void* __restrict__ out, int NWT, int numel) {
+                    const int* rids, void* __restrict__ out, int NWT, int numel, __nv_bfloat16* m1) {
     constexpr int PR = (PAIR64 && NV <= 64) ? 1 : 0;
 #else   // PGN_WSET
 template <int GATED, int NST, int MODE, int NV, int PAIR64, int ACC = 128, int N4 = 0>
 DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB)[16], int pm, int wt, float gsv,
-                    const int* rids, void* __restrict__ out, int NWT, int numel) {
+                    const int* rids, void* __restrict__ out, int NWT, int numel, __nv_bfloat16* m1) {
     constexpr int PR = (PAIR64 && NV == 64) ? 1 : 0;
 #endif  // PGN_WSET
     for (int kt = 0; kt < NKT; kt += 2) {
@@ -701,9 +701,15 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
                 const int idx = cc * 128 + wtid;
                 const int row = idx >> 3, ch = idx & 7;
                 const int rid = rids[64 * p + row];
-                if (rid < numel)
-                    *reinterpret_cast<uint4*>(yp + (size_t)rid * (NWT * 128) + wt * 128 + cw * 64 + ch * 8) =
-                        *reinterpret_cast<const uint4*>(epp + row * EPI2_PITCH + ch * 16);
+                if (rid < numel) {
+                    const uint4 v = *reinterpret_cast<const uint4*>(epp + row * EPI2_PITCH + ch * 16);
+                    const size_t off = (size_t)rid * (NWT * 128) + wt * 128 + cw * 64 + ch * 8;
+                    if (m1 != nullptr)   // M1: the row goes into every rank's slot buffer (NVLS multicast)
+                        asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1, %2, %3, %4};"
+                                     :: "l"(m1 + off), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+                    else
+                        *reinterpret_cast<uint4*>(yp + off) = v;
+                }
             }
         }
     }
@@ -851,7 +857,7 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
     const int* __restrict__ sorted_ids,
     const int* __restrict__ block_experts,
     const int* __restrict__ live,
-    int NWT, int numel, int snake)
+    int NWT, int numel, int snake, __nv_bfloat16* m1, unsigned* m1_ep)
 {
     extern __shared__ __align__(1024) char smem[];
     const int tid = threadIdx.x;
@@ -1003,25 +1009,31 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
         const int nv = eff_nv<WSET>(wcode);
 #ifdef PGN_WSET
         if ((WSET & 16) && nv == 16)
-            item_body<GATED, NST, MODE, 16, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            item_body<GATED, NST, MODE, 16, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel, m1);
         else if ((WSET & 8) && nv == 32)
-            item_body<GATED, NST, MODE, 32, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            item_body<GATED, NST, MODE, 32, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel, m1);
         else if ((WSET & 1) && nv == 64)
-            item_body<GATED, NST, MODE, 64, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            item_body<GATED, NST, MODE, 64, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel, m1);
         else
-            item_body<GATED, NST, MODE, XNT, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            item_body<GATED, NST, MODE, XNT, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel, m1);
 #else   // PGN_WSET
         if ((WSET & 1) && nv == 64)
-            item_body<GATED, NST, MODE, 64, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            item_body<GATED, NST, MODE, 64, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel, m1);
         else if ((WSET & 2) && nv == 128)
-            item_body<GATED, NST, MODE, 128, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            item_body<GATED, NST, MODE, 128, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel, m1);
         else if ((WSET & 4) && nv == 192)
-            item_body<GATED, NST, MODE, 192, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            item_body<GATED, NST, MODE, 192, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel, m1);
         else
-            item_body<GATED, NST, MODE, 256, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel);
+            item_body<GATED, NST, MODE, 256, PAIR64>(c, acc, bA, bB, pm, wt, gsv, rids, out, NWT, numel, m1);
 #endif  // PGN_WSET
     }
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
+    if (!GATED && m1_ep != nullptr) {                   // M1: one release per CTA on every rank's epoch word
+        named_bar_sync(3, 256);
+        if (c.ctid == 0)
+            asm volatile("fence.acq_rel.sys;\n\tmultimem.red.release.sys.global.add.u32 [%0], %1;"
+                         :: "l"(m1_ep), "r"(1u) : "memory");
+    }
 }
 
 
@@ -1608,7 +1620,7 @@ void gather_norm(torch::Tensor x, torch::Tensor gamma, double eps, torch::Tensor
 template <int GATED, int NST, int MODE, int WSET, int PAIR64 = 1, int SPL = 0>
 static void launch(const torch::Tensor& xg, const torch::Tensor& wsf, const float* gs, void* out,
                    const int* sorted_ids, const torch::Tensor& block_experts, const torch::Tensor& live,
-                   int numel, int grid, int snake, bool pdl) {
+                   int numel, int grid, int snake, bool pdl, int64_t m1 = 0, int64_t m1_ep = 0) {
     auto fn = pgk::pg_gemm<GATED, NST, MODE, WSET, PAIR64, SPL>;
     constexpr int smem = pgk::smem_bytes<GATED, MODE>(NST);
     static bool set = false;
@@ -1620,7 +1632,8 @@ static void launch(const torch::Tensor& xg, const torch::Tensor& wsf, const floa
     TORCH_CHECK(wsf.size(2) == pgk::NKT && wsf.size(3) == pgk::WSB, "pg: wsf layout");
     pg_launch(fn, dim3(grid > 0 ? grid : pg_num_sms()), dim3(384), smem, pdl,
               reinterpret_cast<const char*>(xg.data_ptr()), reinterpret_cast<const char*>(wsf.data_ptr()),
-              gs, out, sorted_ids, block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, numel, snake);
+              gs, out, sorted_ids, block_experts.data_ptr<int>(), live.data_ptr<int>(), NWT, numel, snake,
+              reinterpret_cast<__nv_bfloat16*>(m1), reinterpret_cast<unsigned*>(m1_ep));
 }
 
 // snake item order for small calls (few items per CTA): tokens = numel / 8 <= pgk_snake_max_t
@@ -1641,7 +1654,8 @@ void gg1(torch::Tensor xg, torch::Tensor wsf, torch::Tensor gs, torch::Tensor in
 }
 
 void gg2(torch::Tensor xg, torch::Tensor wsf, torch::Tensor y, torch::Tensor sorted_ids,
-         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl) {
+         torch::Tensor block_experts, torch::Tensor live, int64_t numel, int64_t cfg, int64_t grid, int64_t pdl,
+         int64_t m1, int64_t m1_ep) {
     TORCH_CHECK(cfg == 350, "pg: only cfg 350 is built");
     const int snake = (numel / 8 <= pgk_snake_max_t) ? 1 : 0;
 #ifdef PGN_WSET
@@ -1649,7 +1663,85 @@ void gg2(torch::Tensor xg, torch::Tensor wsf, torch::Tensor y, torch::Tensor sor
 #else   // PGN_WSET
     launch<0, 5, 0, 3>(xg, wsf, nullptr, y.data_ptr(), sorted_ids.data_ptr<int>(), block_experts, live,
 #endif  // PGN_WSET
-                       (int)numel, grid, snake, pdl != 0);
+                       (int)numel, grid, snake, pdl != 0, m1, m1_ep);
+}
+
+// M1 receiver (OKC_SW_M1): every rank's gg2 multicast its route rows into this rank's slot buffer [T * 8, 4096] and
+// released once per CTA; spin (ld.acquire.sys) until `want` releases, then per token the 8-slot fp32 sum of
+// post-expert-normed (rms_norm(w * y) / rms_norm(y) * w), score-weighted rows: the combined MoE output, the same on
+// every rank (no all-reduce). The last CTA resets this rank's epoch word. Rows stay packed bf16 (2 CTAs / SM).
+__device__ __forceinline__ float2 m1_bf2(unsigned u) { return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u)); }
+__global__ void __launch_bounds__(512, 2) m1_recv_kernel(const __nv_bfloat16* __restrict__ y, const float* __restrict__ s,
+                                                         const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
+                                                         float eps, int wfirst, unsigned* __restrict__ epoch, unsigned want) {
+    const int tok = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
+    __shared__ float red[16][8];
+    __shared__ float tot[8];
+    if (tid == 0) {
+        unsigned have;
+        do {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(have) : "l"(epoch) : "memory");
+        } while (have < want);
+    }
+    __syncthreads();
+    const uint4 wr = *reinterpret_cast<const uint4*>(w + tid * 8);
+    const unsigned wu[4] = {wr.x, wr.y, wr.z, wr.w};
+    uint4 xr[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) xr[k] = __ldcg(reinterpret_cast<const uint4*>(y + ((size_t)tok * 8 + k) * 4096 + tid * 8));
+    float ss[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const unsigned xu[4] = {xr[k].x, xr[k].y, xr[k].z, xr[k].w};
+        float a = 0.f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float2 f = m1_bf2(xu[i]);
+            if (wfirst) { const float2 g = m1_bf2(wu[i]); f.x *= g.x; f.y *= g.y; }
+            a += f.x * f.x + f.y * f.y;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        ss[k] = a;
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int k = 0; k < 8; k++) red[wp][k] = ss[k];
+    }
+    __syncthreads();
+    if (tid < 8) {
+        float t = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; i++) t += red[i][tid];
+        tot[tid] = t;
+    }
+    __syncthreads();
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const float rk = rsqrtf(tot[k] * (1.0f / 4096) + eps) * s[tok * 8 + k];
+        const unsigned xu[4] = {xr[k].x, xr[k].y, xr[k].z, xr[k].w};
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float2 f = m1_bf2(xu[i]), g = m1_bf2(wu[i]);
+            acc[2 * i] += (f.x * g.x) * rk;
+            acc[2 * i + 1] += (f.y * g.y) * rk;
+        }
+    }
+    uint4 o;
+    __nv_bfloat162* ob = reinterpret_cast<__nv_bfloat162*>(&o);
+#pragma unroll
+    for (int i = 0; i < 4; i++) ob[i] = __floats2bfloat162_rn(acc[2 * i], acc[2 * i + 1]);
+    *reinterpret_cast<uint4*>(out + (size_t)tok * 4096 + tid * 8) = o;
+    if (tid == 0 && atomicAdd(epoch + 1, 1u) == gridDim.x - 1) { epoch[0] = 0; epoch[1] = 0; }
+}
+
+void m1_recv(torch::Tensor y, torch::Tensor s, torch::Tensor w, torch::Tensor out, double eps, int64_t wfirst,
+             int64_t epoch, int64_t want) {
+    pg_launch(m1_recv_kernel, dim3((unsigned)out.size(0)), dim3(512), 0, true,
+              reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), (const float*)s.data_ptr<float>(),
+              reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+              (float)eps, (int)wfirst, reinterpret_cast<unsigned*>(epoch), (unsigned)want);
 }
 """
 

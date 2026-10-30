@@ -215,7 +215,7 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=
     inter_t = torch.empty((num_pid_m * 64 * bm * 64,), dtype=torch.bfloat16, device=x.device)
     ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, grid, 0)
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
-    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid, 0)
+    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid, 0, 0, 0)
     return y
 
 
@@ -225,7 +225,8 @@ SMALL_MAX_ROUTES = 2048
 ROUTE_MAX_ROUTES = 24576
 
 
-def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, gs13, wsf2, pdl, bm=_BLOCK_M, rep=None):
+def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, gs13, wsf2, pdl, bm=_BLOCK_M, rep=None,
+                     m1=None):
     """Verify / decode front end of grouped_pg: x [T, 4096] bf16 BEFORE the pre-expert RMSNorm, topk_ids
     [T, 8] int32 global ids, expert_map [E] int32 global -> local slot (-1 remote; the static home map or this
     forward's balancer map) or None. One pg_route launch replaces the int32 cast, the expert-map gather,
@@ -235,6 +236,8 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     bm = 128 runs the narrow build's front end and kernels (block_m(T)). norm_weight None: x is already normed
     (pg_gather; extends up to ROUTE_MAX_ROUTES). rep = (replica table, rank): pg_route runs the replica balancer itself
     (pg_rep_assign's decision; rank + 8: the extend balancer, align_local's with a table) and expert_map is not read.
+    m1 = (slot multicast address, epoch multicast address): gg2 multicasts its rows into every rank's slot buffer instead
+    of y (okc_patch.m1; y is then not written).
     -> (y [T*8, 4096] bf16 as grouped_pg, local_ids [T, 8] int32: the finalize's slot expert ids)."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
@@ -258,6 +261,7 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
         ext.gather_norm(x, norm_weight, norm_eps, xg_t, sorted_ids, live, numel, p, PG_GN_SPLIT)
     inter_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
     ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, 0, p)
-    y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=dev)
-    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0, p)
+    y = torch.empty((numel if m1 is None else 1, 4096), dtype=torch.bfloat16, device=dev)
+    m1a, m1e = m1 if m1 is not None else (0, 0)
+    ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0, p, m1a, m1e)
     return y, local_ids
