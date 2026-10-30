@@ -1215,6 +1215,9 @@ class MuseSpark1xMoE(nn.Module):
             output = self.experts(
                 full_input, full_scores, full_ids, self.experts.post_expert_norm
             )
+        if getattr(self.experts, "_okc_m1rs_shard", False):   # okc_patch.m1rs: the receiver returned this rank's shard
+            self.experts._okc_m1rs_shard = False
+            return output
         output = output.contiguous()
         if okc_patch.SW_EXT_RS:   # extends: ld_reduce over the symmetric buffer (okc_patch/ext_coll.py)
             from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll

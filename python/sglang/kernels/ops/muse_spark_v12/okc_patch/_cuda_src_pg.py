@@ -662,6 +662,10 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
     } else {
         const float sc2 = 256.0f;                        // 2^8 decode comp (bf16 intermediate: no headroom)
         __nv_bfloat16* yp = reinterpret_cast<__nv_bfloat16*>(out);
+#ifdef PG_M1RS   // rid * rs_mg >> 40 == rid / rs_rows exactly (rid, rs_rows < 2^17)
+        const unsigned rs_rows = (unsigned)numel >> 3;
+        const unsigned long long rs_mg = ((1ull << 40) + rs_rows - 1) / (rs_rows ? rs_rows : 1u);
+#endif
         const char* epp = c.smem + (epi - c.sbase);
 #ifdef PGN_WSET
         constexpr int NPS = (NV + 63) / 64, NSG = NV >= 64 ? 4 : NV / 16;   // passes, x4 groups per pass
@@ -709,6 +713,14 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
                         asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1, %2, %3, %4};"
                                      :: "l"(m1 + off), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
                     else
+#endif
+#ifdef PG_M1RS   // M1-RS (its own builds): the row goes to its token's home rank (SP shard rid / (numel / 8))
+                    if (m1 != nullptr) {
+                        const int home = (int)(((unsigned long long)rid * rs_mg) >> 40);
+                        __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(
+                            __ldg(reinterpret_cast<const unsigned long long*>(m1) + home));
+                        *reinterpret_cast<uint4*>(dst + (off - (size_t)home * rs_rows * (NWT * 128))) = v;
+                    } else
 #endif
                         *reinterpret_cast<uint4*>(yp + off) = v;
                 }
@@ -1030,8 +1042,8 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
 #endif  // PGN_WSET
     }
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
-#ifdef PGN_XNT
-    if (!GATED && m1_ep != nullptr) {                   // M1: one release per CTA on every rank's epoch word
+#if defined(PGN_XNT) || defined(PG_M1RS)
+    if (!GATED && m1_ep != nullptr) {                   // M1 / M1-RS: one release per CTA on every rank's epoch word
         named_bar_sync(3, 256);
         if (c.ctid == 0)
             asm volatile("fence.acq_rel.sys;\n\tmultimem.red.release.sys.global.add.u32 [%0], %1;"

@@ -91,6 +91,11 @@ SW_ST_NORM_FOLD = _flag("OKC_SW_ST_NORM_FOLD", "1")
 SW_M1 = _flag("OKC_SW_M1", "0")
 M1_MIN_T = int(os.environ.get("OKC_M1_MIN_T", "73"))
 M1_MAX_T = int(os.environ.get("OKC_M1_MAX_T", "256"))
+# M1-RS (okc_patch/m1rs.py): the SP prefill / extend MoE combine from gg2's epilogue in the reduce-scatter form (each row
+# to its token's home rank + a receiver there; no finalize / reduce-scatter) for gathered calls of M1RS_MIN_T..MAX_T tokens
+SW_M1RS = _flag("OKC_SW_M1RS", "0")
+M1RS_MIN_T = int(os.environ.get("OKC_M1RS_MIN_T", "512"))
+M1RS_MAX_T = int(os.environ.get("OKC_M1RS_MAX_T", "16384"))
 # with the fold on, the pooler's gather emits the pre-expert norm (once per token, same values; court C39)
 SW_AG_PRENORM = _flag("OKC_SW_AG_PRENORM", "1")
 # st runs pg_rep_assign's balancer (or the home map) in its own CTAs, saving that launch (bit-identical).
@@ -322,7 +327,7 @@ FU_MERGE_MIN_LOAD = int(os.environ.get("OKC_FU_MERGE_MIN_LOAD", "9"))
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_FIRST_VERIFY", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "ADAPT_THETA", "ADAPT_MAX_SWAPS", "ADAPT_TRICKLE", "ADAPT_FULL_GROWTH", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_AG_PRENORM", "SW_M1", "M1_MIN_T", "M1_MAX_T", "SW_ST_REP_FOLD",
+           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_AG_PRENORM", "SW_M1", "M1_MIN_T", "M1_MAX_T", "SW_M1RS", "M1RS_MIN_T", "M1RS_MAX_T", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD", "PG_ROUTE_REPX",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",

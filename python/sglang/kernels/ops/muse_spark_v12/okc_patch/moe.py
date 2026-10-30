@@ -382,12 +382,17 @@ def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps,
         from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
 
         m1 = okc_m1.slot(layer, x.shape[0], x.device)
+    rs = _m1rs(layer, x, bm) if m1 is None else None
     y, local_ids = pg_moe.grouped_pg_small(
         x, topk_ids, emap, rep=rep,
         norm_weight=norm_weight, norm_eps=norm_eps,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=pdl and _sw.SW_PDL,
-        bm=bm, m1=None if m1 is None else (m1[1], m1[3]),
+        bm=bm, m1=None if m1 is None else (m1[1], m1[3]), rs=None if rs is None else (rs[1].data_ptr(), rs[3]),
     )
+    if rs is not None:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import m1rs as okc_m1rs
+
+        return okc_m1rs.receive(layer, rs, topk_scores)
     if m1 is not None:
         out = torch.empty_like(x)
         pg_moe._ext(bm).m1_recv(m1[0][: x.shape[0] * 8], topk_scores.float().contiguous(),
@@ -441,12 +446,28 @@ def finalize_routes(layer, y, topk_scores, local_ids):
     )
 
 
+def _m1rs(layer, x, bm):
+    """okc_patch.m1rs's slot for an SP call on pg's 256- / 128-token-block builds, else None."""
+    if not _sw.SW_M1RS or bm == 64:
+        return None
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import m1rs as okc_m1rs
+
+    return okc_m1rs.slot(layer, x.shape[0], x.device)
+
+
 def _moe_pg(layer, x, topk_scores, topk_ids, state):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
     prep = pg_prep(layer, topk_ids)
+    bm = pg_moe.block_m(x.shape[0])
+    rs = _m1rs(layer, x, bm)
     y = pg_moe.grouped_pg(
         x, *prep[1:],
-        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], bm=pg_moe.block_m(x.shape[0]),
+        wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], bm=bm,
+        rs=None if rs is None else (rs[1].data_ptr(), rs[3]),
     )
+    if rs is not None:   # M1-RS: the receiver already summed this rank's shard over the ranks
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import m1rs as okc_m1rs
+
+        return okc_m1rs.receive(layer, rs, topk_scores)
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, prep[0])
