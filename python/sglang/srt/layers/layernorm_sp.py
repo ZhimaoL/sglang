@@ -189,6 +189,13 @@ def initialize_layernorm_sp(*, model_config) -> None:
         if want and not _okc_hopper.symm_ok:
             logger.warning("OKC SP: symm-mem fused linears unavailable on this node; using NCCL collectives.")
         _okc_hopper.symm_min_tokens = SP_SYMM_MIN_TOKENS
+        if SP_AG_ROWSFIRST and _okc_hopper.symm_ok:
+            # rows-first's scores / ids buffer at boot: ext_coll's agreed setup (local allocation agreed before the
+            # rendezvous); a failure on any rank leaves it None on all of them, and the MoE section then gathers as usual
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
+
+            ext_coll._buffer(get_parallel().tp_group.device_group.group_name,
+                             torch.device("cuda", torch.cuda.current_device()))
     get_flags().sp.enabled = bool(
         (get_parallel().enable_layernorm_sp or _okc_hopper.active)
         and architectures
