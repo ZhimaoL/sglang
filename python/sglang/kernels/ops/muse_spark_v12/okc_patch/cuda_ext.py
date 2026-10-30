@@ -288,7 +288,7 @@ def st_fused_ext():
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_stf import _CUDA_SRC_STF
 
                 _ST_FUSED_EXT = _load_inline(
-                    name="okc_st_moe_c8_s16_e64_f1",
+                    name="okc_st_moe_c8_s16_e64_f2",
                     cpp_sources="void st_moe_fused(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, torch::Tensor, torch::Tensor, int64_t, torch::Tensor, double, torch::Tensor, "
                     "int64_t, int64_t, torch::Tensor);",
