@@ -17,6 +17,7 @@ replica).
 import torch
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL
+from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow64_ext, pg_narrow_ext
 
 _BLOCK_M = 256
@@ -193,11 +194,13 @@ def split_replicas(topk_ids, tab, rank):
     return out
 
 
-def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=_BLOCK_M):
+def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=_BLOCK_M, rs=None):
     """x [T, 4096] bf16 -> y [T*8, 4096] bf16 per-route expert outputs (rows of non-local routes stay
     unwritten; the caller's finalize masks them by slot_expert_ids). sorted_ids / block_experts / n_padded
     come from moe_align_block_size(local_ids, bm, ...) or align_local with -1 for non-local routes; bm 256 runs the
-    shipped build, 128 the narrow one (block_m(T)). The local slot count (32 home + replicas) is wsf13's."""
+    shipped build, 128 the narrow one (block_m(T)). The local slot count (32 home + replicas) is wsf13's.
+    rs = (home table address, epoch multicast address): M1-RS (okc_patch.m1rs), gg2 from its own build stores each row
+    into its token's home rank's slot buffer instead of y (y is then not written)."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
     num_pid_m = block_experts.shape[0]
@@ -214,6 +217,12 @@ def grouped_pg(x, sorted_ids, block_experts, n_padded, *, wsf13, gs13, wsf2, bm=
     ext.gather(x, xg_t, sorted_ids, live, numel, 0)
     inter_t = torch.empty((num_pid_m * 64 * bm * 64,), dtype=torch.bfloat16, device=x.device)
     ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, grid, 0)
+    if rs is not None:
+        assert grid == 0, "M1-RS counts one release per SM-wide persistent CTA"
+        y = torch.empty((1, 4096), dtype=torch.bfloat16, device=x.device)
+        cuda_ext.pg_rs_ext(bm != _BLOCK_M).gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0, 0,
+                                                rs[0], rs[1])
+        return y
     y = torch.empty((numel, 4096), dtype=torch.bfloat16, device=x.device)
     ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, grid, 0, 0, 0)
     return y
@@ -226,7 +235,7 @@ ROUTE_MAX_ROUTES = 24576
 
 
 def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, gs13, wsf2, pdl, bm=_BLOCK_M, rep=None,
-                     m1=None):
+                     m1=None, rs=None):
     """Verify / decode front end of grouped_pg: x [T, 4096] bf16 BEFORE the pre-expert RMSNorm, topk_ids
     [T, 8] int32 global ids, expert_map [E] int32 global -> local slot (-1 remote; the static home map or this
     forward's balancer map) or None. One pg_route launch replaces the int32 cast, the expert-map gather,
@@ -237,7 +246,7 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     (pg_gather; extends up to ROUTE_MAX_ROUTES). rep = (replica table, rank): pg_route runs the replica balancer itself
     (pg_rep_assign's decision; rank + 8: the extend balancer, align_local's with a table) and expert_map is not read.
     m1 = (slot multicast address, epoch multicast address): gg2 multicasts its rows into every rank's slot buffer instead
-    of y (okc_patch.m1; y is then not written).
+    of y (okc_patch.m1; y is then not written). rs: M1-RS as in grouped_pg (extends on the narrow build).
     -> (y [T*8, 4096] bf16 as grouped_pg, local_ids [T, 8] int32: the finalize's slot expert ids)."""
     num_tokens = x.shape[0]
     numel = num_tokens * 8
@@ -261,7 +270,11 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
         ext.gather_norm(x, norm_weight, norm_eps, xg_t, sorted_ids, live, numel, p, PG_GN_SPLIT)
     inter_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
     ext.gg1(xg_t, wsf13, gs13, inter_t, block_experts, live, numel, _CFG, 0, p)
-    y = torch.empty((numel if m1 is None else 1, 4096), dtype=torch.bfloat16, device=dev)
+    y = torch.empty((numel if m1 is None and rs is None else 1, 4096), dtype=torch.bfloat16, device=dev)
+    if rs is not None:
+        cuda_ext.pg_rs_ext(bm != _BLOCK_M).gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0, p,
+                                                rs[0], rs[1])
+        return y, local_ids
     m1a, m1e = m1 if m1 is not None else (0, 0)
     ext.gg2(inter_t, wsf2, y, sorted_ids, block_experts, live, numel, _CFG, 0, p, m1a, m1e)
     return y, local_ids

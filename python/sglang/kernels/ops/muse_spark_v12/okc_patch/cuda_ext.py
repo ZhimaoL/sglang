@@ -9,6 +9,7 @@ _lock = threading.Lock()
 _PG_EXT = None
 _PG_NARROW_EXT = None
 _PG_NARROW64_EXT = None
+_PG_RS_EXT = {}
 _ST_EXT = None
 _PROJ_EXT = None
 _SMALLM_EXT = None
@@ -190,6 +191,23 @@ def pg_narrow64_ext():
                     ["-DPGN_WSET=24", "-DPGN_NST=7", "-DPGN_XNT=64"],
                 )
     return _PG_NARROW64_EXT
+
+
+def pg_rs_ext(narrow: bool):
+    """M1-RS (okc_patch.m1rs): gg2 + the receiver of the main (256-token blocks) or narrow (128) build with -DPG_M1RS,
+    gg2's rows going to their tokens' home ranks. Separate modules, built only when OKC_SW_M1RS is on, so the served
+    builds carry no M1-RS code."""
+    ext = _PG_RS_EXT.get(narrow)
+    if ext is None:
+        with _lock:
+            ext = _PG_RS_EXT.get(narrow)
+            if ext is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
+
+                ext = _PG_RS_EXT[narrow] = _pg_load(
+                    "okc_pg_moe_n17x128s7_int_d3_m1rs" if narrow else "okc_pg_moe_c350_int_d3_m1rs", _CUDA_SRC,
+                    ["gg2", "m1_recv"], ["-DPGN_WSET=17", "-DPGN_NST=7", "-DPG_M1RS"] if narrow else ["-DPG_M1RS"])
+    return ext
 
 
 def st_ext():
