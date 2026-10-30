@@ -637,9 +637,39 @@ class MuseSpark1xMLP(nn.Module):
 #   forwards per layer); a chunk's counts = the ranks' sum when sp, else rank 0's.
 # A failed save logs once and turns the capture off. Feeds the EP-placement / replica fits (muse-opt
 # serving/kernels/moe-int/topk_capture_read.py, prefill_counts_read.py).
+# - OKC_TOPK_DUMP_SP_IDS=N (with the dir): also the per-token ids of the first N SP forwards per layer, every rank (its
+#   shard): <dir>/ids_rank<r>.pt: {layer: {"n": [F] shard rows, "T": [F] chunk tokens, "ids": int16 [F, max n, 8]
+#   (-1 pad)}}, rewritten every 8 SP forwards of the lowest layer (the dedup-AG check, muse-opt
+#   serving/kernels/moe-graft/dedup_f.py --cap).
 _OKC_TOPK_DUMP_DIR = os.environ.get("OKC_TOPK_DUMP_DIR")
+_OKC_TOPK_SP_IDS = int(os.environ.get("OKC_TOPK_DUMP_SP_IDS", "0"))
 _okc_topk: dict = {}
 _okc_cnt: dict = {}
+_okc_spids: dict = {}
+
+
+def _okc_dump_spids(layer_idx: int, topk_ids: torch.Tensor, rank: int) -> None:
+    global _OKC_TOPK_SP_IDS
+    rows = _okc_spids.setdefault(layer_idx, [])
+    if len(rows) >= _OKC_TOPK_SP_IDS:
+        return
+    rows.append((topk_ids.shape[0], int(layernorm_sp.sp_num_tokens()), topk_ids.to(torch.int16).cpu()))
+    if layer_idx == min(_okc_spids) and (len(rows) % 8 == 0 or len(rows) == _OKC_TOPK_SP_IDS):
+        try:
+            out = {}
+            for li, v in _okc_spids.items():
+                m = max(x[0] for x in v)
+                ids = torch.full((len(v), m, 8), -1, dtype=torch.int16)
+                for j, x in enumerate(v):
+                    ids[j, : x[0]] = x[2]
+                out[li] = {"n": torch.tensor([x[0] for x in v]), "T": torch.tensor([x[1] for x in v]), "ids": ids}
+            path = os.path.join(_OKC_TOPK_DUMP_DIR, f"ids_rank{rank}.pt")
+            os.makedirs(_OKC_TOPK_DUMP_DIR, exist_ok=True)
+            torch.save(out, path + ".tmp")
+            os.replace(path + ".tmp", path)
+        except Exception as e:
+            logger.warning("OKC_TOPK_DUMP_SP_IDS: save failed (%r); SP id capture off", e)
+            _OKC_TOPK_SP_IDS = 0
 
 
 def _okc_dump_topk(layer_idx: int, topk_ids: torch.Tensor, rank: int, sp: bool) -> None:
@@ -647,6 +677,8 @@ def _okc_dump_topk(layer_idx: int, topk_ids: torch.Tensor, rank: int, sp: bool) 
     n = topk_ids.shape[0]
     if not _OKC_TOPK_DUMP_DIR or torch.cuda.is_current_stream_capturing():
         return
+    if sp and _OKC_TOPK_SP_IDS > 0:
+        _okc_dump_spids(layer_idx, topk_ids, rank)
     if n <= 256 and not sp:
         if rank != 0:
             return
