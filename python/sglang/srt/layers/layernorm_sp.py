@@ -101,14 +101,29 @@ def okc_hopper_sp_symm() -> bool:
     return _okc_hopper.symm
 
 
+def _okc_symm_local_ok() -> bool:
+    """A tiny symmetric allocation on this rank alone (no collective), freed again."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    t = symm_mem.empty(64, dtype=torch.uint8, device=torch.device("cuda", torch.cuda.current_device()))
+    del t
+    return True
+
+
 def _okc_symm_probe() -> bool:
     """Run both torch symm-mem fused ops once on a tiny problem across the TP group and check the result, then
     agree: the MIN of every rank's success flag over the CPU group, so all ranks take the same path. A node where
-    symm-mem setup or IPC fails runs the NCCL participant linears instead of failing at the first long prefill."""
+    symm-mem setup or IPC fails runs the NCCL participant linears instead of failing at the first long prefill.
+    First, agreed before any collective: a local symmetric allocation, so a rank whose allocation fails alone does
+    not leave its peers waiting inside the fused ops (the MIN after them cannot help a rank that never returns)."""
     import torch.distributed as dist
+
+    from sglang.kernels.ops.muse_spark_v12.okc_patch.ext_coll import agreed
 
     tp_group = get_parallel().tp_group
     world = tp_group.world_size
+    if agreed(_okc_symm_local_ok) is None:
+        return False
     ok = 1
     try:
         group_name = tp_group.device_group.group_name
