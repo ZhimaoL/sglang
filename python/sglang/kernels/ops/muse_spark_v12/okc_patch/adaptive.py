@@ -381,6 +381,30 @@ def full_refresh(refreshes, seen, seen_full, growth):
     return refreshes == 0 or (growth > 0 and seen >= growth * seen_full)
 
 
+# The decision's child (python -c _CHILD): its first statement puts it under SCHED_IDLE, before it imports the package
+# (sglang, transformers, torch), and its fork pool inherits that, so the searches run on otherwise idle CPUs only
+# (os.nice(19) where SCHED_IDLE is refused). No preexec_fn, so Popen takes CPython's vfork path: the scheduler thread
+# waits only until the exec. A preexec_fn forced a fork() of the ~50 GB scheduler, on every rank at every refresh
+# (0.3-0.4 s stalls, muse-opt docs/serving/review-1030/F4-C1.md).
+_CHILD = ("import os\n"
+          "try:\n"
+          "    os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))\n"
+          "except (AttributeError, OSError):\n"
+          "    os.nice(19)\n"
+          "import runpy\n"
+          "runpy.run_module(%r, run_name='__main__', alter_sys=True)\n")
+
+
+def _spawn(fin, fout):
+    """This module's __main__ block (the decision of the jobs in fin, written to fout) in a child interpreter."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
+    return subprocess.Popen([sys.executable, "-c", _CHILD % __name__, fin, fout], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def _trigger():
     sw = _knobs()
     st = _S
@@ -419,15 +443,11 @@ def _trigger():
                      sw.ADAPT_THETA, sw.ADAPT_MAX_SWAPS, full))
     # a plain child interpreter (not multiprocessing: the scheduler process may be daemonic), numpy single-threaded
     import pickle
-    import subprocess
-    import sys
     import tempfile
 
     f = tempfile.NamedTemporaryFile(prefix="okc_adapt_", suffix=".pkl", delete=False)
     pickle.dump(jobs, f); f.close()
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
-    proc = subprocess.Popen([sys.executable, "-m", __name__, f.name, f.name + ".out"], env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=lambda: os.nice(10))
+    proc = _spawn(f.name, f.name + ".out")
     st.pending = (proc, f.name, f.name + ".out")
     st.tokens = 0
     st.full = full
