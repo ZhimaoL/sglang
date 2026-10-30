@@ -457,10 +457,26 @@ def _m1rs(layer, x, bm):
     return okc_m1.rs_slot(layer, x.shape[0], x.device)
 
 
+def rows_first_prep(layer, topk_ids, pre_expert_norm=None):
+    """OKC_SP_AG_ROWSFIRST: pg_prep of a gathered call from its ids alone, made while the rows are still in flight, and
+    kept on the layer for that call's _moe_pg (matched by the ids tensor). False when the call will not take pg_prep
+    (another path, or no pg state): the caller then runs the experts as usual."""
+    state = getattr(layer, "_okc_moe_state", None)
+    if state is None or not state["pg_only"]:
+        return False
+    path = dispatch_path(layer, topk_ids.shape[0], pre_expert_norm)
+    if not (path.startswith("local") or path.startswith("align")) or "narrow64" in path:
+        return False
+    layer._okc_prep = (topk_ids, pg_prep(layer, topk_ids))
+    return True
+
+
 def _moe_pg(layer, x, topk_scores, topk_ids, state):
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
-    prep = pg_prep(layer, topk_ids)
+    pre = getattr(layer, "_okc_prep", None)
+    layer._okc_prep = None
+    prep = pre[1] if pre is not None and pre[0] is topk_ids else pg_prep(layer, topk_ids)
     bm = pg_moe.block_m(x.shape[0])
     rs = _m1rs(layer, x, bm)
     y = pg_moe.grouped_pg(
