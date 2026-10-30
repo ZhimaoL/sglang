@@ -647,7 +647,18 @@ if __name__ == "__main__":   # the background decision: python -m ...okc_patch.a
 
     with open(sys.argv[1], "rb") as f:
         _jobs = pickle.load(f)
-    _res = _decide_many(_jobs)
+    # one process per layer job (this rank's ~8 layers): every layer's search is self-contained (its own seed), so the
+    # plans equal the serial loop's, ~8x sooner; capped by OKC_ADAPT_WORKERS and by the host's cores over the 8 ranks
+    _n = max(1, min(len(_jobs), int(os.environ.get("OKC_ADAPT_WORKERS", "8")), (os.cpu_count() or 8) // 8))
+    if _n > 1:
+        import multiprocessing as mp
+
+        _res = {}
+        with mp.get_context("fork").Pool(_n) as _pool:
+            for _part in _pool.map(_decide_many, [[j] for j in _jobs]):
+                _res.update(_part)
+    else:
+        _res = _decide_many(_jobs)
     with open(sys.argv[2] + ".tmp", "wb") as f:
         pickle.dump(_res, f)
     os.replace(sys.argv[2] + ".tmp", sys.argv[2])
