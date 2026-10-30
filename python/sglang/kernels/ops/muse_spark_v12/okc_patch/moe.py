@@ -390,9 +390,9 @@ def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps,
         bm=bm, m1=None if m1 is None else (m1[1], m1[3]), rs=None if rs is None else (rs[1].data_ptr(), rs[3]),
     )
     if rs is not None:
-        from sglang.kernels.ops.muse_spark_v12.okc_patch import m1rs as okc_m1rs
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
 
-        return okc_m1rs.receive(layer, rs, topk_scores)
+        return okc_m1.rs_receive(layer, rs, topk_scores)
     if m1 is not None:
         out = torch.empty_like(x)
         pg_moe._ext(bm).m1_recv(m1[0][: x.shape[0] * 8], topk_scores.float().contiguous(),
@@ -447,12 +447,12 @@ def finalize_routes(layer, y, topk_scores, local_ids):
 
 
 def _m1rs(layer, x, bm):
-    """okc_patch.m1rs's slot for an SP call on pg's 256- / 128-token-block builds, else None."""
+    """okc_patch.m1.rs_slot for an SP call on pg's 256- / 128-token-block builds, else None."""
     if not _sw.SW_M1RS or bm == 64:
         return None
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import m1rs as okc_m1rs
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
 
-    return okc_m1rs.slot(layer, x.shape[0], x.device)
+    return okc_m1.rs_slot(layer, x.shape[0], x.device)
 
 
 def _moe_pg(layer, x, topk_scores, topk_ids, state):
@@ -467,7 +467,7 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
         rs=None if rs is None else (rs[1].data_ptr(), rs[3]),
     )
     if rs is not None:   # M1-RS: the receiver already summed this rank's shard over the ranks
-        from sglang.kernels.ops.muse_spark_v12.okc_patch import m1rs as okc_m1rs
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
 
-        return okc_m1rs.receive(layer, rs, topk_scores)
+        return okc_m1.rs_receive(layer, rs, topk_scores)
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, prep[0])

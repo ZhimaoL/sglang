@@ -91,7 +91,7 @@ SW_ST_NORM_FOLD = _flag("OKC_SW_ST_NORM_FOLD", "1")
 SW_M1 = _flag("OKC_SW_M1", "0")
 M1_MIN_T = int(os.environ.get("OKC_M1_MIN_T", "73"))
 M1_MAX_T = int(os.environ.get("OKC_M1_MAX_T", "256"))
-# M1-RS (okc_patch/m1rs.py): the SP prefill / extend MoE combine from gg2's epilogue in the reduce-scatter form (each row
+# M1-RS (okc_patch/m1.py rs_*): the SP prefill / extend MoE combine from gg2's epilogue in the reduce-scatter form (each row
 # to its token's home rank + a receiver there; no finalize / reduce-scatter) for gathered calls of M1RS_MIN_T..MAX_T tokens
 SW_M1RS = _flag("OKC_SW_M1RS", "0")
 M1RS_MIN_T = int(os.environ.get("OKC_M1RS_MIN_T", "512"))
