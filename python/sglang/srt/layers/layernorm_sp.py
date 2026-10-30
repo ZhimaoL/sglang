@@ -286,6 +286,9 @@ def okc_boundary_mark(layer_id: int) -> None:
     if _BOUNDARY["ev"] is not None and not _BOUNDARY["fired"] and layer_id == _BOUNDARY["layer"]:
         _BOUNDARY["ev"].record()
         _BOUNDARY["fired"] = True
+        if not _BOUNDARY.get("logged"):
+            _BOUNDARY["logged"] = True
+            logger.info("OKC early chunk boundary active (event at layer %d).", layer_id)
 
 
 def okc_boundary_take() -> bool:
