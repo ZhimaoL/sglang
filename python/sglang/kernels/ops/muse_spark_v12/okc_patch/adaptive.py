@@ -149,13 +149,46 @@ def _draw_ext(q, T, kappa, F, rng):
 ROUTES_16K = 16384 * 8
 
 
-def _context(home, verify_counts, prefill_counts, seed, prefill_chunks, F_v, F_p, F_x):
+def live_groups(vhist):
+    """{verify bs: forwards} -> [(bs, forwards, metric, cost_passes)]: the st regime (T = 8 bs <= 64, passes) and the pg
+    regime (distinct experts) apart, each as at most 2 groups of adjacent batch sizes (the split with the least
+    count-weighted bs variance), each group at its count-weighted mean bs."""
+    out = []
+    for small in (True, False):
+        items = sorted((int(b), float(c)) for b, c in vhist.items() if c > 0 and (8 * int(b) <= 64) == small)
+        if not items:
+            continue
+        if len(items) <= 2:
+            bins = [[it] for it in items]
+        else:   # the 2-way split of adjacent sizes with the least count-weighted bs variance
+            def sse(g):
+                n = sum(c for _, c in g)
+                m = sum(b * c for b, c in g) / n
+                return sum(c * (b - m) ** 2 for b, c in g)
+            k = min(range(1, len(items)), key=lambda j: sse(items[:j]) + sse(items[j:]))
+            bins = [items[:k], items[k:]]
+        for g in bins:
+            n = sum(c for _, c in g)
+            bs = max(1, int(round(sum(b * c for b, c in g) / n)))
+            bs = min(bs, 8) if small else max(bs, 9)
+            out.append((bs, n, "passes", True) if small else (bs, n, "distinct", False))
+    return out
+
+
+def _context(home, verify_counts, prefill_counts, seed, prefill_chunks, F_v, F_p, F_x, live=None):
     """(J, p, q, candidates): the objective on this run's counts. prefill_chunks rows (per-forward route counts) are
-    scaled to one 16K forward each, the unit STRAG_CHUNKS counts."""
+    scaled to one 16K forward each, the unit STRAG_CHUNKS counts. live = {"vhist", "n_pre", "n_ext"} (OKC_ADAPT_OBJ=live):
+    the costs are weighted by the run's own forwards instead of the per-load constants, J in ms of slowest-rank time."""
     rng = np.random.default_rng(seed)
     p = np.asarray(verify_counts, float) + 1e-3; p /= p.sum()
     q = np.asarray(prefill_counts, float) + 1e-3; q /= q.sum()
-    vtr = [(route_counts(p, bs, 0.2, F, rng), w, met, cp) for (bs, w, met, cp), F in zip(GROUPS, F_v)]
+    if live is not None:
+        groups = live_groups(live["vhist"])
+        vtr = [(route_counts(p, bs, 0.2, 10, rng), n, met, cp) for bs, n, met, cp in groups]
+        w_p, w_x = float(live["n_pre"]), float(live["n_ext"])
+    else:
+        vtr = [(route_counts(p, bs, 0.2, F, rng), w, met, cp) for (bs, w, met, cp), F in zip(GROUPS, F_v)]
+        w_p, w_x = W_P * STRAG_CHUNKS, W_X
     if prefill_chunks is not None and len(prefill_chunks):
         ptr = np.asarray(prefill_chunks, float)
         ptr = np.round(ptr * (ROUTES_16K / np.maximum(ptr.sum(1, keepdims=True), 1.0)))
@@ -165,7 +198,7 @@ def _context(home, verify_counts, prefill_counts, seed, prefill_chunks, F_v, F_p
 
     def J(pairs):
         v = sum(w * rank_costs(c, home, pairs, met, cp).max(1).mean() / 1e3 for c, w, met, cp in vtr)
-        return v + W_P * STRAG_CHUNKS * strag_us(ptr, home, pairs) / 1e3 + W_X * extend_slowest(xtr, home, pairs) / 1e3
+        return v + w_p * strag_us(ptr, home, pairs) / 1e3 + w_x * extend_slowest(xtr, home, pairs) / 1e3
 
     cand = sorted(set(np.argsort(-p)[:32].tolist()) | set(np.argsort(-q)[:32].tolist()))
     return J, p, q, cand
@@ -219,13 +252,13 @@ def _refine(J, p, cand, home, cur, theta, max_swaps):
 
 
 def decide(home, verify_counts, prefill_counts, R, seed=0, prefill_chunks=None, F_v=(20, 20, 10, 10), F_p=16, F_x=8,
-           current=None, theta=0.0, max_swaps=4, full=True):
+           current=None, theta=0.0, max_swaps=4, full=True, live=None):
     """home [256] rank, the run's verify / prefill route counts [256] (+ per-forward prefill rows) -> R x 8
     (expert, rank) pairs in balancing order. With current pairs: the incremental search (theta = objective units per
     expert copy, at most max_swaps copies) and, if full, the from-scratch greedy too; the plan with the lower
     J + theta x copies (vs current) wins, current itself included."""
     home = np.asarray(home)
-    J, p, q, cand = _context(home, verify_counts, prefill_counts, seed, prefill_chunks, F_v, F_p, F_x)
+    J, p, q, cand = _context(home, verify_counts, prefill_counts, seed, prefill_chunks, F_v, F_p, F_x, live)
     if current is None:
         return _greedy(J, p, cand, home, R)
     cur = _order(current, p)
@@ -281,13 +314,15 @@ def _decide_many(jobs):
     """Background worker: [(layer, home, verify counts, ring counts, R, seed, current pairs, theta, max_swaps, full)]
     -> {layer: pairs}."""
     out = {}
-    for li, home, v, ring, R, seed, cur, theta, swaps, full in jobs:
+    for job in jobs:
+        li, home, v, ring, R, seed, cur, theta, swaps, full = job[:10]
+        live = job[10] if len(job) > 10 else None
         ring = np.asarray(ring, float)
         chunks = ring[ring.sum(1) > 0]
         pre = chunks.sum(0) if len(chunks) else np.ones(256)
         out[li] = decide(np.asarray(home), np.asarray(v, float), pre, R, seed=seed,
                          prefill_chunks=chunks if len(chunks) >= 4 else None,
-                         current=[tuple(x) for x in cur], theta=theta, max_swaps=swaps, full=full)
+                         current=[tuple(x) for x in cur], theta=theta, max_swaps=swaps, full=full, live=live)
     return out
 
 
@@ -307,6 +342,9 @@ class _State:
         self.queue = []             # [(layer, pairs)] decided, not applied yet (trickled: ADAPT_TRICKLE copies per forward)
         self.rec = None             # the refresh being applied (audit record)
         self.warm = False
+        self.vhist = {}             # OKC_ADAPT_OBJ=live: verify forwards per batch size since the last refresh (halved)
+        self.n_pre = 0.0            # ... prefill forwards (T >= ADAPT_MIN_T) in 16K-chunk equivalents
+        self.n_ext = 0              # ... extend forwards below ADAPT_MIN_T
 
 
 _S = _State()
@@ -339,11 +377,19 @@ def maybe_refresh(model_runner, forward_batch):
     mode = forward_batch.forward_mode
     if mode.is_target_verify():
         st.vtokens += int(forward_batch.input_ids.numel())
+        if sw.ADAPT_OBJ == "live":
+            b = int(forward_batch.batch_size)
+            st.vhist[b] = st.vhist.get(b, 0) + 1
     elif mode.is_extend():
         n = getattr(forward_batch, "extend_num_tokens", None)
         n = int(n if n is not None else forward_batch.input_ids.numel())
         st.tokens += n
         st.seen += n
+        if sw.ADAPT_OBJ == "live":
+            if n >= sw.ADAPT_MIN_T:
+                st.n_pre += n / 16384.0
+            else:
+                st.n_ext += 1
     if st.layers is None:
         st.layers = _collect(model_runner.model)
         if not st.layers:
@@ -409,6 +455,13 @@ def _trigger():
     full = full_refresh(st.refreshes, st.seen, st.seen_full, sw.ADAPT_FULL_GROWTH)
     if full:
         st.seen_full = st.seen
+    live = None
+    if sw.ADAPT_OBJ == "live":   # every rank saw the same forwards, so the weights agree without a collective
+        live = {"vhist": dict(st.vhist), "n_pre": st.n_pre, "n_ext": st.n_ext}
+        st.vhist = {b: c // 2 for b, c in st.vhist.items() if c // 2}
+        st.n_pre /= 2.0
+        st.n_ext //= 2
+    theta = sw.ADAPT_THETA_MS if live is not None else sw.ADAPT_THETA
     jobs = []
     for i, (li, m) in enumerate(st.layers):
         if i % world != rank:
@@ -416,7 +469,7 @@ def _trigger():
         R = len(m.replica_plan["order"]) // world
         cur = [list(x) for x in zip(m.replica_plan["order"], m.replica_plan["rank"])]
         jobs.append((li, list(m.replica_plan["home"]), Vh[i].tolist(), Rh[i].tolist(), R, 1000 + li, cur,
-                     sw.ADAPT_THETA, sw.ADAPT_MAX_SWAPS, full))
+                     theta, sw.ADAPT_MAX_SWAPS, full, live))
     # a plain child interpreter (not multiprocessing: the scheduler process may be daemonic), numpy single-threaded
     import pickle
     import subprocess
