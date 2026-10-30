@@ -172,6 +172,7 @@ def initialize_layernorm_sp(*, model_config) -> None:
             SW_EXT_RS,
             SW_M1,
             SW_M1RS,
+            SP_AG_ROWSFIRST,
         )
 
         _okc_hopper.min_tokens = SP_MIN_TOKENS
@@ -182,7 +183,7 @@ def initialize_layernorm_sp(*, model_config) -> None:
 
         # Every rank evaluates the same switches, so all of them enter the collective probe together. A failed probe
         # turns off every symm-mem path (the fused linears, ext_coll's multimem gather / reduce, the copy-engine ops).
-        want = SP_SYMM or SW_EXT_AG or SW_EXT_RS or SW_M1 or SW_M1RS
+        want = SP_SYMM or SW_EXT_AG or SW_EXT_RS or SW_M1 or SW_M1RS or SP_AG_ROWSFIRST
         _okc_hopper.symm_ok = want and _HAS_TORCH_SYMM_MEM_FUSED and _okc_symm_probe()
         _okc_hopper.symm = SP_SYMM and _okc_hopper.symm_ok
         if want and not _okc_hopper.symm_ok:
