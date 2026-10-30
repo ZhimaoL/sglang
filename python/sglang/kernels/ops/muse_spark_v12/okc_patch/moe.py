@@ -377,11 +377,11 @@ def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps,
 
     emap, rep = _small_map(layer, topk_ids)
     m1 = None
-    if _sw.SW_M1 and pdl:   # M1: gg2 multicasts the rows, the receiver combines; the caller skips the all-reduce
+    bm = pg_moe.block_m(x.shape[0])
+    if _sw.SW_M1 and pdl and bm == 64:   # M1 (pg's 64-block build): gg2 multicasts, the receiver combines, no all-reduce
         from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
 
         m1 = okc_m1.slot(layer, x.shape[0], x.device)
-    bm = pg_moe.block_m(x.shape[0])
     y, local_ids = pg_moe.grouped_pg_small(
         x, topk_ids, emap, rep=rep,
         norm_weight=norm_weight, norm_eps=norm_eps,
