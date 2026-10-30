@@ -886,7 +886,10 @@ class MuseSpark1xMoE(nn.Module):
             router_input,
             ar_workspace=ar_workspace,
         )
-        return self._reduce_and_unpool(output, already_reduced=ar_workspace is not None)
+        m1 = getattr(self.experts, "_okc_m1_reduced", False)   # okc_patch.m1: the receiver already combined the ranks
+        if m1:
+            self.experts._okc_m1_reduced = False
+        return self._reduce_and_unpool(output, already_reduced=ar_workspace is not None or m1)
 
     def _reduce_and_unpool(
         self, output: torch.Tensor, *, already_reduced: bool = False
