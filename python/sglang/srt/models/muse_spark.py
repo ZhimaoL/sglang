@@ -1176,7 +1176,7 @@ class MuseSpark1xMoE(nn.Module):
         """SP prefill without the A2A dispatcher: every rank runs its local experts on the whole
         sequence, exactly the non-SP EP, and reduce-scatters the partial sums back to the shards.
         Shards are [M_pad / tp, ...] in rank order, so gathering along dim 0 restores token order.
-        rows_first: (gathered rows, their stream) from _okc_rows_first; the scores / ids follow by _okc_ids_gather."""
+        rows_first: (gathered rows, their stream, the shard) from _okc_rows_first; the scores / ids follow by _okc_ids_gather."""
         global _okc_sp_logged
         if not _okc_sp_logged:
             _okc_sp_logged = True
@@ -1202,12 +1202,10 @@ class MuseSpark1xMoE(nn.Module):
         if rows_first is not None:
             from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
 
-            full_input, rows_stream = rows_first
+            full_input, rows_stream, _ = rows_first   # the shard stays referenced until the join below
             full_scores, full_ids = _okc_ids_gather(tp_group, topk_scores, topk_ids)
             okc_moe.rows_first_prep(self.experts, full_ids)   # pg's routing prep (ids only) under the rows
             torch.cuda.current_stream().wait_stream(rows_stream)
-            if not torch.cuda.is_current_stream_capturing():
-                full_input.record_stream(torch.cuda.current_stream())
             grouped = (full_input, full_scores, full_ids)
         else:
             grouped = _okc_push_gather(tp_group, expert_input, topk_scores, topk_ids)
@@ -1271,14 +1269,20 @@ _okc_rf_state: dict = {}
 
 def _okc_rows_first(moe, x):
     """OKC_SP_AG_ROWSFIRST: start the SP MoE section's row gather [S, 4096] -> [world S, 4096] on its own stream now,
-    on the pynccl communicator _okc_grouped_gather uses -> (rows, stream), or None (the section gathers as usual).
-    Only for pg-only fp4 layers, gathered calls of SP_AG_ROWSFIRST_MIN..MAX_TOKENS rows, and when the scores / ids can
-    go by the symmetric-memory gather (_okc_ids_buffer). The predicate is the same on every rank."""
+    on the pynccl communicator _okc_grouped_gather uses -> (rows, stream, shard), or None (the section gathers as usual).
+    The rows land in the boot-time buffer (layernorm_sp's rows_buf): the next call's gather is queued on the stream after
+    a wait on the current one, so it runs after this call's consumers; the caller holds the shard until it joins the
+    stream, so neither tensor needs record_stream. Only for pg-only fp4 layers, gathered calls of
+    SP_AG_ROWSFIRST_MIN..MAX_TOKENS rows, and when the scores / ids can go by the symmetric-memory gather
+    (_okc_ids_buffer). The predicate is the same on every rank."""
     tp_group = get_tp_group()
     pyn, world = tp_group.pynccl_comm, tp_group.world_size
     state = getattr(moe.experts, "_okc_moe_state", None)
+    buf = layernorm_sp._okc_hopper.rows_buf
     if (not moe.nvfp4_checkpoint or state is None or not state["pg_only"] or world <= 1
             or not okc_patch.SP_AG_ROWSFIRST_MIN_TOKENS <= x.shape[0] * world <= okc_patch.SP_AG_ROWSFIRST_MAX_TOKENS
+            or buf is None or buf.shape[0] < x.shape[0] * world or buf.shape[1] != x.shape[1] or buf.dtype != x.dtype
+            or buf.device != x.device
             or pyn is None or not (not pyn.disabled or tp_group.is_symmetric_memory_enabled())
             or _okc_ids_buffer(tp_group, x.device) is None):
         return None
@@ -1289,13 +1293,11 @@ def _okc_rows_first(moe, x):
         _okc_rf_state["logged"] = True
         logger.info("OKC SP rows-first MoE gather active (first T=%d).", x.shape[0] * world)
     x = x.contiguous()
+    full = buf[: x.shape[0] * world]
     st.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(st), pyn.change_state(enable=True):
-        full = x.new_empty((x.shape[0] * world, x.shape[1]))
         pyn.all_gather(full, x)
-    if not torch.cuda.is_current_stream_capturing():
-        x.record_stream(st)
-    return full, st
+    return full, st, x
 
 
 def _okc_ids_buffer(tp_group, device):
