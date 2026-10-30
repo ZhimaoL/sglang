@@ -1,13 +1,13 @@
 """Expert placement for Muse Spark under expert parallelism.
 
-Default (no table): the contiguous split (rank r holds experts [r * n, (r + 1) * n)) plus R hot-expert replicas per rank
-and layer whose sets come from the run's own routing counts (okc_patch/adaptive.py, refreshed between forwards); the
-first plan is neutral (rank q replicates the first R experts of rank q + 1). A per-forward balancer that every rank
-computes alike from the top-k ids picks which of the two holders computes each replicated expert, so only the
-computing rank changes, never an expert's result.
+Default: the homes in muse_spark_expert_placement.json (per MoE layer, the experts each rank holds; derived from routed-token
+counts on agentic coding traffic; any expert set per rank is exact, only which rank computes an expert changes) plus R
+hot-expert replicas per rank and layer whose sets come from the run's own routing counts (okc_patch/adaptive.py, refreshed
+between forwards; the first plan is neutral: rank q replicates the first R experts of rank q + 1). A per-forward balancer
+that every rank computes alike from the top-k ids picks which of the two holders computes each replicated expert.
 
-Experiments only: OKC_MOE_HOMES=table reads a placement file (OKC_MOE_PLACEMENT_FILE, per MoE layer the experts each
-rank holds), and OKC_MOE_ADAPT_INIT=table starts the replicas from a replica file (OKC_MOE_REPLICA_FILE).
+OKC_MOE_HOMES=contiguous: the contiguous split (rank r holds experts [r * n, (r + 1) * n)), no table. Experiments only:
+OKC_MOE_PLACEMENT_FILE (another table of the same form) and OKC_MOE_ADAPT_INIT=table with OKC_MOE_REPLICA_FILE.
 """
 
 import functools
@@ -16,12 +16,14 @@ import os
 from typing import List, Optional
 
 # OKC_MOE_PLACEMENT_FILE / OKC_MOE_REPLICA_FILE: other tables of the same form (experiments; unset in serving)
-_PLACEMENT_PATH = os.environ.get("OKC_MOE_PLACEMENT_FILE", "")
+_PLACEMENT_PATH = os.environ.get("OKC_MOE_PLACEMENT_FILE") or os.path.join(
+    os.path.dirname(__file__), "muse_spark_expert_placement.json"
+)
 _REPLICA_PATH = os.environ.get("OKC_MOE_REPLICA_FILE", "")
 # OKC_MOE_HOMES=contiguous: stock homes (rank r holds experts [r * n, (r + 1) * n)) and a neutral initial replica plan
 # (rank q replicates the first R experts of rank q + 1), no fitted table at all; with OKC_MOE_ADAPTIVE_REPLICAS the
 # replica sets then come from the run's own counts (okc_patch/adaptive.py).
-_CONTIGUOUS = os.environ.get("OKC_MOE_HOMES", "contiguous") == "contiguous"
+_CONTIGUOUS = os.environ.get("OKC_MOE_HOMES", "table") == "contiguous"
 # OKC_MOE_ADAPT_INIT (adaptive replicas only): "neutral" (default) starts from the neutral plan on whatever homes are
 # active (rank q replicates the first R experts of rank q + 1), so the replica sets come from the run's own counts and
 # no fitted R table is used; "table" starts from the replica file (experiments only).
