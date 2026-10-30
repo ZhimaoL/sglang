@@ -13,16 +13,21 @@ stf_phase<KIND, FOLD> is st_gemm<KIND>'s body after build_tab, verbatim apart fr
 template argument (host dispatch on gamma; the served verify path, whose pooler gather emits the norm, runs FOLD 0 and
 compiles leaner than st_gemm<1>): the same slab ranges, K split, partial ring and epilogues, so y and the slots are
 bit-identical to the pair.
-Barrier: sense-reversing over stf_arrive / stf_gen. Each CTA's thread 0 arrives with one atom.acq_rel, which releases the
-CTA's h rows (after a bar.sync); the last arriver also acquires every arrival, resets the count and st.release-s the next
-generation. The others spin relaxed, then do one ld.acquire. There is no reset race: the next launch starts after this
-one completes. The arrive comes before any phase-2 load is issued, so its fence waits only for phase 1's last refill
-(L2 hits).
+Barrier: wst_ct14b's monotone ticket (+256 per launch, so no reset and graph-safe).
+- Each CTA's thread 0 arrives with one atom.add.acq_rel after a bar.sync; it releases the CTA's h rows.
+- The last arriver's arrive also acquires every other arrival, so it skips the poll; the others poll with ld.acquire.
+- The arrive comes after an L2 prefetch of phase 2's first slab (a prefetch is no outstanding load for the fence) and
+  before any phase-2 register load, so its fence waits only for phase 1's last refill (L2 hits).
+Slab ranges use 32-bit math (U * (blockIdx + 1) <= 192 * 512 * 256 < 2^32), the same values: st_gemm's 64-bit
+division is a CALL (an I2F.U64 subroutine) per phase; without it st_fused<0> spills 20 / 28 B, below the shipped K1's 24 / 36
+(phase 1 keeps K1's 128-register loop: 4 loop-invariant LDLs per slab, K1's 8; phase 2 and the barrier spill nothing).
 """
 
 _CUDA_SRC_STF = r"""
 namespace stk {
-__device__ unsigned stf_arrive, stf_gen;   // grid barrier: arrivals of the running launch, its generation
+// grid barrier ticket (wst_ct14b's form): monotone, +256 per launch (CTA 0 adds 257 - G, the others 1; G <= 256), so a
+// CTA waits for (old & ~255) + 256 with wrap-safe compares: no reset, graph-safe
+__device__ unsigned stf_ticket;
 // st_fused's shared memory (namespace scope: the phases address it directly, as st_gemm does its own)
 __shared__ Tab stf_tb;
 __shared__ __align__(16) float4 stf_part[R][NW][32];
@@ -32,11 +37,6 @@ __shared__ float stf_rs[2][8];
 __shared__ __align__(8) unsigned long long stf_xbar[2];
 extern __shared__ __align__(16) __nv_bfloat16 stf_x[];
 
-DINL unsigned ld_relaxed_u32(const unsigned* p) {
-    unsigned v;
-    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-    return v;
-}
 DINL unsigned ld_acquire_u32(const unsigned* p) {
     unsigned v;
     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
@@ -44,21 +44,22 @@ DINL unsigned ld_acquire_u32(const unsigned* p) {
 }
 DINL unsigned atom_add_acq_rel_u32(unsigned* p, unsigned v) {
     unsigned old;
-    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
     return old;
 }
-DINL void st_relaxed_u32(unsigned* p, unsigned v) {
-    asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
-}
-DINL void st_release_u32(unsigned* p, unsigned v) {
-    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+DINL void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" :: "l"(p)); }
+
+// this CTA's slab range of a phase: 32-bit (U <= VAMAX * 512, U * (blockIdx + 1) < 2^32; st_gemm's 64-bit division is a CALL)
+DINL void stf_range(int U, int& s0, int& nslab) {
+    s0 = (int)((unsigned)U * blockIdx.x / gridDim.x);
+    nslab = (int)((unsigned)U * (blockIdx.x + 1) / gridDim.x) - s0;
 }
 
-// st_gemm<KIND>'s body after build_tab. KIND 2 waits out generation gen before its first h read (wait = 0: the last
-// arriver, which acquired every arrival already)
+// st_gemm<KIND>'s body after build_tab. KIND 2 waits for the ticket to reach target before its first h read (wait = 0:
+// the last arriver, whose acq_rel arrive saw every other arrival)
 template <int KIND, bool FOLD>
 DINL void stf_phase(const __nv_bfloat16* __restrict__ xin, const char* __restrict__ wsf, __nv_bfloat16* __restrict__ out,
-                    const __nv_bfloat16* __restrict__ gamma_, float eps, unsigned gen, int wait) {
+                    const __nv_bfloat16* __restrict__ gamma_, float eps, unsigned target, int wait) {
     const __nv_bfloat16* __restrict__ gamma = FOLD ? gamma_ : nullptr;   // compile-time null without the fold
     Tab& tb = stf_tb;
     auto& part = stf_part;
@@ -71,8 +72,8 @@ DINL void stf_phase(const __nv_bfloat16* __restrict__ xin, const char* __restric
     constexpr int LSPE = KIND == 1 ? 9 : 8;            // log2 slabs per pass (NWT x 8 slabs)
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int U = tb.nva << LSPE;
-    const int s0 = (int)(((long long)U * blockIdx.x) / gridDim.x);
-    const int nslab = (int)(((long long)U * (blockIdx.x + 1)) / gridDim.x) - s0;
+    int s0, nslab;
+    stf_range(U, s0, nslab);
     if (nslab <= 0) return;                            // no h read: no wait (this CTA has arrived)
     const unsigned fullb = smem_u32(&bars[0]), emptyb = smem_u32(&bars[R]);
 
@@ -97,11 +98,9 @@ DINL void stf_phase(const __nv_bfloat16* __restrict__ xin, const char* __restric
         }
     }
     if (KIND == 2) {                                   // st_gemm<2>'s pdl_wait: every CTA's h rows are released
-        if (tid == 0 && wait) {
-            while (ld_relaxed_u32(&stf_gen) == gen) {
+        if (tid == 0 && wait)
+            while ((int)(ld_acquire_u32(&stf_ticket) - target) < 0) {
             }
-            (void)ld_acquire_u32(&stf_gen);
-        }
         __syncthreads();
     }
 
@@ -243,7 +242,7 @@ __global__ void __launch_bounds__(NTHR, 1) st_fused(const __nv_bfloat16* __restr
     __shared__ unsigned short s_wcnt[NUMEL_MAX / 32][ELOC];
     __shared__ int s_vbase[ELOC];
     __shared__ int s_rtab[256], s_rcnt[256], s_rown[256], s_rord[256], s_rload[8];
-    __shared__ unsigned s_gen;
+    __shared__ unsigned s_target;
     __shared__ int s_wait;
 
     const int tid = threadIdx.x;
@@ -258,20 +257,29 @@ __global__ void __launch_bounds__(NTHR, 1) st_fused(const __nv_bfloat16* __restr
     if (tb.nva == 0) return;                           // no local route here: every CTA sees it, nobody arrives
 
     stf_phase<1, FOLD>(x, wsf13, h, gamma, eps, 0u, 0);
-    __syncthreads();                                   // this CTA's h rows are written
-    if (tid == 0) {
-        const unsigned gen = ld_relaxed_u32(&stf_gen);   // changes only after every CTA of this launch arrived
-        s_gen = gen;
-        s_wait = 1;
-        // release this CTA's h rows (cumulative after the bar.sync); the last arriver also acquires every arrival
-        if (atom_add_acq_rel_u32(&stf_arrive, 1u) == gridDim.x - 1) {
-            st_relaxed_u32(&stf_arrive, 0u);
-            st_release_u32(&stf_gen, gen + 1u);       // open the next generation
-            s_wait = 0;
+    {   // phase 2's first slab into L2 (a prefetch is not an outstanding load: the arrive's fence does not wait for it)
+        int s0, nslab;
+        stf_range(tb.nva << 8, s0, nslab);
+        if (nslab > 0) {
+            const int w = tid >> 5, lane = tid & 31, va = s0 >> 8, loc = s0 & 255;
+            const char* p = wsf2 + ((size_t)(tb.va_e[va] * 32 + (loc >> 3)) * NKT + KPW * w) * WSB + (loc & 7) * 512;
+#pragma unroll
+            for (int i = 0; i < KPW; i++) {
+                prefetch_l2(p + (size_t)i * WSB + lane * 16);
+                if (lane == 0) prefetch_l2(p + (size_t)i * WSB + 4096 - (loc & 7) * (512 - 8 * SFB));
+            }
         }
     }
-    __syncthreads();                                   // phase 2's loads only after the release
-    stf_phase<2, false>(h, wsf2, y, nullptr, 0.f, s_gen, s_wait);
+    __syncthreads();                                   // this CTA's h rows are written
+    if (tid == 0) {   // one atom.acq_rel: releases this CTA's h rows (cumulative after the bar.sync); the last arriver's
+                      // also acquires every other arrival, so it skips the poll
+        const unsigned inc = blockIdx.x == 0 ? 257u - gridDim.x : 1u;
+        const unsigned old = atom_add_acq_rel_u32(&stf_ticket, inc);
+        s_target = (old & ~255u) + 256u;
+        s_wait = (int)(old + inc - s_target) < 0;
+    }
+    __syncthreads();                                   // phase 2's loads only after the arrive
+    stf_phase<2, false>(h, wsf2, y, nullptr, 0.f, s_target, s_wait);
 }
 }  // namespace stk
 
@@ -297,6 +305,7 @@ void st_moe_fused(torch::Tensor x, torch::Tensor ids, torch::Tensor wsf13, torch
                          me >= 0 && me < 8 && lids.scalar_type() == at::kInt && lids.is_contiguous() &&
                          lids.numel() == numel),
                 "st: replica table int32 [256 + n_rep], rank < 8, int32 lids like ids");
+    TORCH_CHECK(st_num_sms() <= 256, "st fused: the +256 ticket needs <= 256 CTAs");
     static bool attr = false;
     if (!attr) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(stk::st_fused<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
