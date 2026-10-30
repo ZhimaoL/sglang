@@ -54,6 +54,9 @@ ADAPT_THETA = float(os.environ.get("OKC_ADAPT_THETA", "0.001"))
 ADAPT_MAX_SWAPS = int(os.environ.get("OKC_ADAPT_MAX_SWAPS", "4"))
 ADAPT_TRICKLE = int(os.environ.get("OKC_ADAPT_TRICKLE", "8"))
 ADAPT_FULL_GROWTH = float(os.environ.get("OKC_ADAPT_FULL_GROWTH", "4"))
+# debug: every replica slot carries its expert id with its packs; after each applied layer the table is checked
+# against those tags (1: log an error per bad layer, 2: raise). 0 (default): no tag, no check, no cost.
+ADAPT_SLOT_CHECK = int(os.environ.get("OKC_ADAPT_SLOT_CHECK", "0"))
 MOE_REP_MAX_TOKENS = int(os.environ.get("OKC_MOE_REP_MAX_TOKENS", "256"))
 MOE_REP_PREFILL = _flag("OKC_MOE_REP_PREFILL", "1")
 # on the st chain the verify balancer weighs an expert by its st passes ceil(routes / 8); 0 = every active expert 1
@@ -326,7 +329,7 @@ FU_MERGE_MIN_LOAD = int(os.environ.get("OKC_FU_MERGE_MIN_LOAD", "9"))
 
 ANY_ATTN = SW_ATTN or SW_WST
 
-__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_FIRST_VERIFY", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "ADAPT_THETA", "ADAPT_MAX_SWAPS", "ADAPT_TRICKLE", "ADAPT_FULL_GROWTH", "MOE_REP_MAX_TOKENS",
+__all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_FIRST_VERIFY", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "ADAPT_THETA", "ADAPT_MAX_SWAPS", "ADAPT_TRICKLE", "ADAPT_FULL_GROWTH", "ADAPT_SLOT_CHECK", "MOE_REP_MAX_TOKENS",
            "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_AG_PRENORM", "SW_M1", "M1_MIN_T", "M1_MAX_T", "SW_M1RS", "M1RS_MIN_T", "M1RS_MAX_T", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD", "PG_ROUTE_REPX",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
