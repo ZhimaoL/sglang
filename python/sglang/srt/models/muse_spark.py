@@ -273,7 +273,9 @@ _okc_p1ss_collect = False   # P1-SS: _forward_gathered_experts returns its _OkcG
 # last layer there is no next qkv: the registrant must push ungated there, or M_b waits on flags nobody sets.
 _OKC_POST_QKV = {}
 _OKC_POST_QKV_N = {"fired": 0, "fallback": 0, "warned": False}
-_OKC_P1SS = {"child": 0, "layers": 0}   # P1-SS: the running stage's child and the decoder layer count (_forward_p1ss)
+# P1-SS: the running stage's child and layer (set by _forward_p1ss before each stage, cleared after the pass) and the
+# decoder layer count; W1b's call site reads them
+_OKC_P1SS = {"child": None, "layer": None, "layers": 0}
 _OKC_W1B_GATE = []   # P1-SS + W1b: the gate (one okc_patch.w1b.Gate, made at the first gated stage)
 
 
@@ -1375,7 +1377,9 @@ def _okc_w1b(moe, x, scores, ids):
         return None
     from sglang.kernels.ops.muse_spark_v12.okc_patch import w1b
 
-    j = moe.layer_idx
+    j = _OKC_P1SS["layer"]
+    if j != moe.layer_idx:
+        raise RuntimeError(f"P1-SS + W1b: the stage's layer {j} is not the MoE's {moe.layer_idx}")
     par, nxt = j % 2, j + 1
     gated = _OKC_P1SS["child"] == 1 and not okc_patch.P1SS_W1B_UNGATED and nxt < _OKC_P1SS["layers"]
     if gated:
@@ -1919,7 +1923,7 @@ class MuseSpark1xModel(nn.Module):
         _OKC_P1SS["layers"] = len(self.layers)
         for c, kind, j in _p1ss_order(len(self.layers)):
             s = st[c]
-            _OKC_P1SS["child"] = c
+            _OKC_P1SS["child"], _OKC_P1SS["layer"] = c, j
             get_forward().set("sp_active", s["sp"])
             layernorm_sp.set_sp_num_tokens(s["n"])
             with forward_context(s["ctx"]):
@@ -2112,6 +2116,7 @@ class MuseSpark1xForCausalLM(nn.Module):
         finally:   # an exception must not leak a pending push (with a stale gate) into the next pass
             left = len(_OKC_POST_QKV)
             _OKC_POST_QKV.clear()
+            _OKC_P1SS["child"] = _OKC_P1SS["layer"] = None
             if w1b_st is not None and not done:
                 for par in range(w1b_st.P):
                     okc_w1b.discard(w1b_st, par)

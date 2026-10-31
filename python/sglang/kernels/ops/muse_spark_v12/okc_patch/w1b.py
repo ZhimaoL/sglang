@@ -130,9 +130,9 @@ GUARD = True
 
 # Timing trace for one profiled pass (QA-P1SS §3; W1B-ORDER-A2; okc_patch/w1b_trace.py): None = off. Otherwise a callable
 # (tag, stream, par) run at each trace point: the gate record ("gate"), the push stream after its waits ("go" / "go_g"
-# gated) and after each peer's words ("w1".."w7") and rows ("r1".."r7"), the side stream around the own copy ("side0" /
-# "side1"), the compute stream around the consumer's waits ("words0" / "words1", "rows0" / "rows1"). Never on in a
-# served pass.
+# gated) and after each peer's words ("w1".."w7") and rows ("r1".."r7"), the compute stream at the stage's ready event
+# ("ready"), the side stream around the own copy ("side0" / "side1"), the compute stream around the consumer's waits
+# ("words0" / "words1", "rows0" / "rows1"). Never on in a served pass.
 TRACE = None
 
 
@@ -170,6 +170,8 @@ def stage(st, x, scores, ids, par):
     x = x.contiguous()
     ready = torch.cuda.Event()
     ready.record(cur)
+    if TRACE is not None:
+        TRACE("ready", cur, par)
     st.side.wait_event(ready)
     if TRACE is not None:
         TRACE("side0", st.side, par)
