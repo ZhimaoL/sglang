@@ -354,7 +354,7 @@ def fmha_ext(exact: bool = False):
 
                 # The prefill lane's flags for this module (fmha7's TMA / wgmma PTX needs sm_90a).
                 _FMHA_EXT[key] = _load_inline(
-                    name="okc_pfmha_c4b_exact" if key else "okc_pfmha_c4b",
+                    name="okc_pfmha_n72_exact" if key else "okc_pfmha_n72",
                     cpp_sources=[_FMHA_CPP],
                     cuda_sources=[_CUDA_SRC],
                     functions=["fmha4n_split", "combine", "gatherp"],

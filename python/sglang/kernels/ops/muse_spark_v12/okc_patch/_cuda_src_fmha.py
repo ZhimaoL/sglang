@@ -1,5 +1,6 @@
-"""CUDA source of the OKC prefill FMHA (okc_patch/prefill_fmha.py): the prefill lane's fmha7 path, trimmed
-from muse-opt serving/kernels/fmha/wsattn_c4b.py (md5 56ad280c; bank plt_c4b 5db91e12) by mk_src.py:
+"""CUDA source of the OKC prefill FMHA (okc_patch/prefill_fmha.py): the prefill lane's fmha7 path with lane C's
+N72 (PV and the row sum as one m64n72k32 on an N-group-major V^T layout; outputs bit-identical), from muse-opt
+kernels/muse_prefill_layer/lanec/plt_ag_top3_w14_n72u.py (md5 bf856b7a) by serving/kernels/k3attn/mk_src_n72.py:
 pgfa (fmha7 + combine) and skw::gather_kp verbatim, plus three host launchers; -DPFMHA_EXACT=1 selects the
 all-MUFU exp2 OPT pair."""
 
@@ -78,6 +79,7 @@ DINL unsigned long long make_desc(unsigned saddr, unsigned lbo, unsigned sbo) {
          | ((unsigned long long)((sbo >> 4) & 0x3FFF) << 32);
 }
 DINL unsigned long long desc_lo(unsigned lo) { return (unsigned long long)lo | (8ull << 32); }
+DINL unsigned long long desc_lo_s(unsigned lo) { return (unsigned long long)lo | (64ull << 32); }   // [lcp ngm] SBO 1024 B
 
 template <int ACC>
 DINL void wgmma_qk(unsigned* d, unsigned* a, unsigned long long db) {
@@ -152,6 +154,10 @@ DINL int pi_lane(int lam) {
 }
 
 constexpr int SB = 16384;
+constexpr int SBS = 17408;   // [lcp ngm] smem slot: K | V^T image + 1 KB ones group
+// slot s (s < 8) offsets without a multiply: 17408 s = 16384 s | 1024 s, 1088 s = 1024 s | 64 s (no carries)
+#define LCP_SS(s) ((((unsigned)(s)) << 14) | (((unsigned)(s)) << 10))
+#define LCP_SL(s) ((((unsigned)(s)) << 10) | (((unsigned)(s)) << 6))
 constexpr unsigned NEG = 0xFC00;
 #define M_INIT (-30000.0f)
 
@@ -483,7 +489,7 @@ DINL void issue_pvl(float (&acc)[32], float (&lblk)[4], unsigned (&pk)[16], unsi
     wgmma_fence();
 #pragma unroll
     for (int js = 0; js < 4; js++) {
-        wgmma_pv(acc, pk + 4 * js, make_desc(st + 8192 + js * 2048, 1024, 128));
+        wgmma_pv(acc, pk + 4 * js, make_desc(st + 8192 + js * 256, 128, 1024));
         if (!(Cfg<OPT>::ABL & 4)) {
             if (js == 0) wgmma_l<0>(lblk, pk, dones);
             else wgmma_l<1>(lblk, pk + 4 * js, dones);
@@ -507,7 +513,7 @@ DINL void issue_pvl_h(float (&acc)[32], float (&lblk)[4], unsigned (&pk)[16], un
     wgmma_fence();
 #pragma unroll
     for (int js = 0; js < 4; js++) {
-        wgmma_pv(acc, pk + 4 * js, desc_lo(dlo + js * 128));
+        wgmma_pv(acc, pk + 4 * js, desc_lo_s(dlo + js * 16));
         if (!(Cfg<OPT>::ABL & 4)) {
             if (js == 0) wgmma_l<0>(lblk, pk, dones);
             else wgmma_l<1>(lblk, pk + 4 * js, dones);
@@ -516,6 +522,61 @@ DINL void issue_pvl_h(float (&acc)[32], float (&lblk)[4], unsigned (&pk)[16], un
     wgmma_commit();
 }
 
+DINL void wgmma_pv72(float* d, unsigned* a, unsigned long long db) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %41, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n72k32.f32.e4m3.e4m3\n"
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32,%33,%34,%35},"
+        "{%36,%37,%38,%39}, %40, p, 1, 1;\n}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]),
+          "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]),
+          "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]),
+          "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]),
+          "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
+          "+r"(a[0]), "+r"(a[1]), "+r"(a[2]), "+r"(a[3])
+        : "l"(db), "n"(1));
+}
+template <long long OPT>
+DINL void issue_pvl72_h(float (&acc)[36], unsigned (&pk)[16], unsigned dlo) {
+    fence_fbank(acc);
+    fence_ubank(pk);
+    wgmma_fence();
+#pragma unroll
+    for (int js = 0; js < 4; js++) wgmma_pv72(acc, pk + 4 * js, desc_lo_s(dlo + js * 16));
+    wgmma_commit();
+}
+DINL void rescale_acc72(float (&acc)[36], const float (&al)[2]) {   // the 32 PV entries only
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        acc[4 * j] *= al[0]; acc[4 * j + 1] *= al[0];
+        acc[4 * j + 2] *= al[1]; acc[4 * j + 3] *= al[1];
+    }
+}
+// [lcp n72] l lives in fp32 registers, never in the wgmma accumulator: the FP8 wgmma accumulator drops the low bits
+// of small addends against a grown accumulator (lcp1f: l rel error 0.17 / 0.70 on flat B). The l columns acc[32..35]
+// hold ONE block's row sums (zeroed after each fold) = the bank's lblk, folded with the bank's own arithmetic.
+template <long long OPT>
+DINL void fold_l72(float (&acc)[36], float (&l)[2], const float (&al)[2], int resc) {
+    if (OPT & 64) {
+        if (resc) {
+            rescale_acc72(acc, al);
+            l[0] = (l[0] + acc[32]) * al[0];
+            l[1] = (l[1] + acc[34]) * al[1];
+        } else {
+            l[0] += acc[32];
+            l[1] += acc[34];
+        }
+    } else {
+        if (resc) rescale_acc72(acc, al);
+        l[0] = (l[0] + acc[32]) * al[0];
+        l[1] = (l[1] + acc[34]) * al[1];
+    }
+    // restart the l columns IN PLACE (x * an opaque +0): a plain "= 0.f" (or x -= x) makes ptxas serialize every
+    // wgmma (C7511, insufficient register resources); l columns are finite and >= 0, so x * +0 = +0 exactly
+    float z0;
+    asm("mov.b32 %0, 0;" : "=f"(z0));
+    acc[32] *= z0; acc[33] *= z0; acc[34] *= z0; acc[35] *= z0;
+}
 DINL void issue_qk_s(unsigned (&s)[32], unsigned dqa, unsigned dlo) {
     wgmma_fence();
     wgmma_qk_ss<0>(s, desc_lo(dqa), desc_lo(dlo));
@@ -539,7 +600,7 @@ DINL void issue_pvl_acc(float (&acc)[32], float (&lacc)[4], unsigned (&pk)[16], 
     wgmma_fence();
 #pragma unroll
     for (int js = 0; js < 4; js++) {
-        wgmma_pv(acc, pk + 4 * js, desc_lo(dlo + js * 128));
+        wgmma_pv(acc, pk + 4 * js, desc_lo_s(dlo + js * 16));
         if (!(Cfg<OPT>::ABL & 4) && !(PG_DBG & 16)) wgmma_l<1>(lacc, pk + 4 * js, dones);
     }
     wgmma_commit();
@@ -567,8 +628,8 @@ DINL void blockP(int kt, unsigned (&sx)[32], unsigned (&sy)[32], unsigned (&px)[
     STAMP(1);
     if (PP) named_bar_sync(1 + cw, 256);
     STAMP(2);
-    if (!LAST) issue_qk_x<OPT>(sy, qf, dqa, dqk + (sl1 << 10));
-    issue_pvl_acc<OPT>(acc, lacc, py, dpv + (slp << 10), dones);
+    if (!LAST) issue_qk_x<OPT>(sy, qf, dqa, dqk + LCP_SL(sl1));
+    issue_pvl_acc<OPT>(acc, lacc, py, dpv + LCP_SL(slp), dones);
     if (PP) named_bar_arrive(1 + (cw + 1) % NC, 256);
     STAMP(3);
     const int j0 = (kb0 + kt) << 7;
@@ -598,7 +659,7 @@ DINL void blockP(int kt, unsigned (&sx)[32], unsigned (&sy)[32], unsigned (&px)[
 
 // one key block kt >= 1 of a consumer warpgroup: QK(kt) + PV(kt-1) (P from pkc); P(kt) into pkn
 template <int NST, int WIN, long long OPT, int MASK = 1>
-DINL void block7(int kt, unsigned (&pkc)[16], unsigned (&pkn)[16], float (&acc)[32], float (&l)[2], float (&m)[2],
+DINL void block7(int kt, unsigned (&pkc)[16], unsigned (&pkn)[16], float (&acc)[36], float (&l)[2], float (&m)[2],
                  float (&al)[2], __half2 (&nmc)[2], __half2 (&nmr)[2], __half2 (&thr)[2], unsigned (&qf)[8],
                  unsigned mb, int cw, unsigned sbase,
                  unsigned dqk, unsigned dpv, unsigned long long dones, int kb0, int dgt, int lim, int t, int win,
@@ -622,13 +683,12 @@ DINL void block7(int kt, unsigned (&pkc)[16], unsigned (&pkn)[16], float (&acc)[
         for (int j = 0; j < 32; j++) s[j] = qf[j & 7] + (unsigned)kt * 0x00010001u;
         fence_ubank(pkc);
 #pragma unroll
-        for (int j = 0; j < 4; j++) lblk[j] = __uint_as_float(pkc[j]);
     } else if (HOIST) {
-        issue_qk_x<OPT>(s, qf, dqa, dqk + (sl << 10));
-        issue_pvl_h<OPT>(acc, lblk, pkc, dpv + (slp << 10), dones);
+        issue_qk_x<OPT>(s, qf, dqa, dqk + LCP_SL(sl));
+        issue_pvl72_h<OPT>(acc, pkc, dpv + LCP_SL(slp));
     } else {
-        issue_qk(s, qf, sbase + sl * SB);
-        issue_pvl<OPT>(acc, lblk, pkc, sbase + slp * SB, dones);
+        issue_qk(s, qf, sbase + LCP_SS(sl));
+        issue_pvl72_h<OPT>(acc, pkc, dpv + LCP_SL(slp));
     }
     if (PP) named_bar_arrive(1 + (cw + 1) % NC, 256);
     // the next stage's full barrier, tested now so the test latency hides under the QK wait
@@ -652,7 +712,6 @@ DINL void block7(int kt, unsigned (&pkc)[16], unsigned (&pkn)[16], float (&acc)[
     if (C::DBP) softmax_cvt<OPT>(s, pkn);
     wgmma_wait<0>();
     fence_fbank(acc);
-    fence_fbank(lblk);
     fence_ubank(pkc);
     mbar_arrive(mb + NST * 8 + slp * 8);
     if (C::INL && pthr) {
@@ -660,25 +719,12 @@ DINL void block7(int kt, unsigned (&pkc)[16], unsigned (&pkn)[16], float (&acc)[
             const unsigned ps = (unsigned)pd.nxt & (NST - 1), pr = (unsigned)pd.nxt / NST;
             if (!mbar_test(mb + NST * 8 + ps * 8, (pr - 1) & 1)) break;
             mbar_expect_tx(mb + ps * 8, SB);
-            bulk_g2s_u(sbase + ps * SB, pd.src + (size_t)pd.nxt * SB, SB, mb + ps * 8);
+            bulk_g2s_u(sbase + LCP_SS(ps), pd.src + (size_t)pd.nxt * SB, SB, mb + ps * 8);
             pd.nxt++;
         }
     }
     STAMP(6);
-    if (OPT & 64) {
-        if (resc) {
-            rescale_acc(acc, al);
-            l[0] = (l[0] + lblk[0]) * al[0];
-            l[1] = (l[1] + lblk[2]) * al[1];
-        } else {
-            l[0] += lblk[0];
-            l[1] += lblk[2];
-        }
-    } else {
-        if (resc) rescale_acc(acc, al);
-        l[0] = (l[0] + lblk[0]) * al[0];
-        l[1] = (l[1] + lblk[2]) * al[1];
-    }
+    fold_l72<OPT>(acc, l, al, resc);   // [lcp n72] the bank's l arithmetic on this block's l columns
     if (!C::DBP) {
         if (C::SPEC) softmax_cvt<OPT>(e, pkn);
         else softmax_cvt<OPT>(s, pkn);
@@ -717,15 +763,16 @@ __global__ void __launch_bounds__(Cfg<OPT>::THREADS, 1) fmha7(
 
     extern __shared__ __align__(1024) char smem[];
     const unsigned sbase = (unsigned)__cvta_generic_to_shared(smem);
-    const unsigned mb = sbase + NST * SB;
+    const unsigned mb = sbase + NST * SBS;
     if (tid < NST) {
         mbar_init(mb + tid * 8, 1);
         mbar_init(mb + NST * 8 + tid * 8, 128 * NC);
     }
-    if (tid >= 64 && tid < 128) {
-        reinterpret_cast<unsigned*>(smem + NST * SB + 256)[tid - 64] = 0x38383838u;   // e4m3 1.0
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    }
+    if (tid >= 64 && tid < 128)
+        reinterpret_cast<unsigned*>(smem + NST * SBS + 256)[tid - 64] = 0x38383838u;   // e4m3 1.0
+    for (int i = tid; i < NST * 256; i += blockDim.x)   // [lcp ngm] each slot's 1 KB ones group (N72's 9th N group)
+        reinterpret_cast<unsigned*>(smem + (i >> 8) * SBS + 16384)[i & 255] = 0x38383838u;
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     __syncthreads();
     const int wg = tid >> 7;
     Prod pd{0, NT, src};
@@ -733,7 +780,7 @@ __global__ void __launch_bounds__(Cfg<OPT>::THREADS, 1) fmha7(
         if (tid == 0) {
             for (; pd.nxt < min(NT, NST); pd.nxt++) {
                 mbar_expect_tx(mb + pd.nxt * 8, SB);
-                bulk_g2s(smem + pd.nxt * SB, src + (size_t)pd.nxt * SB, SB, mb + pd.nxt * 8);
+                bulk_g2s(smem + LCP_SS(pd.nxt), src + (size_t)pd.nxt * SB, SB, mb + pd.nxt * 8);
             }
         }
     } else if (C::PW ? (tid >= 128 * NC) : (wg == 0)) {
@@ -746,16 +793,16 @@ __global__ void __launch_bounds__(Cfg<OPT>::THREADS, 1) fmha7(
                     else mbar_wait(mb + NST * 8 + ps * 8, (pr - 1) & 1);
                 }
                 mbar_expect_tx(mb + ps * 8, SB);
-                bulk_g2s(smem + ps * SB, src + (size_t)kt * SB, SB, mb + ps * 8);
+                bulk_g2s(smem + LCP_SS(ps), src + (size_t)kt * SB, SB, mb + ps * 8);
             }
         }
         return;
     }
     if (NC == 4) asm volatile("setmaxnreg.inc.sync.aligned.u32 112;\n" ::: "memory");
     else if (!C::INL && !C::PW) reg_alloc_160();
-    const int cw = (C::INL || C::PW) ? wg : wg - 1;
+    const int cw = __shfl_sync(0xFFFFFFFFu, (C::INL || C::PW) ? wg : wg - 1, 0);   // [lcp u] warp-uniform -> UR
     const bool pthr = C::INL && tid == 0;
-    const int wiw = (tid >> 5) & 3;
+    const int wiw = __shfl_sync(0xFFFFFFFFu, (tid >> 5) & 3, 0);   // [lcp u]
     const int lane = tid & 31;
     const int t = lane & 3;
     const int h = lane >> 2;
@@ -785,19 +832,19 @@ __global__ void __launch_bounds__(Cfg<OPT>::THREADS, 1) fmha7(
     __half2 nmr[2] = {__float2half2_rn(21.0f - M_INIT), __float2half2_rn(21.0f - M_INIT)};
     __half2 thr[2] = {__float2half2_rn((M_INIT + 0.75f) / qk2f), __float2half2_rn((M_INIT + 0.75f) / qk2f)};
     constexpr bool PP = C::PP;
-    float acc[32];
+    float acc[36];
 #pragma unroll
-    for (int i = 0; i < 32; i++) acc[i] = 0.f;
+    for (int i = 0; i < 36; i++) acc[i] = 0.f;
     unsigned pk[16], pk2[16];
-    unsigned long long dones = make_desc(sbase + NST * SB + 256, 128, 128);
+    unsigned long long dones = make_desc(sbase + NST * SBS + 256, 128, 128);
     unsigned dqk = ((sbase >> 4) & 0x3FFF) | (128u << 16);
-    unsigned dpv = (((sbase + 8192) >> 4) & 0x3FFF) | (64u << 16);
+    unsigned dpv = (((sbase + 8192) >> 4) & 0x3FFF) | (8u << 16);   // [lcp ngm] LBO 128 B
     if (C::PIN) {
         dqk = __shfl_sync(0xFFFFFFFFu, dqk, 0);
         dpv = __shfl_sync(0xFFFFFFFFu, dpv, 0);
         dones = desc_lo(__shfl_sync(0xFFFFFFFFu, (unsigned)dones, 0));
     }
-    const unsigned qsm = sbase + NST * SB + 512 + cw * 4096;
+    const unsigned qsm = sbase + NST * SBS + 512 + cw * 4096;
     const unsigned dqa = ((qsm >> 4) & 0x3FFF) | (64u << 16);
     if (C::QSM) {
 #pragma unroll
@@ -812,8 +859,8 @@ __global__ void __launch_bounds__(Cfg<OPT>::THREADS, 1) fmha7(
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         named_bar_sync(8 + cw, 128);
     }
-    const int lim = ctx + qs + 8 * cw + 2 * wiw;
-    const int dgt = ctx + qs + 8 * cw;
+    const int lim = __shfl_sync(0xFFFFFFFFu, ctx + qs + 8 * cw + 2 * wiw, 0);   // [lcp u] lens[b] is a load
+    const int dgt = __shfl_sync(0xFFFFFFFFu, ctx + qs + 8 * cw, 0);
     const unsigned k32 = 32u + (unsigned)(__float_as_uint(qk2f) == 0x7FC00001u);
     unsigned rdy = 0;
 #define BLOCK7(KT, PKC, PKN) block7<NST, WIN, OPT, 1>(KT, PKC, PKN, acc, l, m, al, nmc, nmr, thr, qf, mb, cw, sbase, \
@@ -823,13 +870,13 @@ __global__ void __launch_bounds__(Cfg<OPT>::THREADS, 1) fmha7(
                                                      dqk, dpv, dones, kb0, dgt, lim, t, win, qk2f, qk2h2, tr, k32, rdy, \
                                                      pd, pthr, dqa)
 
-    if (C::PIPE && NT > 0) {
+    if constexpr (C::PIPE) { if (NT > 0) {
         unsigned sA[32], sB[32], pB[16];
         float lacc[4] = {0.f, 0.f, 0.f, 0.f};
         mbar_wait(mb, 0);
         if (NT > 1) mbar_wait(mb + 8, 0);
         issue_qk_x<OPT>(sA, qf, dqa, dqk);
-        if (NT > 1) issue_qk_x<OPT>(sB, qf, dqa, dqk + (1u << 10));
+        if (NT > 1) issue_qk_x<OPT>(sB, qf, dqa, dqk + 1088u);
         wgmma_wait<0>();
         fence_ubank(sA);
         fence_ubank(sB);
@@ -862,14 +909,14 @@ __global__ void __launch_bounds__(Cfg<OPT>::THREADS, 1) fmha7(
 #undef BLOCKP
         if (PP && NT > 1 && cw == 0) named_bar_sync(1, 256);
         const unsigned sll = (unsigned)(NT - 1) & (NST - 1);
-        if (lastB) issue_pvl_acc<OPT>(acc, lacc, pB, dpv + (sll << 10), dones);
-        else issue_pvl_acc<OPT>(acc, lacc, pk, dpv + (sll << 10), dones);
+        if (lastB) issue_pvl_acc<OPT>(acc, lacc, pB, dpv + LCP_SL(sll), dones);
+        else issue_pvl_acc<OPT>(acc, lacc, pk, dpv + LCP_SL(sll), dones);
         wgmma_wait<0>();
         fence_fbank(acc);
         fence_fbank(lacc);
         l[0] = lacc[0];
         l[1] = lacc[2];
-    } else if (NT > 0) {
+    } } else if (NT > 0) {
         {
             unsigned s[32];
             mbar_wait(mb, 0);
@@ -914,20 +961,14 @@ __global__ void __launch_bounds__(Cfg<OPT>::THREADS, 1) fmha7(
 #undef BLOCK7
 #undef BLOCK7U
         if (PP && NT > 1 && cw == 0) named_bar_sync(1, 256);
-        float lblk[4];
         const unsigned sll = HOIST ? ((unsigned)(NT - 1) & (NST - 1)) : (unsigned)((NT - 1) % NST);
         if (!(C::ABL & 16)) {
-            if (HOIST) issue_pvl_h<OPT>(acc, lblk, pk, dpv + (sll << 10), dones);
-            else issue_pvl<OPT>(acc, lblk, pk, sbase + sll * SB, dones);
+            issue_pvl72_h<OPT>(acc, pk, dpv + LCP_SL(sll));
             wgmma_wait<0>();
-        } else {
-#pragma unroll
-            for (int j = 0; j < 4; j++) lblk[j] = __uint_as_float(pk[j]);
         }
         fence_fbank(acc);
-        fence_fbank(lblk);
-        l[0] += lblk[0];
-        l[1] += lblk[2];
+        l[0] += acc[32];
+        l[1] += acc[34];
     }
 
     const float inv0 = vs / fmaxf(l[0], 1e-37f);
@@ -996,10 +1037,10 @@ static void launch_fmha7(dim3 grid, cudaStream_t stream,
     auto fn = fmha7<NST, SPLIT, WIN, OPT>;
     static bool set = false;
     if (!set) {
-        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, NST * SB + 512 + 4 * 4096);
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, NST * SBS + 512 + 4 * 4096);
         set = true;
     }
-    fn<<<grid, Cfg<OPT>::THREADS, NST * SB + 512 + (Cfg<OPT>::QSM ? 4 * 4096 : 0), stream>>>(qp, kp, op, pop, pmp, lens, ks, vs, smqk, B, L, capblks, win,
+    fn<<<grid, Cfg<OPT>::THREADS, NST * SBS + 512 + (Cfg<OPT>::QSM ? 4 * 4096 : 0), stream>>>(qp, kp, op, pop, pmp, lens, ks, vs, smqk, B, L, capblks, win,
                                                                                            gate, gstride, ng_eps);
 }
 
@@ -1168,7 +1209,7 @@ __global__ void __launch_bounds__(256) gather_k(
             }
             w[ww] = r;
         }
-        uint4* dp = reinterpret_cast<uint4*>(tile + 8192 + kcv * 1024 + d * 16);
+        uint4* dp = reinterpret_cast<uint4*>(tile + 8192 + (d >> 3) * 1024 + kcv * 128 + (d & 7) * 16);   // [lcp ngm] V^T N-group-major
         *dp = make_uint4(w[0], w[1], w[2], w[3]);
     }
 }
@@ -1197,6 +1238,10 @@ __global__ void __launch_bounds__(256) gather_kp(
     const bool old_blk = kst + (blk << 7) + 127 < len - L;
     const int tid = threadIdx.x;
     if (lens_out && blk == 0 && kvh == 0 && tid == 0) lens_out[b] = len - kst;
+    if (kst + (blk << 7) >= len) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        return;
+    }
     unsigned char* tile = kvt + ((size_t)(b * 2 + kvh) * capblks + blk) * SB;
 
     long rowb[2]; bool val[2];
@@ -1240,7 +1285,7 @@ __global__ void __launch_bounds__(256) gather_kp(
             }
             w[ww] = r;
         }
-        uint4* dp = reinterpret_cast<uint4*>(tile + 8192 + kcv * 1024 + d * 16);
+        uint4* dp = reinterpret_cast<uint4*>(tile + 8192 + (d >> 3) * 1024 + kcv * 128 + (d & 7) * 16);   // [lcp ngm] V^T N-group-major
         *dp = make_uint4(w[0], w[1], w[2], w[3]);
     }
     if (old_blk) asm volatile("griddepcontrol.wait;" ::: "memory");   // our completion must imply qkf's
