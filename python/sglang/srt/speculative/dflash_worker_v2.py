@@ -30,7 +30,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
@@ -506,7 +506,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             if hasattr(target_model, "set_dflash_layers_to_capture"):
                 target_model._okc_aux_project = self.draft_model.okc_project_local
         self._okc_kv_commit = False
-        self._okc_u3 = False   # OKC U3: the draft pool is on the target's SWA slots (set by alloc_memory_pool)
         if okc_patch.SW_CAND_FUSE or okc_patch.SW_DRAFT_KV_FUSE:
             from sglang.kernels.ops.muse_spark_v12.okc_patch import draft_glue
 
@@ -741,8 +740,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # remains reusable while draft attention sees only the recent window.
         from sglang.kernels.ops.muse_spark_v12.okc_patch import u3_draft_swa
 
-        if not self.use_compact_draft_cache:
-            # OKC U3: the target whose SWA slots the draft pool may share.
+        if not self.use_compact_draft_cache:  # OKC U3: the target whose SWA slots the draft may share
             u3_draft_swa.arm(self.model_runner)
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
@@ -759,15 +757,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_owns_attention),
         ):
             self._draft_worker.init_attention_backends()
-        if self._okc_u3:
-            # OKC U3: the draft's reads must go through its SWA page table.
-            backend = self.draft_model_runner.attn_backend
-            backend = getattr(backend, "decode_backend", backend)
-            if not getattr(backend, "use_sliding_window_kv_pool", False):
-                raise RuntimeError(
-                    "OKC U3: the draft attention backend "
-                    f"{type(backend).__name__} does not read an SWA pool."
-                )
+        backend = self.draft_model_runner.attn_backend
+        if self._okc_u3 and not getattr(getattr(backend, "decode_backend", backend), "use_sliding_window_kv_pool", 0):
+            raise RuntimeError(f"OKC U3: draft attention backend {type(backend).__name__} reads no SWA pool")
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -1950,21 +1942,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    _okc_u3 = False  # OKC U3: the draft pool is on the target's SWA slots (alloc_memory_pool)
+
     def _draft_write_ids(self, plan: KVLocPlan) -> torch.Tensor:
         """The plan's write ids as the draft pool indexes them: the target's
-        physical ids for a fused draft, the virtual ids for a private one,
-        the target's SWA ids under OKC U3."""
-        if self._okc_u3:
-            return plan.write_ids(
-                self.draft_model_runner.kv_index_translator,
-                kind=IdSpaceKind.SLIDING_WINDOW,
-            )
+        physical ids for a fused draft, the virtual ids for a private one."""
+        if self._okc_u3:  # the target's SWA ids
+            from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+
+            return plan.write_ids(self.draft_model_runner.kv_index_translator, kind=IdSpaceKind.SLIDING_WINDOW)
         return plan.write_ids(self.draft_model_runner.kv_index_translator)
 
     def _draft_kv_write_pool(self):
-        """The pool context rows are written to, at `_draft_write_ids`' ids:
-        the draft pool, or under OKC U3 its SWA sub-pool, which holds every
-        draft layer at its own layer id."""
+        """Where context rows go at `_draft_write_ids`' ids: under OKC U3 the SWA sub-pool (every draft layer)."""
         pool = self.draft_model_runner.token_to_kv_pool
         return pool.swa_kv_pool if self._okc_u3 else pool
 
