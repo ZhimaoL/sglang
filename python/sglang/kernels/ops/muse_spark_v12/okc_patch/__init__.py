@@ -381,3 +381,9 @@ SW_P1SS = _flag("OKC_SW_P1SS", "0")
 P1SS_CUT = int(os.environ.get("OKC_P1SS_CUT", "16384"))
 P1SS_MIN_RUNNING = int(os.environ.get("OKC_P1SS_MIN_RUNNING", "8"))
 __all__ += ["SW_P1SS", "P1SS_CUT", "P1SS_MIN_RUNNING"]
+# P1-SS + W1b (docs/serving/review-1031/W1B-ORDER.md, -A1, -A2): inside a two-child pass the pg layers' MoE inputs go by
+# the W1b push transport (okc_patch/w1b.py; parity buffers made at boot), b(j)'s pushes gated after a(j+1)'s qkv GEMM.
+# OKC_P1SS_W1B=0: the executor alone (M2b's PN arm); OKC_P1SS_W1B_UNGATED=1: b(j) pushes at the end of A_b(j) (PU).
+P1SS_W1B = _flag("OKC_P1SS_W1B", "1")
+P1SS_W1B_UNGATED = _flag("OKC_P1SS_W1B_UNGATED", "0")
+__all__ += ["P1SS_W1B", "P1SS_W1B_UNGATED"]
