@@ -336,7 +336,7 @@ SW_FOLLOWUP_ADMIT = _flag("OKC_SW_FOLLOWUP_ADMIT", "1")
 # then run under the last layers instead of leaving the GPU idle at every boundary (review-1030/FIRSTTURN.md §2f). Timing
 # only; a follow-up arriving in those last ms waits one more chunk (c4 replay: worst TTFT 0.549 -> 0.547 s). Default on
 # (x-ftb3; FTB2 with W1a + F1: prefill_bench -31 ms, identity equal); OKC_SW_BOUNDARY_EARLY=0 records after the forward.
-SW_BOUNDARY_EARLY = _flag("OKC_SW_BOUNDARY_EARLY", "1")
+SW_BOUNDARY_EARLY = _flag("OKC_SW_BOUNDARY_EARLY", "0")
 BOUNDARY_EARLY_LAYERS = int(os.environ.get("OKC_BOUNDARY_EARLY_LAYERS", "2"))
 
 # Bounded merge of follow-up extends (court C30 / C31): at load >= FU_MERGE_MIN_LOAD, with requests decoding and
