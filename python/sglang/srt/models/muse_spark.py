@@ -268,6 +268,10 @@ def _split_bf16_router_supported() -> bool:
 
 _okc_sp_logged = False
 _okc_p1ss_collect = False   # P1-SS: _forward_gathered_experts returns its _OkcGathered instead of running it
+# P1-SS + W1b: layer -> a callable run once, right after the next qkv GEMM of that layer (the other child's A stage), so
+# b(j)'s gated rows pushes are enqueued after a(j+1)'s qkv record (STRUCTURAL.md §3.1a push-form amendment 3). For the
+# last layer there is no next qkv: the registrant must push ungated there, or M_b waits on flags nobody sets.
+_OKC_POST_QKV = {}
 
 
 def _use_split_bf16_router(num_tokens: int) -> bool:
@@ -512,6 +516,10 @@ class MuseSpark1xAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
+        if _OKC_POST_QKV:
+            hook = _OKC_POST_QKV.pop(self.layer_idx, None)
+            if hook is not None:
+                hook()
         rows = _OKC_RSB and self._okc_block_rows(qkv.shape[0])
         if rows:   # OKC rsfold O1: attention through the o-proj RS (okc_attn_rs)
             return self.gated_attention(positions, qkv, forward_batch, okc_rows=rows)
@@ -2017,6 +2025,7 @@ class MuseSpark1xForCausalLM(nn.Module):
         from sglang.kernels.ops.muse_spark_v12.okc_patch import p1ss as okc_p1ss
 
         kids, ctxs = okc_p1ss.split(forward_batch, okc_patch.P1SS_CUT)
+        _OKC_POST_QKV.clear()   # a hook left by the previous pass's last layer never fires in this one
         logger.info("OKC P1-SS pass: %d + %d tokens", okc_patch.P1SS_CUT, positions.shape[0] - okc_patch.P1SS_CUT)
         outs = getattr(self.model, "language_model", self.model)._forward_p1ss(
             input_ids, positions, kids, ctxs, input_embeds)
