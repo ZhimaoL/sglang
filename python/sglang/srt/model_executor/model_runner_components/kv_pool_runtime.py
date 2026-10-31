@@ -75,8 +75,9 @@ def compute_post_capture_kv_resize(
         1 - model_runner.mem_fraction_static
     )
     # OKC exact KV pin: hold the base's own token count; pre-KV adds / savings then move the post-KV headroom, down to
-    # the floor (still raised by the reserves below). Shipped freezes set both defaults in code; unset = stock.
-    pin = get_int_env_var("OKC_KV_PIN_TOKENS")
+    # the floor (still raised by the reserves below). The default is x-f3.naw's own post-capture count (court pod, F3G's
+    # cold judge boot, 10-31); OKC_KV_PIN_TOKENS=0 is stock.
+    pin = get_int_env_var("OKC_KV_PIN_TOKENS", 3611861)
     if pin > 0:
         headroom_gb = get_int_env_var("OKC_KV_PIN_FLOOR_MIB", 9216) / 1024
     decode_cuda_graph_config = get_exec().graph.cuda_graph_config.decode
