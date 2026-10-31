@@ -10,6 +10,8 @@ its EOD template bit set 11:
   - gates: before an item's first k-tile the TMA thread waits until the counter of its slot's position (rank_of[slot])
     reaches 8 x epoch (relaxed .sys loads, then fence.acq_rel.sys and fence.proxy.async.global). The epoch is a device
     word bumped once per call by the global align, so a captured graph re-reads it on every replay; counters never reset.
+    The epoch word (once per thread, after pdl_wait) and rank_of[slot] (once per slot) are read with ld.relaxed.gpu:
+    the global align rewrites both on every call.
 eod_galign: every rank derives every destination's layout from the gathered ids, the 8 ranks' replica tables and the
 served replica cut (owner = pg_rep_split's rule), deterministically: each destination's slots sit in its layout by
 (route count ascending, slot), routes in route-id order inside each (rank, slot) bucket; outputs are the own layout in
@@ -29,22 +31,24 @@ DINL int eod_rl(const int*p){int v;asm volatile("ld.relaxed.gpu.global.b32 %0, [
 DINL int4 eod_rl4(const int*p){int4 v;asm volatile("ld.relaxed.gpu.global.v4.s32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x),"=r"(v.y),"=r"(v.z),"=r"(v.w) : "l"(p) : "memory");return v;}
 DINL void eod_acq(){asm volatile("fence.acq_rel.gpu;\n\tfence.proxy.async.global;" ::: "memory");}
 DINL void eod_acq_sys(){asm volatile("fence.acq_rel.sys;\n\tfence.proxy.async.global;" ::: "memory");}
+DINL unsigned eod_ldep(const unsigned*p){unsigned v;asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");return v;}
+DINL unsigned eod_epoch(const EodArgs&a){return a.ep!=nullptr?eod_ldep(a.ep):(unsigned)a.epoch;}
 DINL int eod_rls(const int*p){int v;asm volatile("ld.relaxed.sys.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");return v;}
-template<int EOD>DINL bool eod_ready(const EodArgs&a,int e){const int r=a.rank_of[e];bool ok=true;
-{const int tgt=(a.ep!=nullptr)?a.ndst*(int)__ldg(a.ep):a.done_target;if(tgt>0)ok=ok&&(((EOD&8)!=0)?eod_rls(a.done + r):eod_rl(a.done + r))>=tgt;}if(a.peer!=nullptr)ok=ok&&eod_rl(a.peer)>=r + 1;
+template<int EOD>DINL bool eod_ready(const EodArgs&a,int e,int r,unsigned epv){bool ok=true;
+{const int tgt=(a.ep!=nullptr)?a.ndst*(int)epv:a.done_target;if(tgt>0)ok=ok&&(((EOD&8)!=0)?eod_rls(a.done + r):eod_rl(a.done + r))>=tgt;}if(a.peer!=nullptr)ok=ok&&eod_rl(a.peer)>=r + 1;
 if(a.needv!=nullptr){const int4 n0=reinterpret_cast<const int4*>(a.needv)[2*e],n1=reinterpret_cast<const int4*>(a.needv)[2*e + 1];
 const int4 c0=eod_rl4(a.chunk),c1=eod_rl4(a.chunk + 4);
 ok=ok&&c0.x>=n0.x&&c0.y>=n0.y&&c0.z>=n0.z&&c0.w>=n0.w&&c1.x>=n1.x&&c1.y>=n1.y&&c1.z>=n1.z&&c1.w>=n1.w;}return ok;}
-template<int EOD>DINL void eod_gate(const EodArgs&a,int e,unsigned&mask){if(e<32&&((mask>>e)&1u))return;
-unsigned long long t0=0;if constexpr((EOD&4)!=0){t0=eod_now();}
-while(!eod_ready<EOD>(a,e))__nanosleep(32);if constexpr((EOD&8)!=0)eod_acq_sys();else eod_acq();if(e<32)mask|=1u<<e;
+template<int EOD>DINL void eod_gate(const EodArgs&a,int e,unsigned&mask,unsigned epv){if(e<32&&((mask>>e)&1u))return;
+const int r=eod_rl(a.rank_of + e);unsigned long long t0=0;if constexpr((EOD&4)!=0){t0=eod_now();}
+while(!eod_ready<EOD>(a,e,r,epv))__nanosleep(32);if constexpr((EOD&8)!=0)eod_acq_sys();else eod_acq();if(e<32)mask|=1u<<e;
 if constexpr((EOD&4)!=0){if(a.trace!=nullptr){const unsigned long long t1=eod_now();if(t1 - t0>200ull){
 const unsigned i=atomicAdd(reinterpret_cast<unsigned*>(a.trace + 256),1u);if(i<8192u){unsigned long long*q=a.trace + 256 + 1 + 3*i;
 q[0]=((unsigned long long)blockIdx.x<<32)|(unsigned)e;q[1]=t0;q[2]=t1;}}}}}
-template<int EOD>DINL void eod_signal(const EodArgs&a,int r,int lane,int w){
+template<int EOD>DINL void eod_signal(const EodArgs&a,int r,int lane,int w,unsigned epv){
 if constexpr((EOD&8)!=0){asm volatile("fence.acq_rel.sys;" ::: "memory");__syncwarp();
 if(lane==0){unsigned old;asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(a.lcnt + r) : "memory");
-if(old==(unsigned)(3*gridDim.x)*(a.ep!=nullptr?__ldg(a.ep):(unsigned)a.epoch) - 1u){asm volatile("fence.acq_rel.sys;" ::: "memory");
+if(old==(unsigned)(3*gridDim.x)*epv - 1u){asm volatile("fence.acq_rel.sys;" ::: "memory");
 for(int d=0;d<a.ndst;d++)asm volatile("red.relaxed.sys.global.add.u32 [%0], 1;" :: "l"(a.rcnt[d] + r) : "memory");}
 if constexpr((EOD&4)!=0){if(a.trace!=nullptr)a.trace[24833 + w*32 + r]=eod_now();}}}
 else{__threadfence();__syncwarp();
@@ -58,24 +62,25 @@ for(int q0=0;q0<16;q0 +=4){uint4 v[4];
 for(int u=0;u<4;u++)v[u]=ok?__ldg(reinterpret_cast<const uint4*>(s +(q0 + u)*512)):make_uint4(0u,0u,0u,0u);
 #pragma unroll
 for(int u=0;u<4;u++){const unsigned kt=(unsigned)((q0 + u)*4 +(lane>>3));*reinterpret_cast<uint4*>(b + kt*(unsigned)XB)=v[u];}}}
-template<int EOD>DINL void eod_copy(const EodArgs&a,int wp){const int lane=threadIdx.x&31;const int w=blockIdx.x*3 + wp - 1;
+template<int EOD>DINL void eod_copy(const EodArgs&a,int wp,unsigned epv){const int lane=threadIdx.x&31;const int w=blockIdx.x*3 + wp - 1;
 const int k0=__shfl_sync(0xFFFFFFFFu,a.woff[w],0),k1=__shfl_sync(0xFFFFFFFFu,a.woff[w + 1],0);const unsigned long long t0=eod_now();int cur=0;
 for(int k=k0;k<k1;k++){const int4 ev=a.ent[k];int4 en;en.x=__shfl_sync(0xFFFFFFFFu,ev.x,0);en.y=__shfl_sync(0xFFFFFFFFu,ev.y,0);
-en.z=__shfl_sync(0xFFFFFFFFu,ev.z,0);en.w=0;const int r=(en.z>>8)&0xFF;for(;cur<r;cur++)eod_signal<EOD>(a,cur,lane,w);
+en.z=__shfl_sync(0xFFFFFFFFu,ev.z,0);en.w=0;const int r=(en.z>>8)&0xFF;for(;cur<r;cur++)eod_signal<EOD>(a,cur,lane,w,epv);
 if(a.rank_t0!=nullptr){const unsigned long long due=t0 + a.rank_t0[r];while(!__all_sync(0xFFFFFFFFu,eod_now()>=due)){}}
 if(a.chunk!=nullptr){const int nd=(en.z>>16)&0xFF;if(nd>0){const int*f=a.chunk +(((unsigned)en.z)>>24);
 while(!__all_sync(0xFFFFFFFFu,eod_ld(f)>=nd))__nanosleep(64);}}
-eod_row(a,en,lane);}for(;cur<a.nidx;cur++)eod_signal<EOD>(a,cur,lane,w);}
+eod_row(a,en,lane);}for(;cur<a.nidx;cur++)eod_signal<EOD>(a,cur,lane,w,epv);}
 template<int GATED,int NST,int MODE,int WSET=3,int PAIR64=1,int SPL=0,int EOD=0>__global__ void __launch_bounds__(384,1)eod_gemm(const char*__restrict__ xg,const char*__restrict__ wsf,const float*__restrict__ gs,void*__restrict__ out,const int*__restrict__ sorted_ids,const int*__restrict__ block_experts,const int*__restrict__ live,
 int NWT,int numel,int snake,__nv_bfloat16*m1,unsigned*m1_ep,const __grid_constant__ EodArgs eod){extern __shared__ __align__(1024)char smem[];const int tid=threadIdx.x;const unsigned sbase=smem_u32(smem);
 if(sbase&1023)__trap();const unsigned mb=sbase + NST*SB;int*meta=reinterpret_cast<int*>(smem + NST*SB + 2*NST*8);const unsigned ebase=mb + BAR_BYTES;const unsigned rbase=ebase +(MODE==4?0:2*(GATED?EPI1:EPI2));
 if(tid<NST){mbar_init(mb + tid*8,1);mbar_init(mb + NST*8 + tid*8,256);}pdl_wait();pdl_trigger();if(SPL&&tid==0)meta[8]=n_wide_entries(live);__syncthreads();const int n_items=(SPL?meta[8]:live[0])*NWT;
-const int wg=((EOD&2)!=0)?__shfl_sync(0xFFFFFFFFu,tid>>7,0):(tid>>7);if(wg==0){reg_dec<PREGS>();if constexpr((EOD&2)!=0){const int wu=__shfl_sync(0xFFFFFFFFu,tid>>5,0);if(wu>=1){eod_copy<EOD>(eod,wu);
-return;}}if(tid==0){int sl=0,rnd=0;unsigned eod_mask=0u;if constexpr((EOD&4)!=0){if(eod.trace!=nullptr){eod.trace[blockIdx.x]=eod_now();if(blockIdx.x==0){for(int q=0;q<8;q++)eod.trace[236 + q]=eod.chunk!=nullptr?(unsigned long long)eod_ld(eod.chunk + q):0ull;
-eod.trace[236 + 8]=eod.peer!=nullptr?(unsigned long long)eod_ld(eod.peer):0ull;eod.trace[236 + 9]=(unsigned long long)eod_ld(eod.done);}}}int item=sched_item(0,blockIdx.x,gridDim.x,snake);int ent_n=item<n_items?live[1 + item/NWT]:0;
+const int wg=((EOD&2)!=0)?__shfl_sync(0xFFFFFFFFu,tid>>7,0):(tid>>7);if(wg==0){reg_dec<PREGS>();const unsigned eod_e=((EOD&3)!=0)?eod_epoch(eod):0u;if constexpr((EOD&2)!=0){const int wu=__shfl_sync(0xFFFFFFFFu,tid>>5,0);
+if(wu>=1){eod_copy<EOD>(eod,wu,eod_e);return;}}if(tid==0){int sl=0,rnd=0;unsigned eod_mask=0u;if constexpr((EOD&4)!=0){if(eod.trace!=nullptr){eod.trace[blockIdx.x]=eod_now();if(blockIdx.x==0){for(int q=0;
+q<8;q++)eod.trace[236 + q]=eod.chunk!=nullptr?(unsigned long long)eod_ld(eod.chunk + q):0ull;eod.trace[236 + 8]=eod.peer!=nullptr?(unsigned long long)eod_ld(eod.peer):0ull;eod.trace[236 + 9]=(unsigned long long)eod_ld(eod.done);
+}}}int item=sched_item(0,blockIdx.x,gridDim.x,snake);int ent_n=item<n_items?live[1 + item/NWT]:0;
 int e_n=item<n_items?block_experts[ent_n&0xFFFFF]:0;float g_n=(GATED&&item<n_items)?gs[e_n]:0.f;for(int j=0;item<n_items;j++){const int wt=item%NWT;const int ent=ent_n,e=e_n;const float gsv=g_n;const int pm=ent&0xFFFFF,wcode=ent>>20;
 const int nv=eff_nv<WSET>(wcode);const int nxt=sched_item(j + 1,blockIdx.x,gridDim.x,snake);if(nxt<n_items)ent_n=live[1 + nxt/NWT];
-int*mt=meta +(j&1)*4;mt[0]=pm;mt[1]=wt;mt[2]=wcode;mt[3]=__float_as_int(gsv);const char*xs=xg +(size_t)pm*NKT*XB;const char*ws=wsf +((size_t)e*NWT + wt)*(size_t)NKT*WSB;if constexpr((EOD&1)!=0){eod_gate<EOD>(eod,e,eod_mask);
+int*mt=meta +(j&1)*4;mt[0]=pm;mt[1]=wt;mt[2]=wcode;mt[3]=__float_as_int(gsv);const char*xs=xg +(size_t)pm*NKT*XB;const char*ws=wsf +((size_t)e*NWT + wt)*(size_t)NKT*WSB;if constexpr((EOD&1)!=0){eod_gate<EOD>(eod,e,eod_mask,eod_e);
 }
 #ifdef PGN_WSET
 const bool pr=PAIR64&&nv<=64;
