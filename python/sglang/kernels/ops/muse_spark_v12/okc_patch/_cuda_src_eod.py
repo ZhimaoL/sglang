@@ -18,14 +18,19 @@ pg_gemm) and these host entry points; anchors are matched as token sequences (an
 import re
 
 _PG_HEAD = 'template<int GATED,int NST,int MODE,int WSET=3,int PAIR64=1,int SPL=0>__global__ void __launch_bounds__(384,1)pg_gemm('
-_EOD_HEAD = 'template<int GATED,int NST,int MODE,int WSET=3,int PAIR64=1,int SPL=0,int EOD=0>__global__ void __launch_bounds__(384,1)eod_gemm('
+_EOD_HEAD = ('template<int GATED,int NST,int MODE,int WSET=3,int PAIR64=1,int SPL=0,int EOD=0>__global__ void __launch_bounds__(384,1)'
+     'eod_gemm(')
 _EDITS = (
     ('int NWT,int numel,int snake,__nv_bfloat16*m1,unsigned*m1_ep){',
      'int NWT,int numel,int snake,__nv_bfloat16*m1,unsigned*m1_ep,const __grid_constant__ EodArgs eod){'),
     ('const int wg=tid>>7;',
      'const int wg=((EOD&2)!=0)?__shfl_sync(0xFFFFFFFFu,tid>>7,0):(tid>>7);'),
     ('if(tid==0){int sl=0,rnd=0;',
-     'if constexpr((EOD&2)!=0){const int wu=__shfl_sync(0xFFFFFFFFu,tid>>5,0);if(wu>=1){eod_copy<EOD>(eod,wu);return;}}if(tid==0){int sl=0,rnd=0;unsigned eod_mask=0u;if constexpr((EOD&4)!=0){if(eod.trace!=nullptr){eod.trace[blockIdx.x]=eod_now();if(blockIdx.x==0){for(int q=0;q<8;q++)eod.trace[236 + q]=eod.chunk!=nullptr?(unsigned long long)eod_ld(eod.chunk + q):0ull;eod.trace[236 + 8]=eod.peer!=nullptr?(unsigned long long)eod_ld(eod.peer):0ull;eod.trace[236 + 9]=(unsigned long long)eod_ld(eod.done);}}}'),
+     ('if constexpr((EOD&2)!=0){const int wu=__shfl_sync(0xFFFFFFFFu,tid>>5,0);if(wu>=1){eod_copy<EOD>(eod,wu);return;}}if(tid='
+     '=0){int sl=0,rnd=0;unsigned eod_mask=0u;if constexpr((EOD&4)!=0){if(eod.trace!=nullptr){eod.trace[blockIdx.x]=eod_now();'
+     'if(blockIdx.x==0){for(int q=0;q<8;q++)eod.trace[236 + q]=eod.chunk!=nullptr?(unsigned long long)eod_ld(eod.chunk + q):0u'
+     'll;eod.trace[236 + 8]=eod.peer!=nullptr?(unsigned long long)eod_ld(eod.peer):0ull;eod.trace[236 + 9]=(unsigned long long'
+     ')eod_ld(eod.done);}}}')),
     ('const char*ws=wsf +((size_t)e*NWT + wt)*(size_t)NKT*WSB;',
      'const char*ws=wsf +((size_t)e*NWT + wt)*(size_t)NKT*WSB;if constexpr((EOD&1)!=0){eod_gate<EOD>(eod,e,eod_mask);}'),
 )
