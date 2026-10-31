@@ -3997,14 +3997,22 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        # OKC P1-SS: above the load floor a plain chunk pass gets two chunks' budget; a pass that then carries more than
+        # one chunk runs as two children cut at one chunk (each child is one stock chunk; okc_patch/p1ss.py)
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        p1ss = (okc_patch.SW_P1SS and between is None and small_first is None and not self.is_mixed_chunk
+                and running_bs > okc_patch.P1SS_MIN_RUNNING
+                and chunked_prefill_size == self.chunked_prefill_size == okc_patch.P1SS_CUT
+                and self.max_prefill_tokens <= okc_patch.P1SS_CUT)
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
-            chunked_prefill_size,
+            self.max_prefill_tokens * 2 if p1ss else self.max_prefill_tokens,
+            chunked_prefill_size * 2 if p1ss else chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
@@ -6047,7 +6055,11 @@ def run_scheduler_process(
         # OKC: load the eager DFlash GEMM variants before the server reports ready (court C21).
         warm = getattr(getattr(scheduler, "draft_worker", None), "okc_warm_eager_gemms", None)
         if warm is not None:
-            warm(max(server_args.chunked_prefill_size or 0, server_args.max_prefill_tokens or 0))
+            from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+            # OKC P1-SS: a two-chunk pass hands the draft up to two chunks of context rows
+            warm(max(server_args.chunked_prefill_size or 0, server_args.max_prefill_tokens or 0)
+                 * (2 if okc_patch.SW_P1SS else 1))
         # OKC: and the stock Triton kernels' per-batch variants (court C42: they compiled inside timed reps)
         from sglang.kernels.ops.muse_spark_v12.okc_patch import triton_warm
 

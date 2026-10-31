@@ -150,9 +150,20 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             get_parallel().world_group.cpu_group,
         )
 
-    # Record resolved per-mode backends on the backend for model dispatch.
-    attn_backend.prefill_attention_backend_str = resolved.prefill
-    attn_backend.decode_attention_backend_str = resolved.decode
+    backends = [attn_backend]
+    from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+    if okc_patch.SW_P1SS and not model_runner.is_draft_worker and not decode_attn_backend_group:
+        # OKC P1-SS: a two-chunk pass's children each run on their own backend (okc_patch/p1ss.py)
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import p1ss as okc_p1ss
+
+        okc_p1ss.set_backends([_build_resolved_backend(model_runner=model_runner, resolved=resolved,
+                                                       init_new_workspace=False) for _ in range(2)])
+        backends += okc_p1ss._BACKENDS
+    for backend in backends:
+        # Record resolved per-mode backends on the backend for model dispatch.
+        backend.prefill_attention_backend_str = resolved.prefill
+        backend.decode_attention_backend_str = resolved.decode
 
     return AttentionBackends(
         attn_backend=attn_backend,

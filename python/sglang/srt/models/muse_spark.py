@@ -102,7 +102,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
@@ -267,6 +267,7 @@ def _split_bf16_router_supported() -> bool:
 
 
 _okc_sp_logged = False
+_okc_p1ss_collect = False   # P1-SS: _forward_gathered_experts returns its _OkcGathered instead of running it
 
 
 def _use_split_bf16_router(num_tokens: int) -> bool:
@@ -1224,22 +1225,73 @@ class MuseSpark1xMoE(nn.Module):
             full_input = gather(expert_input)
             full_scores = gather(topk_scores)
             full_ids = gather(topk_ids)
-        if self.nvfp4_checkpoint:
-            output = self.experts(
-                full_input,
-                full_scores,
-                full_ids,
-                self.experts.post_expert_norm,
-                pre_expert_norm=None if prenorm_shard else self.pre_expert_norm,
-            )
+        g = _OkcGathered(self, tp_group, expert_input.shape[0], full_input, full_scores, full_ids, prenorm_shard)
+        if _okc_p1ss_collect:   # P1-SS: the staged caller runs g.experts() / g.tail() in its own stage order
+            return g
+        g.experts()
+        return g.tail()
+
+    def forward_staged(self, hidden_states, router_input=None, forward_batch=None):
+        """P1-SS: forward() as a generator with two stage ends, after the rows' gather is issued (A) and after the
+        experts (M: gg2 with its M1-RS stores); the M1-RS receive (or the reduce-scatter) and the unpooler are R."""
+        global _okc_p1ss_collect
+        _okc_p1ss_collect = True
+        try:
+            g = self._forward_experts(hidden_states, router_input)
+        finally:
+            _okc_p1ss_collect = False
+        if not isinstance(g, _OkcGathered):   # not an SP gathered call: nothing to stage
+            yield
+            yield
+            return self._reduce_and_unpool(g)
+        yield
+        g.experts(defer=True)
+        yield
+        return self._reduce_and_unpool(g.tail())
+
+
+class _OkcGathered:
+    """One SP gathered-experts call split at its stage ends (P1-SS); experts() then tail() is the old body."""
+
+    def __init__(self, moe, tp_group, shard_rows, full_input, full_scores, full_ids, prenorm_shard):
+        self.moe, self.tp_group, self.shard_rows = moe, tp_group, shard_rows
+        self.args = (full_input, full_scores, full_ids, prenorm_shard)
+        self.output, self.box = None, []
+        self.join = None   # P1-SS + W1b: the wait for the gathered rows, run when the experts start
+
+    def experts(self, defer=False):
+        if self.join is not None:
+            self.join()
+        moe = self.moe
+        full_input, full_scores, full_ids, prenorm_shard = self.args
+        self.args = None
+        if moe.nvfp4_checkpoint:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
+
+            with okc_moe.defer_receive(self.box) if defer else contextlib.nullcontext():
+                self.output = moe.experts(
+                    full_input,
+                    full_scores,
+                    full_ids,
+                    moe.experts.post_expert_norm,
+                    pre_expert_norm=None if prenorm_shard else moe.pre_expert_norm,
+                )
         else:
-            if self.pre_expert_norm is not None and not prenorm_shard:
-                full_input = self.pre_expert_norm(full_input)
-            output = self.experts(
-                full_input, full_scores, full_ids, self.experts.post_expert_norm
+            if moe.pre_expert_norm is not None and not prenorm_shard:
+                full_input = moe.pre_expert_norm(full_input)
+            self.output = moe.experts(
+                full_input, full_scores, full_ids, moe.experts.post_expert_norm
             )
-        if getattr(self.experts, "_okc_m1rs_shard", False):   # okc_patch.m1 rs_receive: this rank's shard
-            self.experts._okc_m1rs_shard = False
+
+    def tail(self):
+        moe, tp_group, output = self.moe, self.tp_group, self.output
+        if self.box:   # P1-SS: the deferred M1-RS receive (gg2's stores were issued in the M stage)
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import p1ss as okc_p1ss
+
+            okc_p1ss.pdl_fence(output.device)
+            output = self.box.pop()()
+        if getattr(moe.experts, "_okc_m1rs_shard", False):   # okc_patch.m1 rs_receive: this rank's shard
+            moe.experts._okc_m1rs_shard = False
             return output
         output = output.contiguous()
         if okc_patch.SW_EXT_RS:   # extends: ld_reduce over the symmetric buffer (okc_patch/ext_coll.py)
@@ -1249,7 +1301,7 @@ class MuseSpark1xMoE(nn.Module):
                                          tp_group.rank_in_group)
             if rs is not None:
                 return rs
-        shard = output.new_empty((expert_input.shape[0], *output.shape[1:]))
+        shard = output.new_empty((self.shard_rows, *output.shape[1:]))
         tp_group.reduce_scatter_tensor(shard, output)
         return shard
 
@@ -1477,6 +1529,15 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
             if result is not None:
                 return result
+        ffn_input, stream, router_input = self._attn_stage(positions, stream, attn_input, forward_batch)
+        if self.is_moe_layer:
+            ffn_output = self.mlp(ffn_input, router_input, forward_batch)
+        else:
+            ffn_output = self.mlp(ffn_input)
+        return self._ffn_tail(stream, ffn_output)
+
+    def _attn_stage(self, positions, stream, attn_input, forward_batch):
+        """forward() up to the FFN: attention and the attention boundary; returns (ffn_input, stream, router_input)."""
         # OKC rsfold: under SP the o-proj reduce-scatter leaves its slots unsummed for the boundary's norm kernel
         rs_fold = (okc_patch.SW_RS_NORM_FOLD and get_forward().sp_active
                    and self._fused_attn_boundary.jit_selected())
@@ -1490,20 +1551,18 @@ class MuseSpark1xDecoderLayer(nn.Module):
         ):
             router_dtype = None
         if rs_slots is not None:   # jit_selected(): the call below would take forward_jit
-            ffn_input, stream, router_input = self._fused_attn_boundary.forward_jit(
+            return self._fused_attn_boundary.forward_jit(
                 stream, attn_output, branch_dtype=self.operator_dtype, router_dtype=router_dtype,
                 branch_slots=rs_slots)
-        else:
-            ffn_input, stream, router_input = self._fused_attn_boundary(
-                stream,
-                attn_output,
-                branch_dtype=self.operator_dtype,
-                router_dtype=router_dtype,
-            )
-        if self.is_moe_layer:
-            ffn_output = self.mlp(ffn_input, router_input, forward_batch)
-        else:
-            ffn_output = self.mlp(ffn_input)
+        return self._fused_attn_boundary(
+            stream,
+            attn_output,
+            branch_dtype=self.operator_dtype,
+            router_dtype=router_dtype,
+        )
+
+    def _ffn_tail(self, stream, ffn_output):
+        """forward() after the FFN: the FFN boundary (the last layer: the model's tail); returns forward()'s value."""
         # A TP-sliced branch means the unpooler gather was deferred to the FFN boundary.
         if ffn_output.shape[-1] != stream.shape[-1]:
             next_attn_input, stream = self._fused_ffn_boundary.forward_with_ag(
@@ -1527,6 +1586,18 @@ class MuseSpark1xDecoderLayer(nn.Module):
             stream, ffn_output, branch_dtype=self.operator_dtype
         )
         return stream, next_attn_input
+
+    def forward_staged(self, positions, stream, attn_input, forward_batch):
+        """P1-SS: forward() as a generator of three stages, cut at the MoE's two stage ends (MuseSpark1xMoE.forward_staged):
+        A = attention + boundary + MoE front, M = the experts, R = the rest; returns forward()'s value."""
+        ffn_input, stream, router_input = self._attn_stage(positions, stream, attn_input, forward_batch)
+        if self.is_moe_layer and isinstance(self.mlp, MuseSpark1xMoE):
+            ffn_output = yield from self.mlp.forward_staged(ffn_input, router_input, forward_batch)
+        else:
+            ffn_output = self.mlp(ffn_input, router_input, forward_batch) if self.is_moe_layer else self.mlp(ffn_input)
+            yield
+            yield
+        return self._ffn_tail(stream, ffn_output)
 
     def self_attn_input_norm(self, stream: torch.Tensor) -> torch.Tensor:
         return self.input_layernorm(stream).to(self.operator_dtype)
@@ -1742,6 +1813,73 @@ class MuseSpark1xModel(nn.Module):
         return hidden_states
 
 
+    def _forward_p1ss(self, input_ids, positions, kids, ctxs, input_embeds):
+        """P1-SS (docs/serving/review-1031/STRUCTURAL.md §3.1c): the two children of a two-chunk pass (okc_patch/p1ss.py)
+        through the decoder layers on ONE stream in _p1ss_order, the same order on every rank. Every stage runs under
+        its child's attention backend (ctxs), SP verdict and token count. Returns [(final hidden (the SP shard when the
+        child runs SP), DFlash taps, tokens, SP)] per child."""
+        from sglang.srt.model_executor.forward_context import forward_context
+
+        last = len(self.layers) - 1
+        st = []
+        for fb, ctx in zip(kids, ctxs):
+            s0, s1 = fb.tbo_parent_token_range
+            fb.okc_fs_meta = None
+            if input_embeds is not None:
+                x = input_embeds[s0:s1]
+            else:
+                x = self.embed_tokens(input_ids[s0:s1])
+                if self.embed_norm is not None:
+                    x = self.embed_norm(x)
+            sp = layernorm_sp.runs_sp(fb.forward_mode, num_tokens=s1 - s0)
+            get_forward().set("sp_active", sp)
+            if sp:
+                x = layernorm_sp.sp_entry_scatter(x)
+            stream = x.to(self.residual_dtype)
+            st.append(dict(pos=positions[s0:s1], stream=stream, attn_input=self.layers[0].self_attn_input_norm(stream),
+                           fb=fb, ctx=ctx, n=s1 - s0, sp=sp, taps=[], g=None, h=None))
+        for c, kind, j in _p1ss_order(len(self.layers)):
+            s = st[c]
+            get_forward().set("sp_active", s["sp"])
+            layernorm_sp.set_sp_num_tokens(s["n"])
+            with forward_context(s["ctx"]):
+                if kind == "A":
+                    s["g"] = self.layers[j].forward_staged(s["pos"], s["stream"], s["attn_input"], s["fb"])
+                    next(s["g"])
+                    continue
+                if kind == "M":
+                    next(s["g"])
+                    continue
+                try:
+                    next(s["g"])
+                except StopIteration as e:
+                    s["stream"], s["attn_input"] = e.value
+                else:
+                    raise RuntimeError("P1-SS: a staged layer yielded more than twice")
+                if j in self.layers_to_capture:
+                    s["taps"].append(s["stream"].to(self.operator_dtype))
+                if j == last:   # _forward's tail for this child
+                    s["h"] = (s["attn_input"] if getattr(self.layers[-1], "_okc_tail_used", False) else
+                              self.norm(s["stream"].to(self.operator_dtype)).to(self.operator_dtype))
+        return [(s["h"], s["taps"], s["n"], s["sp"]) for s in st]
+
+
+def _p1ss_order(num_layers):
+    """P1-SS's static stage order, [(child, stage, layer)]: A_a(j) | M_b(j-1) | M_a(j) | R_b(j-1) | A_b(j) | R_a(j). Child
+    b's attention at layer j follows child a's (it reads a's K / V); a's rows gather (issued in A) flies under b's M,
+    b's under a's R and next A; each R comes after one long stage of the other child (STRUCTURAL.md §3.1)."""
+    order = []
+    for j in range(num_layers):
+        order.append((0, "A", j))
+        if j:
+            order.append((1, "M", j - 1))
+        order.append((0, "M", j))
+        if j:
+            order.append((1, "R", j - 1))
+        order += [(1, "A", j), (0, "R", j)]
+    return order + [(1, "M", num_layers - 1), (1, "R", num_layers - 1)]
+
+
 class MuseSparkModel(nn.Module):
     def __init__(self, config, quant_config, prefix):
         super().__init__()
@@ -1817,6 +1955,9 @@ class MuseSpark1xForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
     ):
+        if (okc_patch.SW_P1SS and forward_batch.forward_mode == ForwardMode.EXTEND
+                and positions.shape[0] > okc_patch.P1SS_CUT and not torch.cuda.is_current_stream_capturing()):
+            return self._okc_p1ss_forward(input_ids, positions, forward_batch, input_embeds)
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds=input_embeds
         )
@@ -1867,6 +2008,36 @@ class MuseSpark1xForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+    def _okc_p1ss_forward(self, input_ids, positions, forward_batch, input_embeds):
+        """P1-SS: a pass above P1SS_CUT tokens (only the scheduler's two-chunk passes are) as two children
+        (okc_patch/p1ss.py, MuseSpark1xModel._forward_p1ss); then per child what _forward does with a pass's output
+        (DFlash taps packed and projected, SP shards gathered), and the logits over the pass in token order (the
+        children are contiguous token ranges)."""
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import p1ss as okc_p1ss
+
+        kids, ctxs = okc_p1ss.split(forward_batch, okc_patch.P1SS_CUT)
+        outs = getattr(self.model, "language_model", self.model)._forward_p1ss(
+            input_ids, positions, kids, ctxs, input_embeds)
+        packed = None
+        if outs[0][1] and any(o[3] for o in outs):   # an SP pass hands over its taps packed (and projected)
+            packed = [pack_aux_hidden_states(o[1]) for o in outs]
+            okc_project = getattr(self, "_okc_aux_project", None)
+            projected = [okc_project(t) for t in packed] if okc_project is not None else [None]
+            if all(t is not None for t in projected):   # one format for the whole pass
+                packed = projected
+        hid, aux = [], []
+        for i, (h, taps, n, sp) in enumerate(outs):
+            get_forward().set("sp_active", sp)
+            if packed is not None:
+                aux.append(layernorm_sp.sp_exit_gather(packed[i], num_tokens=n) if sp else packed[i])
+            elif taps:
+                aux.append(taps)
+            hid.append(layernorm_sp.sp_exit_gather(h, num_tokens=n) if sp else h)
+        get_forward().set("sp_active", False)
+        aux = (torch.cat(aux) if packed is not None else [torch.cat(t) for t in zip(*aux)]) if aux else None
+        # input_ids None: the rows are gathered already (the processor reads input_ids only to gather them)
+        return self.logits_processor(None, torch.cat(hid), self.lm_head, forward_batch, aux)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
         """Capture the residual stream after each listed decoder layer.

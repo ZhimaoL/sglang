@@ -737,6 +737,11 @@ class SchedulerMetricsReporter:
 
         if prefill_stats.log_replay_tokens:
             msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
+        from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+        if okc_patch.SW_P1SS and batch is not None and (batch.extend_num_tokens or 0) > okc_patch.P1SS_CUT:
+            # OKC P1-SS: the pass runs as two chunks, each within the chunked-prefill size
+            msg += f"#p1ss-chunks: {okc_patch.P1SS_CUT} + {batch.extend_num_tokens - okc_patch.P1SS_CUT}, "
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
             msg += (
