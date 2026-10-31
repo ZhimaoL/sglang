@@ -1050,8 +1050,11 @@ class MuseSpark1xMoE(nn.Module):
         prenormed = okc_patch.SP_PRENORM_EARLY and sp_active and layernorm_sp.okc_hopper_sp() and self._okc_prenorm_shard()
         if prenormed:
             expert_input = self.pre_expert_norm(expert_input)
+        # OKC_EOD: the rows stay on this rank and gg1 pushes them (no rows gather at all)
+        eod = bool(prenormed and okc_patch.EOD and _okc_eod_active(self, expert_input))
         # OKC_SP_AG_ROWSFIRST: the rows' gather leaves now, under the router's tail, on its own stream
-        rows_first = _okc_rows_first(self, expert_input) if prenormed and okc_patch.SP_AG_ROWSFIRST else None
+        rows_first = (_okc_rows_first(self, expert_input) if prenormed and okc_patch.SP_AG_ROWSFIRST and not eod
+                      else None)
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -1082,7 +1085,8 @@ class MuseSpark1xMoE(nn.Module):
             capturer.capture(layer_id=self.layer_idx, topk_indices=capture_topk_ids)
         if getattr(get_forward(), "sp_active", False):
             return self._forward_sp_experts(
-                expert_input, topk_scores, topk_ids, router_logits, prenormed=prenormed, rows_first=rows_first
+                expert_input, topk_scores, topk_ids, router_logits, prenormed=prenormed, rows_first=rows_first,
+                eod=eod,
             )
         if self.nvfp4_checkpoint:
             output = self.experts(
@@ -1142,11 +1146,12 @@ class MuseSpark1xMoE(nn.Module):
         *,
         prenormed: bool = False,
         rows_first=None,
+        eod: bool = False,
     ) -> torch.Tensor:
         """Return combined source-token shards, before the nonlinear FFN tail."""
         if layernorm_sp.okc_hopper_sp():
             return self._forward_gathered_experts(expert_input, topk_scores, topk_ids, prenormed=prenormed,
-                                                  rows_first=rows_first)
+                                                  rows_first=rows_first, eod=eod)
         if self.pre_expert_norm is not None:
             expert_input = self.pre_expert_norm(expert_input)
         if self.use_megamoe:
@@ -1179,6 +1184,7 @@ class MuseSpark1xMoE(nn.Module):
         *,
         prenormed: bool = False,
         rows_first=None,
+        eod: bool = False,
     ) -> torch.Tensor:
         """SP prefill without the A2A dispatcher: every rank runs its local experts on the whole
         sequence, exactly the non-SP EP, and reduce-scatters the partial sums back to the shards.
@@ -1206,6 +1212,13 @@ class MuseSpark1xMoE(nn.Module):
         prenorm_shard = self._okc_prenorm_shard()
         if prenorm_shard and not prenormed:
             expert_input = self.pre_expert_norm(expert_input)
+        if eod:   # OKC_EOD: only the scores / ids are gathered; gg1 pushes this rank's rows (okc_patch/eod.py)
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import eod as okc_eod
+
+            full_scores, full_ids = _okc_ids_gather(tp_group, topk_scores, topk_ids)
+            output = okc_eod.forward(self.experts, expert_input, full_scores, full_ids)
+            self.experts._okc_m1rs_shard = False   # rs_receive's mark, consumed here as below
+            return output
         if rows_first is not None:
             from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
 
@@ -1305,6 +1318,17 @@ def _okc_rows_first(moe, x):
     with torch.cuda.stream(st), pyn.change_state(enable=True):
         pyn.all_gather(full, x)
     return full, st, x
+
+
+def _okc_eod_active(moe, x):
+    """OKC_EOD (okc_patch/eod.py): whether this SP MoE section runs without its rows gather; the scores / ids go by the
+    multimem gather (_okc_ids_buffer). The predicate is the same on every rank."""
+    tp_group = get_tp_group()
+    if not moe.nvfp4_checkpoint or tp_group.world_size != 8 or _okc_ids_buffer(tp_group, x.device) is None:
+        return False
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import eod as okc_eod
+
+    return okc_eod.active(moe.experts, x.shape[0] * tp_group.world_size, x.device)
 
 
 def _okc_ids_buffer(tp_group, device):

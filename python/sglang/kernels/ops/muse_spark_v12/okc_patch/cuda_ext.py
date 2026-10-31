@@ -21,6 +21,7 @@ _VFG_EXT = None
 _DRAFT_EXT = None
 _FTNORM_EXT = None
 _ROUTE_EXT = None
+_PG_EOD_EXT = None
 
 def _build_dir(name: str):
     """None (torch's default build directory) when that is writable, else one under the temp dir: a read-only home or
@@ -85,11 +86,11 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_N4, QK_FOLD, SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import EOD, PG64_N4, QK_FOLD, SW_M1RS
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     names = (_PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("pg_n4_ext",) if PG64_N4 else ())
-             + (("ftnorm_ext",) if QK_FOLD else ()))
+             + (("ftnorm_ext",) if QK_FOLD else ()) + (("pg_eod_ext",) if EOD and SW_M1RS else ()))
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -239,6 +240,32 @@ def pg_rs_ext(narrow: bool):
                     "okc_pg_moe_n17x128s7_int_d3_m1rs" if narrow else "okc_pg_moe_c350_int_d3_m1rs", _CUDA_SRC,
                     ["gg2", "m1_recv"], ["-DPGN_WSET=17", "-DPGN_NST=7", "-DPG_M1RS"] if narrow else ["-DPG_M1RS"])
     return ext
+
+
+def pg_eod_ext():
+    """OKC_EOD (okc_patch/eod.py): pg's text with eod_gemm (the wide gg1 plus push copiers and per-slot gates), the global
+    align and the replica cut (_cuda_src_eod.py) in a module of its own, built only with OKC_EOD on, so the served pg
+    modules keep their text and builds."""
+    global _PG_EOD_EXT
+    if _PG_EOD_EXT is None:
+        with _lock:
+            if _PG_EOD_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_eod import eod_source
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
+
+                _PG_EOD_EXT = _load_inline(
+                    name="okc_pg_eod_v3",
+                    cpp_sources="void eod_gg1(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor, int64_t, int64_t, torch::Tensor);\n"
+                    "void eod_rep_cut(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t);\n"
+                    "void eod_galign(torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, "
+                    "int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);",
+                    cuda_sources=eod_source(_CUDA_SRC),
+                    functions=["eod_gg1", "eod_rep_cut", "eod_galign"],
+                    extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+                    verbose=False,
+                )
+    return _PG_EOD_EXT
 
 
 def pg_rs_main_ext():
