@@ -9,11 +9,17 @@ idled for the same enqueue time anyway. Eager passes only: P1-SS never runs capt
 
 Per gated push (b(j)), on this rank's clock: slack = arrival at M_b(j)'s first wait - the push's last peer rows done;
 excess = the two wait groups' span minus this pass's floor (the minimum over all its consumers); gate lag = push start
-- gate record (>= 0: the push waited for a(j+1)'s qkv GEMM); CE busy = last rows done - push start."""
+- gate record (>= 0: the push waited for a(j+1)'s qkv GEMM); CE busy = last rows done - push start. Per push (W1B-ORDER-A4,
+QA-P1SS): lag = push start - max(stage ready, gate); lag_h = push start - max(that, the host's enqueue of the push
+mapped onto the GPU clock), so an idle GPU waiting for the host is not read as queueing; lag_q = push start - max(that,
+the push stream's previous push end), the part neither the host nor the push stream's own FIFO explains (HOL / a shared
+hardware queue). Every event also keeps the host time of its record call; the host -> GPU clock map is calibrated on an
+idle GPU right after the pass (min of 5 samples), and again 0.5 s later for drift."""
 
 import json
 import logging
 import os
+import time
 
 import torch
 
@@ -38,11 +44,13 @@ class Trace:
         self.k = 0
         self.geq = int(cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ)
         self._cs = {}
+        self.cal = None   # the host -> GPU clock map, set by times()
 
     def _ev(self, tag, stream, par):
         e = torch.cuda.Event(enable_timing=True)
+        h = time.perf_counter()
         e.record(stream)
-        self.recs.append((tag, par, e))
+        self.recs.append((tag, par, e, h))
 
     def __call__(self, tag, stream, par):
         if tag in ("words0", "rows0"):
@@ -63,29 +71,49 @@ class Trace:
         self.hv[0] = self.k
 
     def times(self):
-        """[(tag, par, us since the first event)] after a synchronize."""
+        """[(tag, par, us since the first event, its record call's host time on the GPU clock)] after a synchronize."""
         torch.cuda.synchronize()
         if not self.recs:
             return []
-        t0 = self.recs[0][2]
-        return [(tag, par, round(t0.elapsed_time(e) * 1e3, 2)) for tag, par, e in self.recs]
+        t0, h0 = self.recs[0][2], self.recs[0][3]
+        cal = []
+        for k in range(2):   # an idle GPU runs a record right after the call: GPU - host time is the map's offset
+            if k:
+                time.sleep(0.5)
+            best = hk = None
+            for _ in range(5):
+                e = torch.cuda.Event(enable_timing=True)
+                hk = time.perf_counter()
+                e.record()
+                e.synchronize()
+                o = t0.elapsed_time(e) * 1e3 - (hk - h0) * 1e6
+                best = o if best is None else min(best, o)
+            cal.append(((hk - h0) * 1e6, best))
+        (ha, oa), (hb, ob) = cal
+        rate = (ob - oa) / (hb - ha)
+        self.cal = {"offset_us": round(oa, 2), "at_us": round(ha, 2), "drift_ppm": round(rate * 1e6, 2)}
+        return [(tag, par, round(t0.elapsed_time(e) * 1e3, 2), round((h - h0) * 1e6 + oa + rate * ((h - h0) * 1e6 - ha), 2))
+                for tag, par, e, h in self.recs]
 
 
 def summarize(T):
     """Pair each consumer with its slot's push and stage (FIFO per slot) -> (uses, pass summary)."""
     pushes, stages, cons, gate = {}, {}, [], None
-    cur_p, cur_c = {}, {}
-    for tag, par, t in T:
+    cur_p, cur_c, order = {}, {}, []
+    for tag, par, t, h in T:
         if tag == "gate":
             gate = t
         elif tag in ("go", "go_g"):
-            d = {"par": par, "gated": tag == "go_g", "go": t, "gate": gate if tag == "go_g" else None}
+            d = {"par": par, "gated": tag == "go_g", "go": t, "enq": h, "gate": gate if tag == "go_g" else None}
             pushes.setdefault(par, []).append(d)
             cur_p[par] = d
+            order.append(d)
         elif tag[0] in "wr" and tag[1:].isdigit():
             cur_p[par][tag] = t
+        elif tag == "ready":
+            stages.setdefault(par, []).append({"ready": t})
         elif tag == "side0":
-            stages.setdefault(par, []).append({"side0": t})
+            stages[par][-1]["side0"] = t
         elif tag == "side1":
             stages[par][-1]["side1"] = t
         elif tag in ("aw", "ar"):
@@ -95,6 +123,8 @@ def summarize(T):
             cur_c[par][tag] = t
         elif tag in ("words0", "words1", "rows0", "rows1"):
             cur_c[par][tag] = t
+    for prev, d in zip(order, order[1:]):   # the push stream is one FIFO: a push starts after the previous one's last op
+        d["prev_end"] = max(v for n, v in prev.items() if n == "go" or (n[0] in "wr" and n[1:].isdigit()))
     k = {}
     uses = []
     for c in cons:
@@ -104,7 +134,10 @@ def summarize(T):
         s = stages[par][i]
         rl = max((int(n[1:]) for n in p if n[0] == "r" and n[1:].isdigit()), default=None)
         r_last = p["r%d" % rl] if rl else None
-        u = {"par": par, "gated": p["gated"],
+        dep = max(s["ready"], p["gate"]) if p["gated"] else s["ready"]
+        deh = max(dep, p["enq"])
+        u = {"par": par, "gated": p["gated"], "lag": round(p["go"] - dep, 2), "lag_h": round(p["go"] - deh, 2),
+             "lag_q": round(p["go"] - max(deh, p.get("prev_end", deh)), 2),
              "slack": None if r_last is None else round(c["aw"] - r_last, 2),
              "slack_rows": None if r_last is None else round(c["ar"] - r_last, 2),
              "span_w": round(c["words1"] - c["words0"], 2), "span_r": round(c["rows1"] - c["rows0"], 2),
@@ -127,7 +160,9 @@ def summarize(T):
          "min_gate_lag": min((u["gate_lag"] for u in g if u["gate_lag"] is not None), default=None),
          "ce_busy": round(sum(u["busy"] or 0 for u in uses), 2),
          "exposed": round(sum(u["excess"] for u in uses), 2),
-         "own_max": max(u["own"] for u in uses)}
+         "own_max": max(u["own"] for u in uses),
+         **{f"{n}_{f}": (sorted(u[n] for u in uses)[len(uses) // 2] if f == "med" else max(u[n] for u in uses))
+            for n in ("lag", "lag_h", "lag_q") for f in ("med", "max")}}
     s["rows_before_first_wait"] = bool(sl) and len(sl) == len(g) and min(sl) >= 0 and s["max_excess_gated"] <= 10.0
     return uses, s
 
@@ -156,5 +191,5 @@ def pass_end(tr, ok=True):
     uses, s = summarize(T)
     path = os.path.join(OUT_DIR, f"w1b_trace_p{_N[0]}_r{rank}.json")
     with open(path, "w") as f:
-        json.dump({"pass": _N[0], "rank": rank, "events": T, "uses": uses, "summary": s}, f)
+        json.dump({"pass": _N[0], "rank": rank, "cal": tr.cal, "events": T, "uses": uses, "summary": s}, f)
     logger.info("OKC W1b trace pass %d rank %d: %s (%s)", _N[0], rank, json.dumps(s), path)
