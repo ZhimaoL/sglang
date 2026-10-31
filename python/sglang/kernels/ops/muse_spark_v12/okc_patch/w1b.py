@@ -14,6 +14,7 @@ push-done event (the own-source fence; also what keeps the own slots safe withou
 """
 
 import logging
+import os
 
 import torch
 
@@ -110,16 +111,32 @@ def setup(group_name, world, rank, device, s_max, hidden=4096, parities=2, agree
         torch.cuda.synchronize(device)   # the pads are zero before any peer returns from the rendezvous
         return buf
 
+    def rendezvous():
+        # The slots need no multicast (peer copies + memop flags), so this rendezvous takes no multicast object from the
+        # later users (sp_tp_ce, M1-RS): torch reads TORCH_SYMM_MEM_DISABLE_MULTICAST at every rendezvous (W1BMC: per call
+        # on every rank; QA-M2B Q14)
+        old = os.environ.get("TORCH_SYMM_MEM_DISABLE_MULTICAST")
+        os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"] = "1"
+        try:
+            return symm_mem.rendezvous(buf, group_name)
+        finally:
+            if old is None:
+                del os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"]
+            else:
+                os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"] = old
+
     buf = run(alloc)
     if buf is None:
         return None
-    hdl = run(lambda: symm_mem.rendezvous(buf, group_name))
+    hdl = run(rendezvous)
     if hdl is None:
         return None
     if hdl.world_size != world or hdl.rank != rank:
         raise RuntimeError(f"W1b: symm-mem world / rank {hdl.world_size} / {hdl.rank} != {world} / {rank}")
     st = State(hdl, buf, world, rank, s_max, hidden, parities)
-    logger.info("OKC W1b push transport active (%d parities, S_max %d, %.0f MiB symmetric).", parities, s_max, n / 2**20)
+    mc = int(getattr(hdl, "multicast_ptr", 0) or 0) != 0
+    logger.info("OKC W1b push transport active (%d parities, S_max %d, %.0f MiB symmetric, %s).", parities, s_max,
+                n / 2**20, "multicast ON (opt-out not honored)" if mc else "no multicast")
     return st
 
 
