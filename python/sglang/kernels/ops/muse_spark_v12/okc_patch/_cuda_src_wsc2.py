@@ -1,9 +1,9 @@
 """CUDA source of OKC_SW_WSC2 (okc_patch/wsc2.py): KQ3 (qkv_gate at m 17-32) and KO2b (o_proj at m 1-32), from muse-opt
 serving/kernels/megakernel/mkw1b_src.py (md5 906b1eb9; LOG M5.3 / M5.4) with the probe-only kernels left out.
 
-KQ3: 108 CTAs = 36 row tiles x a cluster of 3 (split-K 22 / 21 / 21 k-stages of 128), a 9-stage ring of [16 KB W | 8 KB
-x] over 224 KB, wgmma m64n32k16 (W rows as A, tokens as B); the producer issues the W atoms of the first 9 stages before
-griddepcontrol.wait (one expect_tx of W + x per stage) and their x atoms after it; fp32 partials reduced by push-mode
+KQ3: 108 CTAs = 36 row tiles x a cluster of 3 (split-K 22 / 21 / 21 k-stages of 128), an 8-stage ring of [16 KB W | 8 KB
+x] (205,960 B, so a CTA fits beside an all-gather-norm CTA), wgmma m64n32k16 (W rows as A, tokens as B); the producer issues the W atoms of the first 9 stages before
+griddepcontrol.wait (one expect_tx of W + x per stage) and their x atoms after it (14.2 MB staged); fp32 partials reduced by push-mode
 DSMEM (warp w's rows owned by rank (w == 3 ? 0 : w); own + lower + higher rank, fixed order), bf16 out.
 KO2b: 128 CTAs, each loads its 64-row weight slice (16 atoms of 64 k, one barrier each) before griddepcontrol.wait, then
 streams x through a 3-slot ring of 64-k atoms. 135-145 KB, so a CTA fits beside a VP2 CTA (81,984 B).
@@ -78,12 +78,15 @@ template <int NT> DINL void wgmma_nt(float* acc, uint64_t da, uint64_t db) {
     else wgmma_n32(acc, da, db);
 }
 
+// 8 stages, not the 9 that fit in 224 KB: a KQ3 CTA must sit beside an all-gather-norm CTA (1,232 B static) on one SM
+// (233,472 B, 1 KB reserved per CTA), and 9 stages miss by 360 B.
 template <int NT> struct LayQ3 {
     static constexpr int XATOM = NT * 128;
     static constexpr int SB = STAGE_W + 2 * XATOM;
     static constexpr int RX = 2 * 2 * 16 * NT * 4;            // [owned slot][sender][16 rows][NT] fp32
-    static constexpr int NSTQ = (RINGQ - RX) / SB;
-    static constexpr int SMEM = RINGQ + 8 * (2 * NSTQ + 1) + 1024;
+    static constexpr int NSTQ = (RINGQ - RX) / SB < 8 ? (RINGQ - RX) / SB : 8;
+    static constexpr int RING_BYTES = NSTQ * SB + RX;
+    static constexpr int SMEM = RING_BYTES + 8 * (2 * NSTQ + 1) + 1024;
 };
 template <int NT> struct LayO2b {
     static constexpr int XATOM = NT * 128;
@@ -133,7 +136,7 @@ __global__ void __launch_bounds__(160, 1) kq3_k(const __grid_constant__ CUtensor
     char* sgen = smem_raw + (sbase - sraw);
     const unsigned ring = sbase, rx = sbase + NSTQ * L::SB;
     const float* rxp = reinterpret_cast<const float*>(sgen + NSTQ * L::SB);
-    const unsigned qfull = sbase + RINGQ, qempty = qfull + 8 * NSTQ, rxbar = qempty + 8 * NSTQ;
+    const unsigned qfull = sbase + L::RING_BYTES, qempty = qfull + 8 * NSTQ, rxbar = qempty + 8 * NSTQ;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int b = blockIdx.x, qrt = b / QS3, qrank = b % QS3;
     if (tid == 0) {
