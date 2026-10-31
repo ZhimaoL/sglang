@@ -373,3 +373,8 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "ANY_ATTN"]
 SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "1")  # M 33..128: fused AG + norm, row kernel at 1024 threads
 __all__ += ["SW_AG_NORM_WIDE"]
+# FT-LEVERS #4 (FIRSTTURN-FTL §3 lever (a)): M1-RS's gg2 sends each route row to its token's home rank as one 128 B TMA
+# bulk store instead of eight 16 B thread stores (same bytes, same addresses). Its own builds (module names + "b"); default
+# off until its A/B reads.
+M1RS_BULK = _flag("OKC_M1RS_BULK", "0")
+__all__ += ["M1RS_BULK"]

@@ -235,9 +235,13 @@ def pg_rs_ext(narrow: bool):
             if ext is None:
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
 
+                from sglang.kernels.ops.muse_spark_v12.okc_patch import M1RS_BULK
+
+                bulk = ["-DPG_M1RS_BULK"] if M1RS_BULK else []   # FT-LEVERS #4: gg2's home rows by TMA bulk stores
                 ext = _PG_RS_EXT[narrow] = _pg_load(
-                    "okc_pg_moe_n17x128s7_int_d3_m1rs" if narrow else "okc_pg_moe_c350_int_d3_m1rs", _CUDA_SRC,
-                    ["gg2", "m1_recv"], ["-DPGN_WSET=17", "-DPGN_NST=7", "-DPG_M1RS"] if narrow else ["-DPG_M1RS"])
+                    ("okc_pg_moe_n17x128s7_int_d3_m1rs" if narrow else "okc_pg_moe_c350_int_d3_m1rs") + ("b" if bulk else ""),
+                    _CUDA_SRC, ["gg2", "m1_recv"],
+                    (["-DPGN_WSET=17", "-DPGN_NST=7", "-DPG_M1RS"] if narrow else ["-DPG_M1RS"]) + bulk)
     return ext
 
 

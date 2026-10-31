@@ -86,6 +86,9 @@ DINL void bulk_commit() { asm volatile("cp.async.bulk.commit_group;" ::: "memory
 DINL void bulk_wait_read0() { asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory"); }
 DINL void bulk_wait0() { asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); }
 DINL void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
+#if defined(PG_M1RS_BULK) && !defined(PG_M1RS)
+#error "PG_M1RS_BULK is a variant of the M1-RS build (-DPG_M1RS)"
+#endif
 DINL void named_bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 template <int N> DINL void reg_dec() { asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(N)); }
 template <int N> DINL void reg_inc() { asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(N)); }
@@ -674,12 +677,18 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
         constexpr int NPS = (NV + 63) / 64, NSG = NV >= 64 ? 4 : NV / 16;   // passes, x4 groups per pass
 #pragma unroll
         for (int p = 0; p < NPS; p++) {                  // 64-token passes (one partial pass below 64)
+#ifdef PG_M1RS_BULK
+            if (m1 != nullptr && wtid < 64) bulk_wait_read0();   // this thread's bulk stores finished reading epi
+#endif
             named_bar_sync(bar, 128);                 // previous pass's readers are done
 #pragma unroll
             for (int s = 0; s < NSG; s++) {              // 4 x4-groups = 16 matrices (8 i-blocks x 2 row halves)
 #else   // PGN_WSET
 #pragma unroll
         for (int p = 0; p < NV / 64; p++) {              // 64-token passes
+#ifdef PG_M1RS_BULK
+            if (m1 != nullptr && wtid < 64) bulk_wait_read0();   // this thread's bulk stores finished reading epi
+#endif
             named_bar_sync(bar, 128);                 // previous pass's readers are done
 #pragma unroll
             for (int s = 0; s < 4; s++) {                // 4 x4-groups = 16 matrices (8 i-blocks x 2 row halves)
@@ -698,6 +707,28 @@ DINL void item_body(Ctx& c, float (&acc)[ACC], unsigned (&bA)[16], unsigned (&bB
                 const unsigned a = epi + (8 * il + (lane & 7)) * EPI2_PITCH + (lw * 16 + 8 * h) * 2;
                 stsm_x4_trans(a, r[0], r[1], r[2], r[3]);
             }
+#ifdef PG_M1RS_BULK   // M1-RS rows by TMA bulk stores (FT-LEVERS #4, FIRSTTURN-FTL §3 lever (a)): one 128 B bulk copy
+                      // per route row (its 8 chunks are contiguous in epi and at the home slot), one thread per row
+            if (m1 != nullptr) {
+                fence_proxy_async();                     // this thread's stmatrix writes -> visible to the async proxy
+                named_bar_sync(bar, 128);
+                if (wtid < 64) {
+                    const int rid = rids[64 * p + wtid];
+                    if (rid < numel) {
+                        const int home = (int)(((unsigned long long)rid * rs_mg) >> 40);
+#ifdef PG_M1RS_CHECK
+                        if ((unsigned)home >= 8u) __trap();
+#endif
+                        const size_t off = (size_t)rid * (NWT * 128) + wt * 128 + cw * 64;
+                        __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(
+                            __ldg(reinterpret_cast<const unsigned long long*>(m1) + home));
+                        bulk_s2g(dst + (off - (size_t)home * rs_rows * (NWT * 128)), epi + wtid * EPI2_PITCH, 128);
+                    }
+                    bulk_commit();
+                }
+                continue;
+            }
+#endif  // PG_M1RS_BULK
             named_bar_sync(bar, 128);
 #pragma unroll
 #ifdef PGN_WSET
@@ -1049,6 +1080,12 @@ __global__ void __launch_bounds__(384, 1) pg_gemm(
 #endif  // PGN_WSET
     }
     if (GATED && wtid == 0) bulk_wait0();               // stores complete before the CTA retires its smem
+#ifdef PG_M1RS_BULK
+    if (!GATED && m1 != nullptr && wtid < 64) {         // the row stores performed, and ordered before the release
+        bulk_wait0();
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+    }
+#endif
 #if defined(PG_M1_STORE) || defined(PG_M1RS)
     if (!GATED && m1_ep != nullptr) {                   // M1 / M1-RS: one release per CTA on every rank's epoch word
         named_bar_sync(3, 256);
