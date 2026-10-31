@@ -373,3 +373,11 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "ANY_ATTN"]
 SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "1")  # M 33..128: fused AG + norm, row kernel at 1024 threads
 __all__ += ["SW_AG_NORM_WIDE"]
+# P1-SS (docs/serving/review-1031/STRUCTURAL.md §3.1 / §3.1c): above OKC_P1SS_MIN_RUNNING running requests the scheduler
+# gives a first-turn pass two chunks' budget; a pass above OKC_P1SS_CUT tokens runs as two children cut at OKC_P1SS_CUT
+# (each one stock chunk) on ONE compute stream, in a static stage order identical on every rank (okc_patch/p1ss.py).
+# Default off.
+SW_P1SS = _flag("OKC_SW_P1SS", "0")
+P1SS_CUT = int(os.environ.get("OKC_P1SS_CUT", "16384"))
+P1SS_MIN_RUNNING = int(os.environ.get("OKC_P1SS_MIN_RUNNING", "8"))
+__all__ += ["SW_P1SS", "P1SS_CUT", "P1SS_MIN_RUNNING"]

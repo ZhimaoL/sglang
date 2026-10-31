@@ -8,6 +8,7 @@ The pg packs are re-encodings of the raw NVFP4 expert tensors, so maybe_capture_
 right before prepare_moe_nvfp4_layer_for_marlin repacks them in place.
 """
 
+import contextlib
 import logging
 
 import torch
@@ -448,6 +449,21 @@ def finalize_routes(layer, y, topk_scores, local_ids):
     )
 
 
+_RS_DEFER = None   # P1-SS: a list that _moe_pg appends its M1-RS receiver to instead of running it
+
+
+@contextlib.contextmanager
+def defer_receive(box):
+    """P1-SS: inside, an M1-RS pg call issues gg2 (its stores and releases) and returns an empty placeholder; the
+    receiver (a callable returning this rank's shard) lands in box for the caller's R stage."""
+    global _RS_DEFER
+    _RS_DEFER = box
+    try:
+        yield box
+    finally:
+        _RS_DEFER = None
+
+
 def _m1rs(layer, x, bm):
     """okc_patch.m1.rs_slot for an SP call on pg's 256- / 128-token-block builds, else None."""
     if not _sw.SW_M1RS or bm == 64:
@@ -487,5 +503,8 @@ def _moe_pg(layer, x, topk_scores, topk_ids, state):
     if rs is not None:   # M1-RS: the receiver already summed this rank's shard over the ranks
         from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
 
+        if _RS_DEFER is not None:   # P1-SS: the caller runs the receiver in its R stage (gg2's stores are issued)
+            _RS_DEFER.append(lambda: okc_m1.rs_receive(layer, rs, topk_scores))
+            return x.new_empty((0, x.shape[1]))
         return okc_m1.rs_receive(layer, rs, topk_scores)
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, prep[0])
