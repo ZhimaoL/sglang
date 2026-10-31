@@ -726,6 +726,12 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._draft_swa_layers_num = 0
             self._draft_swa_full_layers_num = 0
             self._draft_cell_size = 0
+        if self._draft_cell_size:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import u3_draft_swa
+
+            # OKC U3: a DFlash draft pool on the target's SWA slots holds a row per SWA token, not per full token.
+            if u3_draft_swa.active():
+                self._draft_cell_size *= self._swa_full_tokens_ratio
 
         self._recompute_cell_size()
 
