@@ -1,0 +1,186 @@
+"""OKC W1b: the SP MoE section's gathered inputs (rows [S, 4096] bf16 + router words [S, 16] int32) as zero-SM copy-engine
+pushes with memop readiness flags (docs/serving/review-1031/W1B-ORDER.md; STRUCTURAL §3.1a "W1b after K2b2").
+
+Each rank pushes its shard into its own slot of every peer's parity buffer, on a dedicated push stream: words first (pg_prep
+needs only them), then the rows, each followed by a stream-memop flag write into the peer's pad. The consumer waits the
+flags with stream memops on the compute stream, so nothing on the comm path needs an SM (no barrier kernel, no NCCL; K1).
+Flags follow x-agflags' Flags helper: cuStreamWriteValue32 DEFAULT (the writer's memory barrier orders the copies before
+the flag), cuStreamWaitValue32 EQ, reset to 0 on the consumer's stream. Captured memops keep constant values, so 1 / 0.
+
+Order (W1B-ORDER §2-§4): every produce is enqueued before any wait that depends on it; the own block is a same-device copy
+on a side compute stream (never the push stream: a same-device copy is an SM kernel and would gate the peer copies behind
+it); the pushes read the caller's x, which is held until the next same-parity produce, which first waits the parity's
+push-done event (the own-source fence; also what keeps the own slots safe without the qkv barrier).
+"""
+
+import logging
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+_IDS, _ROWS = 0, 1
+
+
+def _ok(cu, res):
+    if res[0] != cu.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"CUDA driver error {res[0]}")
+    return res[1] if len(res) > 1 else None
+
+
+class Flags:
+    """x-agflags' memop helper. pads[p]: rank p's int32 pad [P][2][W] as mapped here; flag (par, kind, src) of rank r is
+    written by rank src after its pushes into r and waited / reset by r."""
+
+    def __init__(self, pads, me, world, parities):
+        from cuda.bindings import driver as cu
+
+        self.cu, self.me, self.W, self.P = cu, me, world, parities
+        self.pads = pads
+        self.write_flags = cu.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT
+        self.wait_flags = int(cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ)
+        dev = _ok(cu, cu.cuCtxGetDevice())
+        if _ok(cu, cu.cuDeviceGetAttribute(cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES, dev)):
+            self.wait_flags |= int(cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_FLUSH)
+        self._cs = {}
+
+    def _stream(self, stream):
+        cs = self._cs.get(stream.cuda_stream)
+        if cs is None:
+            cs = self._cs[stream.cuda_stream] = self.cu.CUstream(stream.cuda_stream)
+        return cs
+
+    def _addr(self, rank, par, kind, src):
+        return self.cu.CUdeviceptr(self.pads[rank] + 4 * ((par * 2 + kind) * self.W + src))
+
+    def signal(self, stream, dest, par, kind):
+        """On `stream`, after its copies: dest's flag (par, kind, me) = 1."""
+        _ok(self.cu, self.cu.cuStreamWriteValue32(self._stream(stream), self._addr(dest, par, kind, self.me), 1,
+                                                  self.write_flags))
+
+    def wait(self, stream, src, par, kind):
+        """On `stream`: wait until my flag (par, kind, src) == 1, then reset it to 0."""
+        cs = self._stream(stream)
+        a = self._addr(self.me, par, kind, src)
+        _ok(self.cu, self.cu.cuStreamWaitValue32(cs, a, 1, self.wait_flags))
+        _ok(self.cu, self.cu.cuStreamWriteValue32(cs, a, 0, self.write_flags))
+
+
+class State:
+    """One symmetric allocation per rank: per parity [rows W x S_max x H bf16 | words W x S_max x 16 int32], then the flag
+    pad [P][2][W] int32; the push stream and side compute stream; per-parity events and the held x."""
+
+    def __init__(self, hdl, buf, world, rank, s_max, hidden, parities):
+        self.hdl, self.buf = hdl, buf
+        self.W, self.me, self.S_max, self.H, self.P = world, rank, s_max, hidden, parities
+        rows_b = world * s_max * hidden * 2
+        words_b = world * s_max * 16 * 4
+        self.per_par = rows_b + words_b
+        pad_off = parities * self.per_par
+        # get_buffer's offset counts elements of the view's dtype, not bytes
+        self.rows = [[hdl.get_buffer(p, (world * s_max, hidden), torch.bfloat16, par * self.per_par // 2)
+                      for p in range(world)] for par in range(parities)]
+        self.words = [[hdl.get_buffer(p, (world * s_max, 16), torch.int32, (par * self.per_par + rows_b) // 4)
+                       for p in range(world)] for par in range(parities)]
+        pads = [hdl.get_buffer(p, (parities * 2 * world,), torch.int32, pad_off // 4).data_ptr() for p in range(world)]
+        self.flags = Flags(pads, rank, world, parities)
+        self.push = torch.cuda.Stream(priority=-1)
+        self.side = torch.cuda.Stream()
+        self.ce_done = [None] * parities
+        self.own_done = [None] * parities
+        self.held = [None] * parities
+
+
+def nbytes(world, s_max, hidden, parities):
+    return parities * (world * s_max * hidden * 2 + world * s_max * 16 * 4) + parities * 2 * world * 4
+
+
+def setup(group_name, world, rank, device, s_max, hidden=4096, parities=2, agreed=None):
+    """Allocate, zero and rendezvous (outside capture; every rank together). agreed: ext_coll.agreed in the server, so a
+    failure on any rank leaves every rank on the old path; None runs the steps directly (tests)."""
+    from torch.distributed import _symmetric_memory as symm_mem
+
+    run = agreed or (lambda step: step())
+    n = nbytes(world, s_max, hidden, parities)
+
+    def alloc():
+        buf = symm_mem.empty(n, dtype=torch.uint8, device=device)
+        buf.zero_()
+        torch.cuda.synchronize(device)   # the pads are zero before any peer returns from the rendezvous
+        return buf
+
+    buf = run(alloc)
+    if buf is None:
+        return None
+    hdl = run(lambda: symm_mem.rendezvous(buf, group_name))
+    if hdl is None:
+        return None
+    if hdl.world_size != world or hdl.rank != rank:
+        raise RuntimeError(f"W1b: symm-mem world / rank {hdl.world_size} / {hdl.rank} != {world} / {rank}")
+    st = State(hdl, buf, world, rank, s_max, hidden, parities)
+    logger.info("OKC W1b push transport active (%d parities, S_max %d, %.0f MiB symmetric).", parities, s_max, n / 2**20)
+    return st
+
+
+def produce(st, x, scores, ids, par, gate=None):
+    """End of A_x(j) on the compute stream: x [S, H] bf16 (the shard prenorm), scores [S, 8] fp32, ids [S, 8] int32.
+    Words into my own slot (cat(out=), compute stream), the own rows by a side-stream copy, then on the push stream the
+    words + rows into every peer's slot `me`, each followed by its flag. gate: an event the pushes also wait for (the
+    P1-SS push window, W1B-ORDER §7). Every enqueue happens here, before any consumer wait."""
+    S, W, me = x.shape[0], st.W, st.me
+    cur = torch.cuda.current_stream()
+    if st.ce_done[par] is not None:          # the own-source fence, unless join_push already took it
+        cur.wait_event(st.ce_done[par])
+    words = st.words[par][me][me * S:(me + 1) * S]
+    torch.cat([scores.contiguous().view(torch.int32), ids.to(torch.int32).contiguous()], dim=1, out=words)
+    x = x.contiguous()
+    ready = torch.cuda.Event()
+    ready.record(cur)
+    st.side.wait_event(ready)
+    with torch.cuda.stream(st.side):
+        st.rows[par][me][me * S:(me + 1) * S].copy_(x)
+    own = torch.cuda.Event()
+    own.record(st.side)
+    st.push.wait_event(ready)
+    if gate is not None:
+        st.push.wait_event(gate)
+    fl = st.flags
+    with torch.cuda.stream(st.push):
+        for s in range(1, W):
+            p = (me + s) % W
+            st.words[par][p][me * S:(me + 1) * S].copy_(words)
+            fl.signal(st.push, p, par, _IDS)
+            st.rows[par][p][me * S:(me + 1) * S].copy_(x)
+            fl.signal(st.push, p, par, _ROWS)
+    done = torch.cuda.Event()
+    done.record(st.push)
+    st.ce_done[par], st.own_done[par] = done, own
+    st.held[par] = (x, scores, ids)          # the push stream reads x until `done`; dropped after the next fence
+
+
+def wait_words(st, par, S):
+    """Compute stream: the 7 peers' words are in -> (scores [W S, 8] fp32, ids [W S, 8] int32), views of my buffer."""
+    cur = torch.cuda.current_stream()
+    for s in range(1, st.W):
+        st.flags.wait(cur, (st.me - s) % st.W, par, _IDS)
+    w = st.words[par][st.me][: st.W * S]
+    return w[:, :8].view(torch.float32), w[:, 8:]
+
+
+def wait_rows(st, par, S):
+    """Compute stream: the 7 peers' rows and my own block are in -> rows [W S, H] bf16, a view of my buffer."""
+    cur = torch.cuda.current_stream()
+    for s in range(1, st.W):
+        st.flags.wait(cur, (st.me - s) % st.W, par, _ROWS)
+    cur.wait_event(st.own_done[par])
+    return st.rows[par][st.me][: st.W * S]
+
+
+def join_push(st, par):
+    """Compute stream: my parity-`par` pushes are done. Call it before the graph segment that issued them ends (a captured
+    fork must rejoin its origin stream), at the end of the MoE section; it costs nothing once the pushes have drained.
+    It also discharges the next same-parity produce's fence (an event from an earlier capture cannot be waited in a
+    later one)."""
+    if st.ce_done[par] is not None:
+        torch.cuda.current_stream().wait_event(st.ce_done[par])
+        st.ce_done[par] = None
