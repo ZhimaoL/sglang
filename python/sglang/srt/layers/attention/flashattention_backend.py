@@ -1387,7 +1387,7 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
-    def _okc_fused_fp8_kv(self, q, k, v, layer, forward_batch, is_prefill):
+    def _okc_fused_fp8_kv(self, q, k, v, layer, forward_batch, is_prefill, qk_fold=None):
         """OKC (OKC_SW_FA3_FUSED_KV): the FP8 casts of k / v and the paged KV write (set_kv_buffer: two cast launches +
         store_kvcache) plus the FP8 cast of q that prepare_paged_mha_query does next, as one launch of the
         fused_fp8_qkv_kv_cache kernel the TRT-LLM backend uses. Same values: unscaled layers only (the pool divides
@@ -1445,6 +1445,10 @@ class FlashAttentionBackend(AttentionBackend):
             and layer.head_dim <= 256
             and (not is_prefill or self.fa_impl_ver != 4)
         )
+        if qk_fold is not None:   # OKC_QK_FOLD: q / k raw, the per-head norm (and rope) in the same launch
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import ft_norm
+
+            return ft_norm.fold(q, k, v, k_cache, v_cache, loc, quant_q, qk_fold, forward_batch)
         from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
 
         ones = getattr(self, "_okc_kv_ones", None)
@@ -1483,6 +1487,10 @@ class FlashAttentionBackend(AttentionBackend):
             raise NotImplementedError("MLA extend does not return an LSE.")
         extend_lse = None
         cp_active = is_cp_active(forward_batch)
+        if getattr(layer, "okc_qk_fold", None) is not None:   # OKC_QK_FOLD: raw q / k from a marked layer
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import ft_norm
+
+            q, k, save_kv_cache = ft_norm.extend(self, q, k, v, layer, forward_batch, save_kv_cache, cp_active)
 
         if k is not None:
             assert v is not None
