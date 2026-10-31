@@ -360,3 +360,10 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "ANY_ATTN"]
 SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "1")  # M 33..128: fused AG + norm, row kernel at 1024 threads
 __all__ += ["SW_AG_NORM_WIDE"]
+# FT-LEVERS #7 (piece C, revived; docs/serving/review-1031/FT-LEVERS.md §2): the SP entry of a text-only prefill as a
+# reduce-scatter. The served class (MuseSparkForConditionalGeneration._forward_omni) embeds eagerly for the breakable
+# graph's input_embeds slot; on: the vocab shards' masked lookups are reduce-scattered, embed_norm runs on this rank's
+# shard and the shard fills this rank's rows of the [T, h] input_embeds (the inner sp_entry_scatter reads only those),
+# instead of an all-reduce of [T, 8192] and the norm on every row. Bit-exact (one nonzero term per row, the norm per row).
+SP_EMB_RS = _flag("OKC_SP_EMB_RS", "0")
+__all__ += ["SP_EMB_RS"]

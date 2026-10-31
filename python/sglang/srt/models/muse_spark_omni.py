@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.muse_spark_v12 import okc_patch
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.linear import (
     ReplicatedLinear,
@@ -140,6 +142,26 @@ class _NormalizedEmbedding(nn.Module):
     @property
     def num_embeddings(self):
         return self._embedding.num_embeddings
+
+
+def _okc_entry_rs(model, input_ids: torch.Tensor, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+    """OKC_SP_EMB_RS: a text-only SP prefill's input_embeds from layernorm_sp.okc_entry_reduce_scatter (the vocab shards'
+    masked lookups reduce-scattered, embed_norm on this rank's [ceil(T / tp), h] shard), written into this rank's rows
+    of a [T, h] tensor. The inner model's sp_entry_scatter reads only those rows (its padding rows are zeros either way)
+    and nothing else reads the others, so they stay unwritten. None when the forward does not run SP."""
+    lm = model.model.language_model
+    shard = layernorm_sp.okc_entry_reduce_scatter(
+        lm.embed_tokens, lm.embed_norm, input_ids, forward_batch.forward_mode
+    )
+    if shard is None:
+        return None
+    T, S = input_ids.shape[0], shard.shape[0]
+    r = get_parallel().tp_group.rank_in_group
+    out = shard.new_empty((T, shard.shape[1]))
+    n = min(S, T - r * S)
+    if n > 0:
+        out[r * S : r * S + n].copy_(shard[:n])
+    return out
 
 
 class MuseSparkForConditionalGeneration(MuseSpark1xForCausalLM):
@@ -285,7 +307,10 @@ class MuseSparkForConditionalGeneration(MuseSpark1xForCausalLM):
             # forwards input_ids alone, the replay buffer retains its
             # capture-time zeros and every prefill logit is invalid.  Use the
             # same normalized embedding path as multimodal requests.
-            input_embeds = self.get_input_embeddings()(input_ids)
+            if okc_patch.SP_EMB_RS:
+                input_embeds = _okc_entry_rs(self, input_ids, forward_batch)
+            if input_embeds is None:
+                input_embeds = self.get_input_embeddings()(input_ids)
         return super().forward(
             input_ids, positions, forward_batch, input_embeds=input_embeds
         )

@@ -290,6 +290,38 @@ def okc_boundary_take() -> bool:
     return fired
 
 
+_okc_entry_rs_logged: list = []
+
+
+def okc_entry_reduce_scatter(embed, norm, input_ids: torch.Tensor, forward_mode) -> Optional[torch.Tensor]:
+    """OKC_SP_EMB_RS: the SP entry as one reduce-scatter. The vocab-parallel embedding's masked local lookup [M, h]
+    (zeros where another rank owns the token's row) is padded like ``sp_entry_scatter`` and reduce-scattered, then
+    ``norm`` runs on this rank's [M_pad / tp, h] shard, instead of an all-reduce of [M, h] and the norm on every row.
+    Bit-exact: each row's sum has one nonzero term, the norm is per row and padding rows stay zero. None when this
+    forward does not run SP or the embedding would not all-reduce (the caller then takes the usual path)."""
+    from sglang.srt.layers.layer_boundary import get_attn_tp_context
+    from sglang.srt.utils.async_probe import maybe_detect_oob
+
+    num_tokens = input_ids.shape[0]
+    tp_group = get_parallel().tp_group
+    tp_size = tp_group.world_size
+    if (tp_size == 1 or embed.tp_size != tp_size or embed.use_attn_tp_group
+            or get_attn_tp_context().input_scattered or not runs_sp(forward_mode, num_tokens=num_tokens)):
+        return None
+    set_sp_num_tokens(num_tokens)
+    if not _okc_entry_rs_logged:
+        _okc_entry_rs_logged.append(num_tokens)
+        logger.info("OKC SP entry reduce-scatter active (first T=%d).", num_tokens)
+    maybe_detect_oob(input_ids, 0, embed.num_embeddings, "VocabParallelEmbedding input id")
+    partial = embed._embed_local_shard(input_ids)
+    padded = ceil_align(num_tokens, tp_size)
+    if padded != num_tokens:
+        partial = torch.nn.functional.pad(partial, (0, 0, 0, padded - num_tokens))
+    shard = partial.new_empty((padded // tp_size, partial.shape[1]))
+    tp_group.reduce_scatter_tensor(shard, partial.contiguous())
+    return shard if norm is None else norm(shard)
+
+
 def sp_exit_gather(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """g: all-gather the per-rank shards back to the full sequence along dim 0,
     then narrow to ``num_tokens`` (dropping the entry-scatter padding)."""
