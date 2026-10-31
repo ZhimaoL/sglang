@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     pre_capture_activation_reserve_mb,
 )
-from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
+from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -74,6 +74,11 @@ def compute_post_capture_kv_resize(
     headroom_gb = model_runner.pre_model_load_memory * (
         1 - model_runner.mem_fraction_static
     )
+    # OKC exact KV pin: hold the base's own token count; pre-KV adds / savings then move the post-KV headroom, down to
+    # the floor (still raised by the reserves below). Shipped freezes set both defaults in code; unset = stock.
+    pin = get_int_env_var("OKC_KV_PIN_TOKENS")
+    if pin > 0:
+        headroom_gb = get_int_env_var("OKC_KV_PIN_FLOOR_MIB", 9216) / 1024
     decode_cuda_graph_config = get_exec().graph.cuda_graph_config.decode
     decode_max_bs = int(decode_cuda_graph_config.max_bs or 0)
     running_requests = int(model_runner.max_running_requests or decode_max_bs or 1)
@@ -131,9 +136,15 @@ def compute_post_capture_kv_resize(
         + sum(draft_pool.post_capture_backed_bytes for draft_pool in draft_pools)
         - canary_workspace_bytes
     )
+    cap = model_runner.max_total_num_tokens
     config = model_runner.kv_cache_configurator.config_from_budget(
-        budget_bytes, cap_tokens=model_runner.max_total_num_tokens
+        budget_bytes, cap_tokens=min(cap, pin) if pin > 0 else cap
     )
+    if pin > 0:
+        got = config.full_max_total_num_tokens or config.max_total_num_tokens
+        (logger.info if got >= pin else logger.error)(
+            "OKC KV pin: pin %d, full_layer_tokens %d, floor %.2f GB%s", pin, got, headroom_gb,
+            "" if got >= pin else " BELOW PIN (floor)")
     pool.finalize_backing(config)
     for draft_pool in draft_pools:
         draft_pool.finalize_backing(config)
