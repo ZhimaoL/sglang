@@ -157,7 +157,7 @@ GEMM_AG_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_MAX_TOKENS", "128"))
 # the DFlash column splits, and an explicit OKC_GEMM_AG_MAX_TOKENS still sets all three (older arms keep their meaning).
 _GEMM_AG_ENV = os.environ.get("OKC_GEMM_AG_MAX_TOKENS")
 GEMM_AG_POOLER_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_POOLER_MAX_TOKENS", _GEMM_AG_ENV or "256"))
-GEMM_AG_UNPOOLER_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_UNPOOLER_MAX_TOKENS", _GEMM_AG_ENV or "136"))
+GEMM_AG_UNPOOLER_MAX_TOKENS = int(os.environ.get("OKC_GEMM_AG_UNPOOLER_MAX_TOKENS", _GEMM_AG_ENV or "256"))
 # SP participant linears through torch's symmetric-memory fused all-gather+matmul / matmul+reduce-scatter
 # (async TP, copy-engine overlap) on forwards of >= OKC_SP_SYMM_MIN_TOKENS tokens, NCCL below: session SB measured
 # the 74K first turn -6.0% but cached follow-up TTFT +54 ms (bs 1) / +70 ms (bs 4) with it on every forward.
