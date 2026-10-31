@@ -70,6 +70,8 @@ def _setup(device, nl):
                   "rank_of": torch.zeros((64,), dtype=torch.int32, device=device),   # eod_galign writes it per call
                   "W": 3 * torch.cuda.get_device_properties(device).multi_processor_count,
                   "rank": g.rank_in_group, "group": g, "woff": {}, "calls": 0}
+            logger.info("OKC EOD setup: images %.3f GiB (%d blocks), %.2f GiB free after.",
+                        img.numel() * 2 / 2**30, nblocks, torch.cuda.mem_get_info(device)[0] / 2**30)   # MEM-F5
     _STATE[key] = st
     if st is not None and _sw.EOD_EPOCH_DIR:
         _epoch_probe(st, device)
