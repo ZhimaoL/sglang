@@ -244,12 +244,15 @@ static CUtensorMap make_map(const void* p, int rows, int K, int box_rows) {
 
 static std::map<std::tuple<const void*, int, int, int>, CUtensorMap> g_maps;
 
-static const CUtensorMap& cached_map(const void* p, int rows, int K, int box_rows) {
+// By value: a later lookup's clear() must not leave an earlier caller holding a dangling reference (UB past 4096 maps).
+static CUtensorMap cached_map(const void* p, int rows, int K, int box_rows) {
     auto key = std::make_tuple(p, rows, K, box_rows);
     auto it = g_maps.find(key);
     if (it != g_maps.end()) return it->second;
     if (g_maps.size() > 4096) g_maps.clear();
-    return g_maps.emplace(key, make_map(p, rows, K, box_rows)).first->second;
+    const CUtensorMap mp = make_map(p, rows, K, box_rows);
+    g_maps.emplace(key, mp);
+    return mp;
 }
 
 template <int NT, int NST, int S, int KT, int RT, int NWG, int PIPE, int DIAG = 0>
@@ -269,8 +272,8 @@ static void launch(const torch::Tensor& W, const torch::Tensor& x, torch::Tensor
                         "rmw: non-portable cluster");
         set = true;
     }
-    const CUtensorMap& wm = cached_map(W.data_ptr(), N, K, R);
-    const CUtensorMap& xm = cached_map(x.data_ptr(), m, K, NT);
+    const CUtensorMap wm = cached_map(W.data_ptr(), N, K, R);
+    const CUtensorMap xm = cached_map(x.data_ptr(), m, K, NT);
     cudaLaunchConfig_t lc = {};
     lc.gridDim = dim3(N / R, S, 1);
     lc.blockDim = dim3(128 * NWG + 32, 1, 1);
