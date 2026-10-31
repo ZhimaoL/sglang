@@ -89,6 +89,7 @@ class State:
         self.ce_done = [None] * parities
         self.own_done = [None] * parities
         self.held = [None] * parities
+        self.pending = [None] * parities
 
 
 def nbytes(world, s_max, hidden, parities):
@@ -122,14 +123,34 @@ def setup(group_name, world, rank, device, s_max, hidden=4096, parities=2, agree
     return st
 
 
-def produce(st, x, scores, ids, par, gate=None):
-    """End of A_x(j) on the compute stream: x [S, H] bf16 (the shard prenorm), scores [S, 8] fp32, ids [S, 8] int32.
-    Words into my own slot (cat(out=), compute stream), the own rows by a side-stream copy, then on the push stream the
-    words + rows into every peer's slot `me`, each followed by its flag. gate: an event the pushes also wait for (the
-    P1-SS push window, W1B-ORDER §7). Every enqueue happens here, before any consumer wait."""
-    S, W, me = x.shape[0], st.W, st.me
+# The own-source fence (QA-P1SS §3 b): the next same-parity stage waits this parity's push-done event before it writes
+# the own slots or drops x. Off = rely on the transitive argument (every peer's M, which consumed my flags, precedes the
+# next A's qkv barrier on every rank); the unit runs both. join_push (required in graph form) discharges it either way.
+GUARD = True
+
+
+class Gate:
+    """The push-window gate (STRUCTURAL §3.1a amendment 3; QA-P1SS §3 c): an event plus a generation counter. A stream wait
+    binds to the event's most recent record at call time, so push() asserts the generation its caller expects: a gate
+    recorded after the push was enqueued (or not at all) fails loudly instead of silently not gating."""
+
+    def __init__(self):
+        self.ev = torch.cuda.Event()
+        self.gen = 0
+
+    def record(self, stream=None):
+        self.ev.record(stream or torch.cuda.current_stream())
+        self.gen += 1
+        return self.gen
+
+
+def stage(st, x, scores, ids, par):
+    """Compute side of A_x(j)'s produce, on the compute stream: x [S, H] bf16 (the shard prenorm), scores [S, 8] fp32,
+    ids [S, 8] int32. Words into my own slot (cat(out=)), the own rows by a side-stream copy (never on the push stream: a
+    same-device copy is an SM kernel). push() enqueues the peer copies; until then they are pending."""
+    S, me = x.shape[0], st.me
     cur = torch.cuda.current_stream()
-    if st.ce_done[par] is not None:          # the own-source fence, unless join_push already took it
+    if GUARD and st.ce_done[par] is not None:     # the own-source fence, unless join_push already took it
         cur.wait_event(st.ce_done[par])
     words = st.words[par][me][me * S:(me + 1) * S]
     torch.cat([scores.contiguous().view(torch.int32), ids.to(torch.int32).contiguous()], dim=1, out=words)
@@ -141,10 +162,23 @@ def produce(st, x, scores, ids, par, gate=None):
         st.rows[par][me][me * S:(me + 1) * S].copy_(x)
     own = torch.cuda.Event()
     own.record(st.side)
+    st.own_done[par] = own
+    st.held[par] = (x, scores, ids)               # the push stream reads x; dropped after the next same-parity fence
+    st.pending[par] = (S, words, x, ready)
+
+
+def push(st, par, gate=None, gate_gen=None):
+    """Enqueue the staged words + rows into every peer's slot `me` on the push stream, each followed by its flag, after
+    the stage's ready event and, when gated, after `gate` (a Gate whose generation must equal gate_gen: the record the
+    caller made for this push). Must be called before any wait that depends on these pushes (host order; QA a)."""
+    if gate is not None and gate.gen != gate_gen:
+        raise RuntimeError(f"W1b gate generation {gate.gen} != expected {gate_gen}: the wait would bind to another record")
+    S, words, x, ready = st.pending[par]
+    st.pending[par] = None
     st.push.wait_event(ready)
     if gate is not None:
-        st.push.wait_event(gate)
-    fl = st.flags
+        st.push.wait_event(gate.ev)
+    W, me, fl = st.W, st.me, st.flags
     with torch.cuda.stream(st.push):
         for s in range(1, W):
             p = (me + s) % W
@@ -154,8 +188,13 @@ def produce(st, x, scores, ids, par, gate=None):
             fl.signal(st.push, p, par, _ROWS)
     done = torch.cuda.Event()
     done.record(st.push)
-    st.ce_done[par], st.own_done[par] = done, own
-    st.held[par] = (x, scores, ids)          # the push stream reads x until `done`; dropped after the next fence
+    st.ce_done[par] = done
+
+
+def produce(st, x, scores, ids, par, gate=None, gate_gen=None):
+    """stage + push in one step (chunk a, single-chunk forwards, and P1-SS's "ungated" switch)."""
+    stage(st, x, scores, ids, par)
+    push(st, par, gate, gate_gen)
 
 
 def wait_words(st, par, S):
