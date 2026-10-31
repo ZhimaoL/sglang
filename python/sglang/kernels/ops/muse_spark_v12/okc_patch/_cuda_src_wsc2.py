@@ -6,7 +6,8 @@ x] (205,960 B, so a CTA fits beside an all-gather-norm CTA), wgmma m64n32k16 (W 
 griddepcontrol.wait (one expect_tx of W + x per stage) and their x atoms after it (14.2 MB staged); fp32 partials reduced by push-mode
 DSMEM (warp w's rows owned by rank (w == 3 ? 0 : w); own + lower + higher rank, fixed order), bf16 out.
 KO2b: 128 CTAs, each loads its 64-row weight slice (16 atoms of 64 k, one barrier each) before griddepcontrol.wait, then
-streams x through a 3-slot ring of 64-k atoms. 135-145 KB, so a CTA fits beside a VP2 CTA (81,984 B).
+streams x through a 3-slot ring of 64-k atoms. 135-145 KB, so a CTA fits beside a VP2 CTA (81,984 B). Its consumer warps
+trigger the dependents right after their wait, so the all-reduce behind it lands early (KOT1: -0.5 us per layer).
 """
 
 _CUDA_SRC = r"""
@@ -260,6 +261,9 @@ __global__ void __launch_bounds__(160, 1) ko2b_k(const __grid_constant__ CUtenso
         }
     } else {
         pdl_wait();
+        // trigger the dependents (the PDL-launched o_proj all-reduce) now: they land beside this CTA and still wait
+        // for its completion before they read the output (muse-opt megakernel LOG M5.28)
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
         float acc[NT / 2];
 #pragma unroll
         for (int i = 0; i < NT / 2; i++) acc[i] = 0.f;
