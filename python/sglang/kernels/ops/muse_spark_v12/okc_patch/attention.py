@@ -295,6 +295,7 @@ def _vfg_attn(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
             ext.muse_vp2_launch_e(qkv.data_ptr(), page_table.data_ptr(), page_table.stride(0), seq_pre.data_ptr(),
                                   cache_loc.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), freq, out.data_ptr(),
                                   bs, window, c2, 1.0 / kv_scale, 1.0 / kv_scale, kv_scale, eps, 0, stream, 1)
+            okc_wsc2.mark_o(out)
             return out
         ext.muse_vp2_launch(qkv.data_ptr(), page_table.data_ptr(), page_table.stride(0), seq_pre.data_ptr(),
                             cache_loc.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), freq, out.data_ptr(), bs,

@@ -502,7 +502,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         self._ensure_cached_weights(torch.bfloat16)
         # OKC_SW_WSC2: the carveout only (the all-gather norm already triggers its dependents right after its wait)
         carveout = okc_wsc2.agnorm_carveout(self, stream.shape[0])
-        return all_gather_norm_residual(
+        out = all_gather_norm_residual(
             comm,
             local,
             stream,
@@ -515,3 +515,6 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             beta=self._cc_beta if self._use_residual_gate else None,
             carveout=carveout,
         )
+        if carveout >= 0:   # the qkv GEMM that reads this output may run W-staged (okc_patch/wsc2.py)
+            okc_wsc2.mark_q(out[0])
+        return out

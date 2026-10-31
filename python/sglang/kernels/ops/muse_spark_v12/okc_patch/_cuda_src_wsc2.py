@@ -303,13 +303,16 @@ static CUtensorMap make_map(const void* p, int rows, int cols, int box_rows) {
     TORCH_CHECK(r == CUDA_SUCCESS, "wsc2: tensor map encode failed ", (int)r);
     return mp;
 }
+// By value: a later lookup may clear the cache, which must not invalidate a map taken before it (qa-wsc W3 P1).
 static std::map<std::tuple<const void*, int, int, int>, CUtensorMap> g_maps;
-static const CUtensorMap& cached_map(const void* p, int rows, int cols, int box_rows) {
+static CUtensorMap cached_map(const void* p, int rows, int cols, int box_rows) {
     auto key = std::make_tuple(p, rows, cols, box_rows);
     auto it = g_maps.find(key);
     if (it != g_maps.end()) return it->second;
     if (g_maps.size() > 4096) g_maps.clear();
-    return g_maps.emplace(key, make_map(p, rows, cols, box_rows)).first->second;
+    const CUtensorMap mp = make_map(p, rows, cols, box_rows);
+    g_maps.emplace(key, mp);
+    return mp;
 }
 
 // PDL-launched: each kernel issues its weight before griddepcontrol.wait and reads x only after it.
@@ -347,12 +350,12 @@ void wsc2_launch(int64_t kind, torch::Tensor W, torch::Tensor x, torch::Tensor o
                 out.size(1) == N, "wsc2: layout");
     if (kind == 0) {
         TORCH_CHECK(N == wsc2::QN && K == wsc2::QK && m >= 17 && m <= 32, "wsc2: kq3 shape");
-        const CUtensorMap& wm = cached_map(W.data_ptr(), N, K, 64);
-        const CUtensorMap& xm = cached_map(x.data_ptr(), m, K, 32);
+        const CUtensorMap wm = cached_map(W.data_ptr(), N, K, 64);
+        const CUtensorMap xm = cached_map(x.data_ptr(), m, K, 32);
         launch(wsc2::kq3_k<32, true>, wsc2::QCTAS3, wsc2::LayQ3<32>::SMEM, wsc2::QS3, wm, xm, out, m);
     } else {
         TORCH_CHECK(N == wsc2::ON && K == wsc2::OK && m >= 1 && m <= 32, "wsc2: ko2b shape");
-        const CUtensorMap& wm = cached_map(W.data_ptr(), N, K, 64);
+        const CUtensorMap wm = cached_map(W.data_ptr(), N, K, 64);
         if (m <= 8) launch(wsc2::ko2b_k<8>, wsc2::OTILES, wsc2::LayO2b<8>::SMEM, 1, wm, cached_map(x.data_ptr(), m, K, 8), out, m);
         else if (m <= 16) launch(wsc2::ko2b_k<16>, wsc2::OTILES, wsc2::LayO2b<16>::SMEM, 1, wm, cached_map(x.data_ptr(), m, K, 16), out, m);
         else launch(wsc2::ko2b_k<32>, wsc2::OTILES, wsc2::LayO2b<32>::SMEM, 1, wm, cached_map(x.data_ptr(), m, K, 32), out, m);
