@@ -16,7 +16,7 @@ replica).
 
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL
+from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL, SW_PGR
 from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow64_ext, pg_narrow_ext
 
@@ -262,7 +262,8 @@ def grouped_pg_small(x, topk_ids, expert_map, *, norm_weight, norm_eps, wsf13, g
     emap = expert_map if expert_map is not None else topk_ids.new_empty((0,))
     n_global = expert_map.shape[0] if expert_map is not None else nl
     rtab, me = rep if rep is not None else (topk_ids.new_empty((0,)), 0)
-    ext.route(topk_ids, emap, rtab, local_ids, sorted_ids, block_experts, live, numel, n_global, nl, p, me)
+    rx = cuda_ext.pgr_ext() if SW_PGR and bm == 64 and numel <= 2048 and me < 8 else ext   # OKC_SW_PGR
+    rx.route(topk_ids, emap, rtab, local_ids, sorted_ids, block_experts, live, numel, n_global, nl, p, me)
     xg_t = torch.empty((nb * 64 * bm * 64,), dtype=torch.bfloat16, device=dev)
     if norm_weight is None:
         ext.gather(x, xg_t, sorted_ids, live, numel, p)

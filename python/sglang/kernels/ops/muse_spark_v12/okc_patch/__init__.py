@@ -227,6 +227,9 @@ PFMHA_RAGGED_MAX_BS = int(os.environ.get("OKC_PFMHA_RAGGED_MAX_BS", "32"))
 # local ids + block list, in place of the int32 cast / expert-map gather / moe_align / pg_tiles) and folds the
 # pre-expert RMSNorm into the token gather (bit-identical to F.rms_norm).
 SW_PG_SMALL = _flag("OKC_SW_PG_SMALL", "1")
+# ... with its routing launch on pg_route_f (_cuda_src_pgr.py: same tables on a short chain, ~7 -> ~2 us at verify
+# T 73-256 on the 64-token-block build; MIDBS lever #1)
+SW_PGR = _flag("OKC_SW_PGR", "0")
 # Programmatic dependent launch on the OKC kernels inside verify / decode graphs (the next kernel's launch and
 # prologue overlap the previous one's tail; every kernel waits on griddepcontrol before reading its inputs).
 SW_PDL = _flag("OKC_SW_PDL", "1")
@@ -334,7 +337,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "PFMHA_RAGGED_MAX_BS", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
            "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_EXT_AG", "EXT_AG_MAX_BYTES", "SW_EXT_RS", "EXT_RS_FENCE", "SP_CE_TP",
-           "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
+           "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SW_PG_SMALL", "SW_PGR", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
