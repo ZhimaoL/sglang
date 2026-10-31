@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _BM = 256        # the pg wide build's token block (the only build eod_gemm instantiates)
 _CHUNK = 4096    # eod_galign's route chunk: T * 8 and S * 8 must be multiples
+_NAN = 0x7FC0    # bf16 quiet NaN (OKC_EOD_POISON)
 _STATE = {}
 
 
@@ -57,7 +58,7 @@ def _setup(device, nl):
         cnt = hi and agreed(lambda: symm_mem.empty(64, dtype=torch.int32, device=device))
         hc = cnt is not None and cnt is not False and agreed(lambda: symm_mem.rendezvous(cnt, name))
         if hc and g.world_size == 8:
-            img.zero_()
+            img.view(torch.int16).fill_(_NAN if _sw.EOD_POISON else 0)
             cnt.zero_()
             torch.cuda.synchronize()
             torch.distributed.barrier(group=g.cpu_group)   # every rank's counters are zero before any release
@@ -194,13 +195,16 @@ def forward(layer, x, topk_scores, topk_ids):
     x = x.contiguous()
     args = ([st["cnt"].data_ptr(), 0, st["rank_of"].data_ptr(), 0, 0, 0, nl, ent.data_ptr(),
              st["woff"][S * 8].data_ptr(), x.data_ptr()] + st["img_ptrs"] + [0, 0, 0, st["ep"].data_ptr()]
-            + st["cnt_ptrs"] + [st["lcnt"].data_ptr(), (8 << 32) | 0x7FFFFFFF])
+            + st["cnt_ptrs"] + [st["lcnt"].data_ptr(), ((0 if _sw.EOD_UNGATED else 8) << 32) | 0x7FFFFFFF])
     ext.eod_gg1(st["img"], state["pg_wsf13"], state["w13_gs32"], inter_t, be, live, numel, 11,
                 torch.tensor(args, dtype=torch.int64))
+    if _sw.EOD_POISON:   # this layer's rows are consumed and no peer pushes the next layer's before gg2's releases
+        st["img"].view(torch.int16).fill_(_NAN)
     y = torch.empty((1, 4096), dtype=torch.bfloat16, device=dev)
     cuda_ext.pg_rs_ext(False).gg2(inter_t, state["pg_wsf2"], y, sid, be, live, numel, pg_moe._CFG, 0, 0,
                                   rs[1].data_ptr(), rs[3])
     st["calls"] += 1
     if st["calls"] == 1 or st["calls"] % 4096 == 0:
-        logger.info("OKC EOD active: %d calls (T=%d, %d slots).", st["calls"], T, nl)
+        logger.info("OKC EOD active: %d calls (T=%d, %d slots)%s.", st["calls"], T, nl,
+                    (", poison" if _sw.EOD_POISON else "") + (", ungated" if _sw.EOD_UNGATED else ""))
     return okc_m1.rs_receive(layer, rs, topk_scores)

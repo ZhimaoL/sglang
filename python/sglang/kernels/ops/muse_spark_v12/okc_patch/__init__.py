@@ -226,6 +226,11 @@ SP_AG_ROWSFIRST_MAX_TOKENS = int(os.environ.get("OKC_SP_AG_ROWSFIRST_MAX_TOKENS"
 # own rows into every rank's symmetric token images in expert order and gg1 gates each slot on the 8 sources' releases.
 # Gathered calls where M1-RS runs, on pg's wide build, at T a multiple of 4096; everything else as today.
 EOD = _flag("OKC_EOD", "0")
+# Identity-harness only (default 0): OKC_EOD_POISON NaN-fills each rank's token images at setup and after every gg1, so
+# every row a call reads must have been pushed by that call; OKC_EOD_UNGATED also turns the gates and releases off (the
+# poison read's negative control: its outputs must differ).
+EOD_POISON = _flag("OKC_EOD_POISON", "0")
+EOD_UNGATED = _flag("OKC_EOD_UNGATED", "0")
 
 # Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call. Per request:
 # full layers from OKC_PFMHA_MIN_TOKENS new tokens, sliding layers from OKC_PFMHA_SLIDING_MIN_TOKENS (1xH200 over a 75K
