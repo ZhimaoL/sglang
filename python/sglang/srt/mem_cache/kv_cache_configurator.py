@@ -1587,6 +1587,14 @@ class KVCacheConfigurator:
                 current_platform, subsystem="the block-scaled (fp4 / mxfp8) KV pool"
             )
 
+        if self.is_draft_worker:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import u3_draft_swa
+
+            # OKC U3: a DFlash draft pool on the target's SWA slots (None: off or declined).
+            token_to_kv_pool = u3_draft_swa.build_pool(self, mha_pool_class)
+            if token_to_kv_pool is not None:
+                return token_to_kv_pool
+
         if is_dsv4_model:
             reject_out_of_tree_path(
                 current_platform, subsystem="the DeepSeek-V4 KV pool"
