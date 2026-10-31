@@ -40,6 +40,10 @@ GROUP = int(os.environ.get("OKC_SP_CE_AG_GROUP", "1"))
 AG_MIN_TOKENS = int(os.environ.get("OKC_SP_CE_AG_MIN_TOKENS", "16384"))
 STREAMS = int(os.environ.get("OKC_SP_CE_STREAMS", "1"))
 MAX_TOKENS = int(os.environ.get("OKC_SP_CE_MAX_TOKENS", "16384"))
+# T1 (docs/serving/review-1031/T1-CE-INTEGRATION.md): the pushes as one cudaMemcpyAsync each on the peer pointers (copy
+# engines, no SMs: structural K2b2 arm Q1) instead of Tensor.copy_ (torch runs its own SM copy kernel on a peer view:
+# K2). Same bytes into the same slots on the same streams; a module attribute, so a unit test can flip it per call.
+CE_MEMCPY = os.environ.get("OKC_SP_CE_MEMCPY", "0") == "1"
 
 _state = None
 _failed = False
@@ -132,6 +136,24 @@ def _buffers(tp_group, hidden: int, device):
     return _state
 
 
+def _push(dst, src, stream):
+    """dst.copy_(src) on `stream` (the current stream); CE_MEMCPY: the same bytes as one cudaMemcpyAsync (Default kind)."""
+    if not CE_MEMCPY:
+        dst.copy_(src)
+        return
+    from cuda.bindings import runtime as rt
+
+    # the call structural's K2b2 times (k2b2_cepeer.py cp_default): runtime cudaMemcpyAsync, Default kind, current stream
+    (err,) = rt.cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(), src.numel() * src.element_size(),
+                                rt.cudaMemcpyKind.cudaMemcpyDefault, rt.cudaStream_t(stream.cuda_stream))
+    if err != rt.cudaError_t.cudaSuccess:
+        rt.cudaGetLastError()   # clear it, so a failed push cannot poison the next torch call
+        raise RuntimeError(f"OKC SP CE push: cudaMemcpyAsync {err}")
+    if "ce" not in _logged:
+        _logged.add("ce")
+        logger.info("OKC SP CE pushes on cudaMemcpyAsync (%d B first).", src.numel() * src.element_size())
+
+
 def _order(me, W):
     return [(me + s) % W for s in range(1, W)]
 
@@ -159,7 +181,7 @@ def ag_matmul_steps(st, x_shard, weight):
             s.wait_stream(X)
         for j, dest in enumerate(group):
             with torch.cuda.stream(st.streams[j % len(st.streams)]):
-                st.g[dest][me * S * K:(me + 1) * S * K].copy_(x_shard.view(-1))
+                _push(st.g[dest][me * S * K:(me + 1) * S * K], x_shard.view(-1), st.streams[j % len(st.streams)])
         for s in st.streams[1:]:
             X.wait_stream(s)
         yield X
@@ -199,7 +221,7 @@ def matmul_rs_steps(st, x, weight):
         s = st.streams[j % len(st.streams)]
         s.wait_event(ev)
         with torch.cuda.stream(s):
-            st.o[dest][me * S * N:(me + 1) * S * N].copy_(part.view(-1))
+            _push(st.o[dest][me * S * N:(me + 1) * S * N], part.view(-1), s)
     torch.mm(rows(me), wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
     ev = torch.cuda.Event()
     ev.record(cur)
