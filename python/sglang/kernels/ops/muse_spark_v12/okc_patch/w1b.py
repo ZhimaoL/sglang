@@ -198,12 +198,13 @@ def produce(st, x, scores, ids, par, gate=None, gate_gen=None):
 
 
 def wait_words(st, par, S):
-    """Compute stream: the 7 peers' words are in -> (scores [W S, 8] fp32, ids [W S, 8] int32), views of my buffer."""
+    """Compute stream: the 7 peers' words are in -> (scores [W S, 8] fp32, ids [W S, 8] int32), contiguous copies (as
+    W1a-P's ids gather returns; pg_prep / pg_route take no strides): ~1 MiB of local copy at S 2048 (QA-P1SS n3)."""
     cur = torch.cuda.current_stream()
     for s in range(1, st.W):
         st.flags.wait(cur, (st.me - s) % st.W, par, _IDS)
     w = st.words[par][st.me][: st.W * S]
-    return w[:, :8].view(torch.float32), w[:, 8:]
+    return w[:, :8].contiguous().view(torch.float32), w[:, 8:].contiguous()
 
 
 def wait_rows(st, par, S):
