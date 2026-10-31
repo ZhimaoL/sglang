@@ -227,8 +227,8 @@ PFMHA_RAGGED_MAX_BS = int(os.environ.get("OKC_PFMHA_RAGGED_MAX_BS", "32"))
 # local ids + block list, in place of the int32 cast / expert-map gather / moe_align / pg_tiles) and folds the
 # pre-expert RMSNorm into the token gather (bit-identical to F.rms_norm).
 SW_PG_SMALL = _flag("OKC_SW_PG_SMALL", "1")
-# ... with its routing launch on pg_route_f (_cuda_src_pgr.py: same tables on a short chain, ~7 -> ~2 us at verify
-# T 73-256 on the 64-token-block build; MIDBS lever #1)
+# ... with its routing launch on pg_route_f (_cuda_src_pgr.py: the same tables, 1xH200 standalone ~6.9 -> ~4.0 us at
+# verify T 73-256 on the 64-token-block build; MIDBS lever #1)
 SW_PGR = _flag("OKC_SW_PGR", "0")
 # Programmatic dependent launch on the OKC kernels inside verify / decode graphs (the next kernel's launch and
 # prologue overlap the previous one's tail; every kernel waits on griddepcontrol before reading its inputs).
