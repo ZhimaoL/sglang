@@ -894,10 +894,7 @@ class MuseSpark1xMoE(nn.Module):
             router_input,
             ar_workspace=ar_workspace,
         )
-        m1 = getattr(self.experts, "_okc_m1_reduced", False)   # okc_patch.m1: the receiver already combined the ranks
-        if m1:
-            self.experts._okc_m1_reduced = False
-        return self._reduce_and_unpool(output, already_reduced=ar_workspace is not None or m1)
+        return self._reduce_and_unpool(output, already_reduced=ar_workspace is not None)
 
     def _reduce_and_unpool(
         self, output: torch.Tensor, *, already_reduced: bool = False
@@ -1227,13 +1224,6 @@ class MuseSpark1xMoE(nn.Module):
             self.experts._okc_m1rs_shard = False
             return output
         output = output.contiguous()
-        if okc_patch.SW_EXT_RS:   # extends: ld_reduce over the symmetric buffer (okc_patch/ext_coll.py)
-            from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
-
-            rs = ext_coll.reduce_scatter(output, tp_group.device_group.group_name, tp_group.world_size,
-                                         tp_group.rank_in_group)
-            if rs is not None:
-                return rs
         shard = output.new_empty((expert_input.shape[0], *output.shape[1:]))
         tp_group.reduce_scatter_tensor(shard, output)
         return shard

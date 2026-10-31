@@ -89,11 +89,6 @@ MOE_ST_PDL = _flag("OKC_MOE_ST_PDL", "1")
 # st folds the pre-expert RMSNorm into its gate/up kernel (bit-identical to F.rms_norm, as pg_gather_norm), saving the
 # separate norm launch on every st layer.
 SW_ST_NORM_FOLD = _flag("OKC_SW_ST_NORM_FOLD", "1")
-# M1 (okc_patch/m1.py): the verify MoE combine from gg2's epilogue (multimem rows + a receiver; no finalize / all-reduce)
-# for pg-small calls of M1_MIN_T..M1_MAX_T tokens (st below)
-SW_M1 = _flag("OKC_SW_M1", "0")
-M1_MIN_T = int(os.environ.get("OKC_M1_MIN_T", "73"))
-M1_MAX_T = int(os.environ.get("OKC_M1_MAX_T", "256"))
 # M1-RS (okc_patch/m1.py rs_*): the SP prefill / extend MoE combine from gg2's epilogue in the reduce-scatter form (each row
 # to its token's home rank + a receiver there; no finalize / reduce-scatter) for gathered calls of M1RS_MIN_T..MAX_T tokens
 SW_M1RS = _flag("OKC_SW_M1RS", "1")
@@ -168,11 +163,6 @@ SP_SYMM_MIN_TOKENS = int(os.environ.get("OKC_SP_SYMM_MIN_TOKENS", "4096"))
 # step M: eager / graph / back-to-back / skewed layer pattern bitwise, 1.10-1.55x NCCL at 8-62 MiB)
 SW_EXT_AG = _flag("OKC_SW_EXT_AG", "1")
 EXT_AG_MAX_BYTES = int(os.environ.get("OKC_EXT_AG_MAX_BYTES", str(4096 * 8192 * 2)))
-# ... and the extend's o-proj / MoE-out reduce-scatters as multimem.ld_reduce (fp32 in the switch) over a second
-# symmetric buffer of that size: differs from NCCL's ring in ~half the elements by an ulp (equal to the fp32 sum), so
-# off until a consistency read
-SW_EXT_RS = _flag("OKC_SW_EXT_RS", "0")
-EXT_RS_FENCE = _flag("OKC_EXT_RS_FENCE", "1")   # its buffer-reuse barrier after the ld_reduce (see ext_coll.py)
 # Those two collectives on copy-engine pushes with one barrier per matmul + reduce-scatter and one per
 # OKC_SP_CE_AG_GROUP all-gather steps (okc_patch/sp_tp_ce.py) instead of torch's fused ops (16 / 3 barriers per op):
 # session SI bench -0.12 ms per 16K layer-chunk (~-30 ms per first turn); the AG side only on 16K chunks.
@@ -348,13 +338,13 @@ FU_MERGE_MIN_LOAD = int(os.environ.get("OKC_FU_MERGE_MIN_LOAD", "9"))
 ANY_ATTN = SW_ATTN or SW_WST
 
 __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS", "MOE_REPLICAS", "ADAPT_REPLICAS", "ADAPT_FIRST_TOKENS", "ADAPT_EVERY_TOKENS", "ADAPT_FIRST_VERIFY", "ADAPT_RING", "ADAPT_MIN_T", "ADAPT_CHECK", "ADAPT_THETA", "ADAPT_MAX_SWAPS", "ADAPT_TRICKLE", "ADAPT_FULL_GROWTH", "MOE_REP_MAX_TOKENS",
-           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG64_N4", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_AG_PRENORM", "SW_M1", "M1_MIN_T", "M1_MAX_T", "SW_M1RS", "M1RS_MIN_T", "M1RS_MAX_T", "SW_ST_REP_FOLD",
+           "MOE_REP_PREFILL", "MOE_REP_PASSES", "MOE_REP_SPLIT_MIN_TOKENS", "MOE_REP_EXTEND", "MOE_REP_EXTEND_MIN_TOKENS", "PG_NARROW_MIN_T", "PG_NARROW_MAX_T", "PG64_MAX_T", "PG64_N4", "PG_GN_SPLIT", "SW_MOE_ST", "MOE_ST_MAX_TOKENS", "MOE_ST_PDL", "SW_ST_NORM_FOLD", "SW_AG_PRENORM", "SW_M1RS", "M1RS_MIN_T", "M1RS_MAX_T", "SW_ST_REP_FOLD",
            "PG_LOCAL_ALIGN", "PG_LOCAL_ALIGN_MIN_TOKENS", "PG_ROUTE", "PG_ROUTE_REP_FOLD", "PG_ROUTE_REPX",
            "SW_ATTN", "SW_PROJ", "SW_SMALLM", "SW_LT", "SW_ROUTER", "SW_ROUTE_FUSED",
            "SW_PREFILL_FMHA", "PFMHA_MIN_TOKENS", "PFMHA_SLIDING", "PFMHA_SLIDING_MIN_TOKENS", "PFMHA_RAGGED",
            "PFMHA_RAGGED_MAX_BS", "SW_WST", "WST_MIN_BS", "WST_BAL_MIN_BS", "SW_VFG",
            "SW_VFG_FULL1", "VP2_MAX_BS",
-           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_EXT_AG", "EXT_AG_MAX_BYTES", "SW_EXT_RS", "EXT_RS_FENCE", "SP_CE_TP",
+           "SW_SP", "SP_MIN_TOKENS", "SW_GEMM_AG", "GEMM_AG_MAX_TOKENS", "SP_SYMM", "SP_SYMM_MIN_TOKENS", "SW_EXT_AG", "EXT_AG_MAX_BYTES", "SP_CE_TP",
            "SW_RS_NORM_FOLD", "SP_PRENORM_SHARD", "SP_PRENORM_EARLY", "QK_FOLD", "SP_AG_GROUP", "SP_AG_PUSH", "SP_AG_PUSH_MAX_TOKENS", "SW_PG_SMALL", "SW_PDL", "NORM_PREFETCH", "SW_DFLASH_FC_AG", "SW_DFLASH_CONV_AG", "SW_BF16_MOE_GLUE", "SW_BF16_MOE_CFG",
            "SW_DFLASH_FC_SP", "DFLASH_FC_SP_MIN_ROWS", "SW_DFLASH_FC_SP_PIN", "SW_WARM_GEMMS",
            "SW_TAIL_NORM", "SW_ARGMAX_SPLIT", "SW_CAND_AG_MERGE", "SW_CAND_FUSE", "SW_DRAFT_KV_FUSE", "HOPPER_NORM_MAX_CLUSTER",

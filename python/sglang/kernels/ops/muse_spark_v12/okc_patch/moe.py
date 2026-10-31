@@ -378,30 +378,18 @@ def _moe_pg_small(layer, x, topk_scores, topk_ids, state, norm_weight, norm_eps,
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
     emap, rep = _small_map(layer, topk_ids)
-    m1 = None
     bm = pg_moe.block_m(x.shape[0])
-    if _sw.SW_M1 and pdl and bm == 64:   # M1 (pg's 64-block build): gg2 multicasts, the receiver combines, no all-reduce
-        from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
-
-        m1 = okc_m1.slot(layer, x.shape[0], x.device)
-    rs = _m1rs(layer, x, bm) if m1 is None else None
+    rs = _m1rs(layer, x, bm)
     y, local_ids = pg_moe.grouped_pg_small(
         x, topk_ids, emap, rep=rep,
         norm_weight=norm_weight, norm_eps=norm_eps,
         wsf13=state["pg_wsf13"], gs13=state["w13_gs32"], wsf2=state["pg_wsf2"], pdl=pdl and _sw.SW_PDL,
-        bm=bm, m1=None if m1 is None else (m1[1], m1[3]), rs=None if rs is None else (rs[1].data_ptr(), rs[3]),
+        bm=bm, rs=None if rs is None else (rs[1].data_ptr(), rs[3]),
     )
     if rs is not None:
         from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
 
         return okc_m1.rs_receive(layer, rs, topk_scores)
-    if m1 is not None:
-        out = torch.empty_like(x)
-        pg_moe._ext(bm).m1_recv(m1[0][: x.shape[0] * 8], topk_scores.float().contiguous(),
-                                layer._post_expert_norm_weight, out, float(layer._post_expert_norm_eps),
-                                1 if layer._post_expert_norm_weight_first else 0, m1[2].data_ptr(), m1[4])
-        layer._okc_m1_reduced = True
-        return out
     return finalize_routes(layer, y.view(x.shape[0], 8, x.shape[1]), topk_scores, local_ids)
 
 

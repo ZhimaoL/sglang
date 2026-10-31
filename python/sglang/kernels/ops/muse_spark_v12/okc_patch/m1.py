@@ -1,21 +1,16 @@
-"""OKC_SW_M1: the verify MoE combine issued from gg2's epilogue (lane-moe M1).
+"""OKC_SW_M1RS (lane-extend E57): the SP prefill / extend MoE combine issued from gg2's epilogue, in the reduce-scatter
+form.
 
-Every rank's gg2 multicasts its route rows into every rank's slot buffer [T * 8, 4096] (NVLS) and releases once per
-CTA; a receiver on every rank sums the 8 slots of each token (post-expert norm, scores) into the combined output, so
-neither the finalize nor the combine all-reduce runs.
+Every rank's gg2 stores each route row (route r = token * 8 + slot of the T gathered tokens) into the slot buffer of the
+token's home rank (r / T, the rank whose SP shard holds the token) at row r - home * T, through a table of the ranks'
+slot pointers, and releases once per CTA. The home rank's receiver sums its T / tp tokens' 8 slots into its shard, so
+neither the finalize nor the reduce-scatter runs. Each route is computed by exactly one rank (the home map or the
+replica balancer: split_replicas / the extend balancer), so each slot is written once.
 
 Two slot buffers plus epoch words, symmetric with multicast mappings, are made on the first eager call (never inside a
 capture) and agreed over the TP ranks. MoE layers alternate them by layer parity, so a buffer is written again only two
-MoE layers later, after the all-reduce in between has ordered every rank's receiver before any rank's next gg2.
-
-OKC_SW_M1RS (lane-extend E57) shares the buffers and epoch words: the SP prefill / extend combine in the reduce-scatter
-form. Every rank's gg2 stores each route row (route r = token * 8 + slot of the T gathered tokens) into the slot buffer
-of the token's home rank (r / T, the rank whose SP shard holds the token) at row r - home * T, through a table of the
-ranks' slot pointers, and releases once per CTA. The home rank's receiver sums its T / tp tokens' 8 slots into its shard,
-so neither the finalize nor the reduce-scatter runs. Each route is computed by exactly one rank (the home map or the
-replica balancer: split_replicas / the extend balancer), so each slot is written once. The parity argument below holds
-with the SP attention's collectives in place of the o-proj all-reduce, and layer L + 1's own epoch wait also orders it
-(every rank's L + 1 gg2 follows its L receiver).
+MoE layers later. The parity argument below holds with the SP attention's collectives in place of the o-proj
+all-reduce, and layer L + 1's own epoch wait also orders it (every rank's L + 1 gg2 follows its L receiver).
 """
 import logging
 
@@ -62,7 +57,7 @@ def _setup(device):
 
         g = get_tp_group()
         name = g.device_group.group_name
-        rows = max(_sw.M1_MAX_T * 8, -(-_sw.M1RS_MAX_T // g.world_size) * 8 if _sw.SW_M1RS else 0)
+        rows = -(-_sw.M1RS_MAX_T // g.world_size) * 8
         bufs, tables = [], []
         for _ in range(2):
             slot = agreed(lambda: symm_mem.empty(rows, 4096, dtype=torch.bfloat16, device=device))
@@ -82,17 +77,6 @@ def _setup(device):
                   "world": g.world_size, "rows": rows}
     _STATE[key] = st
     return st
-
-
-def slot(layer, tokens, device):
-    """(slot buffer, slot multicast, epoch words, epoch multicast, releases to wait for) for this layer's call, or None."""
-    if not (_sw.M1_MIN_T <= tokens <= _sw.M1_MAX_T) or getattr(layer, "_post_expert_norm_weight", None) is None:
-        return None
-    st = _setup(device)
-    if st is None:
-        return None
-    s, smc, e, emc = st["bufs"][getattr(layer, "_okc_layer_idx", 0) & 1]
-    return s, smc, e, emc, st["want"]
 
 
 def rs_slot(layer, tokens, device):

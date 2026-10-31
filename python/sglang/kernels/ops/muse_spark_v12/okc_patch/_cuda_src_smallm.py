@@ -100,7 +100,7 @@ template <int NT, int KT, int R> struct Lay {
 
 // NT tokens (m <= NT), NST stages of KT k, S CTAs per cluster splitting k; CTA rows R = 64 RT NWG: NWG consumer
 // warpgroups, each running RT m64 row tiles out of the CTA's one R-row W box
-template <int NT, int NST, int S, int KT, int RT, int NWG, int PIPE, int DIAG = 0>
+template <int NT, int NST, int S, int KT, int RT, int NWG, int PIPE>
 __global__ void __launch_bounds__(128 * NWG + 32, 1) rmw(const __grid_constant__ CUtensorMap wmap,
                                              const __grid_constant__ CUtensorMap xmap,
                                              __nv_bfloat16* __restrict__ out, int N, int K, int m)
@@ -161,7 +161,7 @@ __global__ void __launch_bounds__(128 * NWG + 32, 1) rmw(const __grid_constant__
                 for (int s4 = 0; s4 < 4; s4++)
 #pragma unroll
                     for (int t = 0; t < RT; t++)
-                        if constexpr (!(DIAG & 2)) wgmma_nt<NT>(acc[t], desc_sw128(st + a * L::WB + (wg * RT + t) * 64 * 128 + 32 * s4),
+                        wgmma_nt<NT>(acc[t], desc_sw128(st + a * L::WB + (wg * RT + t) * 64 * 128 + 32 * s4),
                                      desc_sw128(st + L::ATOMS * L::WB + a * L::XB + 32 * s4), 1);
             wg_commit();
             if constexpr (PIPE) {   // keep this stage's group in flight; retire and release the previous stage's
@@ -192,14 +192,7 @@ __global__ void __launch_bounds__(128 * NWG + 32, 1) rmw(const __grid_constant__
             }
     }
     __syncwarp();
-    if constexpr (S > 1 && (DIAG & 1)) {   // DIAG: no cluster reduction (own rows of the own partial)
-        __syncthreads();
-        constexpr int RQ = R / S;
-        for (int e = tid; e < RQ * NT; e += NTH) {
-            const int r = q * RQ + e / NT, t = e % NT;
-            if (t < m) out[(size_t)t * N + row0 + r] = __float2bfloat16_rn(tile[r * NT + t]);
-        }
-    } else if constexpr (S > 1) {
+    if constexpr (S > 1) {
         cluster_sync();   // every CTA's tile is parked
         constexpr int RQ = R / S;
         const unsigned tl = smem_u32(tile);
@@ -252,14 +245,14 @@ static const CUtensorMap& cached_map(const void* p, int rows, int K, int box_row
     return g_maps.emplace(key, make_map(p, rows, K, box_rows)).first->second;
 }
 
-template <int NT, int NST, int S, int KT, int RT, int NWG, int PIPE, int DIAG = 0>
+template <int NT, int NST, int S, int KT, int RT, int NWG, int PIPE>
 static void launch(const torch::Tensor& W, const torch::Tensor& x, torch::Tensor& out) {
     const int N = (int)W.size(0), K = (int)W.size(1), m = (int)x.size(0);
     constexpr int R = 64 * RT * NWG;
     using L = rmw::Lay<NT, KT, R>;
     const int smem = NST * L::SB + 2 * NST * 8 + 1024;
     TORCH_CHECK(N % R == 0, "rmw: rows");
-    auto fn = rmw::rmw<NT, NST, S, KT, RT, NWG, PIPE, DIAG>;
+    auto fn = rmw::rmw<NT, NST, S, KT, RT, NWG, PIPE>;
     static bool set = false;
     if (!set) {
         TORCH_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) == cudaSuccess,

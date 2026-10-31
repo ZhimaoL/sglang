@@ -169,8 +169,6 @@ def initialize_layernorm_sp(*, model_config) -> None:
             SP_SYMM,
             SP_SYMM_MIN_TOKENS,
             SW_EXT_AG,
-            SW_EXT_RS,
-            SW_M1,
             SW_M1RS,
         )
 
@@ -181,8 +179,8 @@ def initialize_layernorm_sp(*, model_config) -> None:
             cuda_ext.prebuild()
 
         # Every rank evaluates the same switches, so all of them enter the collective probe together. A failed probe
-        # turns off every symm-mem path (the fused linears, ext_coll's multimem gather / reduce, the copy-engine ops).
-        want = SP_SYMM or SW_EXT_AG or SW_EXT_RS or SW_M1 or SW_M1RS
+        # turns off every symm-mem path (the fused linears, ext_coll's multimem gather, the copy-engine ops).
+        want = SP_SYMM or SW_EXT_AG or SW_M1RS
         _okc_hopper.symm_ok = want and _HAS_TORCH_SYMM_MEM_FUSED and _okc_symm_probe()
         _okc_hopper.symm = SP_SYMM and _okc_hopper.symm_ok
         if want and not _okc_hopper.symm_ok:
@@ -461,20 +459,6 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
             scatter_dim=0,
             group_name=group_name,
         )
-    if _okc_hopper.active and bias is None and linear.weight.dtype is torch.bfloat16:
-        from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-
-        tp_group = get_parallel().tp_group
-        gname = tp_group.device_group.group_name
-        target = (
-            ext_coll.rs_target(padded, linear.weight.shape[0], gname, tp_size)
-            if isinstance(linear.quant_method, UnquantizedLinearMethod)
-            else None
-        )
-        if target is not None:   # OKC_SW_EXT_RS: the GEMM straight into the symmetric buffer, then ld_reduce
-            torch.mm(x, linear.weight.t(), out=target)
-            return ext_coll.rs_finish(target, gname, tp_size, tp_group.rank_in_group)
     full = linear.quant_method.apply(linear, x, bias)
     output = full.new_empty((padded // tp_size, *full.shape[1:]))
     get_parallel().tp_group.reduce_scatter_tensor(output, full)
