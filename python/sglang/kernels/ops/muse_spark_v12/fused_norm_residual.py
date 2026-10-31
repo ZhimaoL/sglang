@@ -515,6 +515,6 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             beta=self._cc_beta if self._use_residual_gate else None,
             carveout=carveout,
         )
-        if carveout >= 0:   # the qkv GEMM that reads this output may run W-staged (okc_patch/wsc2.py)
+        if okc_wsc2.claims_q(self, stream.shape[0]):   # the qkv GEMM reading this output runs W-staged (wsc2.py)
             okc_wsc2.mark_q(out[0])
         return out
