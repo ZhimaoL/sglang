@@ -9,7 +9,7 @@
   OKC_MOE_PG_ONLY=1  (default) packed layers drop their Marlin copy and run pg at every token count
                      (verify steps included), so every layer fits: +0.1 GiB per layer over Marlin.
                      0 keeps Marlin and uses pg on the prefill chunks of the first N layers only.
-  OKC_MOE_REPLICAS=1 hot-expert replicas per rank per pg-only layer (0..3), 1.8 GiB per rank per replica.
+  OKC_MOE_REPLICAS=1 hot-expert replicas per rank per pg-only layer (0..2), 1.8 GiB per rank per replica.
 
 Switches are read once at import, so dispatch is stable across CUDA-graph capture and replay.
 The judge's launch command is fixed, so the submitted defaults are the ones below.
