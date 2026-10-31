@@ -43,6 +43,8 @@ if okc_patch.ANY_ATTN:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import attention as okc_attention
 if okc_patch.SW_ROUTER:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import router as okc_router
+if okc_patch.QK_FOLD:
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import ft_norm as okc_ft_norm
 _OKC_RSB = okc_patch.SW_RS_ATTN_BLOCKS or okc_patch.RS_ATTN_BLOCKS_FULL > 0
 if okc_patch.SW_RS_NORM_FOLD or _OKC_RSB:
     from sglang.kernels.ops.muse_spark_v12.okc_patch import sp_tp_ce as okc_sp_tp_ce
@@ -466,6 +468,8 @@ class MuseSpark1xAttention(nn.Module):
             if self.use_qk_norm
             else None
         )
+        if okc_patch.QK_FOLD:
+            okc_ft_norm.mark(self)
 
     def _fused_kv_store(
         self, forward_batch: ForwardBatch
@@ -588,7 +592,10 @@ class MuseSpark1xAttention(nn.Module):
             and (self.rotary_emb is None or fuse_rope)
             else None
         )
-        if fuse_rope:
+        if okc_patch.QK_FOLD and okc_ft_norm.applies(self.attn, forward_batch) is not None:
+            # OKC_QK_FOLD: q / k go to the FA3 backend raw; it folds the norm into the FP8 KV write or applies it
+            assert kv_store is None
+        elif fuse_rope:
             q, k = self._fused_qk_norm(
                 qkv, positions, self.rotary_emb.cos_sin_cache, kv_store=kv_store
             )
