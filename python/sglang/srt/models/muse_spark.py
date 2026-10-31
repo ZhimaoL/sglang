@@ -1074,8 +1074,11 @@ class MuseSpark1xMoE(nn.Module):
         prenormed = okc_patch.SP_PRENORM_EARLY and sp_active and layernorm_sp.okc_hopper_sp() and self._okc_prenorm_shard()
         if prenormed:
             expert_input = self.pre_expert_norm(expert_input)
-        # OKC_SP_AG_ROWSFIRST: the rows' gather leaves now, under the router's tail, on its own stream
-        rows_first = _okc_rows_first(self, expert_input) if prenormed and okc_patch.SP_AG_ROWSFIRST else None
+        # OKC_SP_AG_ROWSFIRST: the rows' gather leaves now, under the router's tail, on its own stream. Not inside a
+        # P1-SS two-child pass: its single persistent rows_buf would take child x's rows while the other child's M still
+        # reads its own from it (STRUCTURAL.md §3.1a push-form amendment 6)
+        rows_first = (_okc_rows_first(self, expert_input)
+                      if prenormed and okc_patch.SP_AG_ROWSFIRST and not _okc_p1ss_collect else None)
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
