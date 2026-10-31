@@ -2017,6 +2017,7 @@ class MuseSpark1xForCausalLM(nn.Module):
         from sglang.kernels.ops.muse_spark_v12.okc_patch import p1ss as okc_p1ss
 
         kids, ctxs = okc_p1ss.split(forward_batch, okc_patch.P1SS_CUT)
+        logger.info("OKC P1-SS pass: %d + %d tokens", okc_patch.P1SS_CUT, positions.shape[0] - okc_patch.P1SS_CUT)
         outs = getattr(self.model, "language_model", self.model)._forward_p1ss(
             input_ids, positions, kids, ctxs, input_embeds)
         packed = None
