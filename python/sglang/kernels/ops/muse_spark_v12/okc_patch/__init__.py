@@ -216,7 +216,7 @@ SP_AG_PUSH_MAX_TOKENS = int(os.environ.get("OKC_SP_AG_PUSH_MAX_TOKENS", "2048"))
 # without waiting for the router; the top-k scores / ids follow as a symmetric-memory multimem gather (not the same NCCL
 # comm, which would queue them behind the rows) and pg's routing prep runs under the rows. Gathered calls of at least
 # SP_AG_ROWSFIRST_MIN_TOKENS..MAX_TOKENS rows; same kernels, same inputs.
-SP_AG_ROWSFIRST = _flag("OKC_SP_AG_ROWSFIRST", "0")
+SP_AG_ROWSFIRST = _flag("OKC_SP_AG_ROWSFIRST", "1")
 SP_AG_ROWSFIRST_MIN_TOKENS = int(os.environ.get("OKC_SP_AG_ROWSFIRST_MIN_TOKENS", "4096"))
 SP_AG_ROWSFIRST_MAX_TOKENS = int(os.environ.get("OKC_SP_AG_ROWSFIRST_MAX_TOKENS", "16384"))
 
