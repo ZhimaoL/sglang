@@ -16,6 +16,7 @@ Buffers (images, counters) are symmetric, made on the first eager call (never in
 ranks like okc_patch.m1's; a rank where setup fails takes the gathered path with all the others.
 """
 import logging
+import sys
 
 import torch
 
@@ -71,13 +72,24 @@ def _setup(device, nl):
     return st
 
 
+def _p1ss_pass():
+    """True inside a P1-SS two-child pass (okc/x-p1ss-*: muse_spark._OKC_P1SS["child"] is set for each stage and cleared
+    after the pass). One image set, counter set and epoch word per device serve one forward at a time, and a gated gg1
+    beside the other child's kernels could wait on a peer that waits on it (qa-eod E3 item 2)."""
+    st = getattr(sys.modules.get("sglang.srt.models.muse_spark"), "_OKC_P1SS", None)
+    return isinstance(st, dict) and st.get("child") is not None
+
+
 def active(layer, tokens, device):
     """Whether this SP call (`tokens` gathered tokens) runs EOD; host-side sizes and agreed setup only, so every rank
-    decides alike. The caller skips the rows gather when it does."""
+    decides alike. The caller skips the rows gather when it does. Never inside a P1-SS two-child pass, never with
+    adaptive replicas (they rebuild the tables in place after the once-per-layer gather)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
     from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
     from sglang.kernels.ops.muse_spark_v12.okc_patch import pg_moe
 
+    if _sw.ADAPT_REPLICAS or _p1ss_pass():
+        return False
     state = getattr(layer, "_okc_moe_state", None)
     if (state is None or not state["pg_only"] or tokens % _CHUNK or pg_moe.block_m(tokens) != _BM
             or layer.num_local_experts > 64 or okc_moe._rep_mode(layer, tokens) not in (None, "split")
@@ -97,7 +109,9 @@ def active(layer, tokens, device):
 
 def _tables(layer, st, device):
     """The 8 ranks' [256] replica-table words (slot | home << 8 | replicated << 11 | replica rank << 12), gathered once
-    per layer: the replica table's head when the layer has one, else made from the 8 expert maps."""
+    per layer: the replica table's head when the layer has one, else made from the 8 expert maps. Only the slot field is
+    per rank; every rank must hold the same home / replica fields and the same replicated list (rep[256:]), since the
+    cut every rank computes alone rests on them (qa-eod E3 addition a): checked here, on every rank alike."""
     g = st["group"]
     rep = getattr(layer, "_okc_rep_table", None)
     if rep is not None:
@@ -110,6 +124,21 @@ def _tables(layer, st, device):
         held = allm >= 0
         home = held.int().argmax(0)
         allm = torch.where(held, allm, torch.full_like(allm, 255)) | (home[None, :] << 8)
+    ok = bool(((allm >> 8) == (allm[:1] >> 8)).all())
+    if rep is not None:
+        tail = rep[256:].to(device=device, dtype=torch.int32).contiguous()
+        ns = torch.empty((8,), dtype=torch.int32, device=device)
+        torch.distributed.all_gather_into_tensor(ns, torch.tensor([tail.numel()], dtype=torch.int32, device=device),
+                                                 group=g.device_group)
+        if bool((ns == ns[:1]).all()) and tail.numel():
+            tails = torch.empty((8, tail.numel()), dtype=torch.int32, device=device)
+            torch.distributed.all_gather_into_tensor(tails, tail, group=g.device_group)
+            ok = ok and bool((tails == tails[:1]).all())
+        else:
+            ok = ok and bool((ns == ns[:1]).all())
+    if not ok:
+        raise RuntimeError("OKC_EOD: the ranks' replica tables disagree on the home / replica fields or the replicated "
+                           "list; every rank's global align would place routes differently")
     layer._okc_eod_tabs = allm.contiguous()
     return layer._okc_eod_tabs
 
@@ -125,12 +154,13 @@ def _woff(st, n, device):
 
 
 def forward(layer, x, topk_scores, topk_ids):
-    """x: this rank's pre-normalized shard [S, 4096]; topk_scores / topk_ids: the gathered [T, 8] -> this rank's combined
-    shard [S, 4096] (M1-RS receive)."""
+    """x: this rank's pre-normalized shard [S, 4096]; topk_scores / topk_ids: the gathered [T, 8] -> this rank's
+    combined shard [S, 4096] (M1-RS receive)."""
     from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext, pg_moe
     from sglang.kernels.ops.muse_spark_v12.okc_patch import m1 as okc_m1
     from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
 
+    assert not _p1ss_pass(), "OKC_EOD inside a P1-SS two-child pass"
     st = _STATE[str(x.device)]
     state = layer._okc_moe_state
     T, S, nl = topk_ids.shape[0], x.shape[0], layer.num_local_experts
