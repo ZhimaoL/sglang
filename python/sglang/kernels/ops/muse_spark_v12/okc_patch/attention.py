@@ -37,11 +37,13 @@ from sglang.kernels.ops.muse_spark_v12.okc_patch import (
     SW_ATTN,
     SW_VFG,
     SW_VFG_FULL1,
+    SW_WSC2,
     SW_WST,
     VP2_MAX_BS,
     WST_BAL_MIN_BS,
     WST_MIN_BS,
 )
+from sglang.kernels.ops.muse_spark_v12.okc_patch import wsc2 as okc_wsc2
 
 LOG2E = 1.4426950408889634
 
@@ -289,6 +291,11 @@ def _vfg_attn(qkv, k_cache, v_cache, cache_loc, seq_pre, page_table, *,
     stream = torch.cuda.current_stream().cuda_stream
     ext = vfg_ext()
     if window and bs <= max(1, VP2_MAX_BS):
+        if SW_WSC2 and okc_wsc2.vp2_early(bs * 8):   # the o_proj behind it is W-staged (okc_patch/wsc2.py)
+            ext.muse_vp2_launch_e(qkv.data_ptr(), page_table.data_ptr(), page_table.stride(0), seq_pre.data_ptr(),
+                                  cache_loc.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), freq, out.data_ptr(),
+                                  bs, window, c2, 1.0 / kv_scale, 1.0 / kv_scale, kv_scale, eps, 0, stream, 1)
+            return out
         ext.muse_vp2_launch(qkv.data_ptr(), page_table.data_ptr(), page_table.stride(0), seq_pre.data_ptr(),
                             cache_loc.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), freq, out.data_ptr(), bs,
                             window, c2,

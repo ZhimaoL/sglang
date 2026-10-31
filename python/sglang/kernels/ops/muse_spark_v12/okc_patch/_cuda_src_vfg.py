@@ -1043,6 +1043,9 @@ struct VP2Smem {
 };
 #define Q_ST(i) do { } while (0)
 
+// kEarly (OKC_SW_WSC2): trigger the dependents at entry, so a PDL-launched W-staged o_proj (KO2b) lands beside this
+// kernel's CTAs and loads its weight during the attention; it still waits for this kernel before it reads the output.
+template <bool kEarly = false>
 __global__ void __launch_bounds__(256, 1)
 vp2_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_table,
            const int* __restrict__ seq_lens, const long long* __restrict__ cache_loc,
@@ -1050,6 +1053,7 @@ vp2_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
            int window, float c2, float k_rscale, float v_rscale, float eps,
            unsigned long long* __restrict__ dbgp, __nv_bfloat16* __restrict__ out, float v_scale,
            int pt_stride) {
+  if constexpr (kEarly) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   {
     int const b = (int)blockIdx.y;
     qkv += (long long)b * 8 * V_QKVW;
@@ -1455,12 +1459,14 @@ vp2_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
 void vp2_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t seq_lens, int64_t cache_loc,
                 int64_t k_cache, int64_t v_cache, int64_t inv_freq, int64_t out, int64_t B, int64_t window,
                 double c2, double k_rscale, double v_rscale,
-                double v_scale, double eps, int64_t dbgp, int64_t stream) {
+                double v_scale, double eps, int64_t dbgp, int64_t stream, int64_t early = 0) {
   static bool configured = false;
   int const smem = (int)sizeof(VP2Smem) + 1024;
   if (!configured) {
-    cudaFuncSetAttribute(vp2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(vp2_kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    cudaFuncSetAttribute(vp2_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(vp2_kernel<false>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    cudaFuncSetAttribute(vp2_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(vp2_kernel<true>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
     configured = true;
   }
   cudaLaunchConfig_t cfg = {};
@@ -1468,14 +1474,16 @@ void vp2_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t seq_
   cfg.blockDim = dim3(256, 1, 1);
   cfg.dynamicSmemBytes = smem;
   cfg.stream = reinterpret_cast<cudaStream_t>(stream);
-  cudaLaunchAttribute attr[1];
+  cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = 16;
   attr[0].val.clusterDim.y = 1;
   attr[0].val.clusterDim.z = 1;
+  attr[1].id = cudaLaunchAttributePreferredSharedMemoryCarveout;   // OKC_SW_WSC2: room for a KO2b CTA beside each CTA
+  attr[1].val.sharedMemCarveout = 100;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
-  cudaError_t e = cudaLaunchKernelEx(&cfg, vp2_kernel, reinterpret_cast<const __nv_bfloat16*>(qkv),
+  cfg.numAttrs = early ? 2 : 1;
+  cudaError_t e = cudaLaunchKernelEx(&cfg, early ? vp2_kernel<true> : vp2_kernel<false>, reinterpret_cast<const __nv_bfloat16*>(qkv),
                                      reinterpret_cast<const int*>(page_table), reinterpret_cast<const int*>(seq_lens),
                                      reinterpret_cast<const long long*>(cache_loc), reinterpret_cast<uint8_t*>(k_cache),
                                      reinterpret_cast<uint8_t*>(v_cache), reinterpret_cast<const float*>(inv_freq),
@@ -1504,6 +1512,11 @@ void muse_vp2_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t
     double k_rscale, double v_rscale, double v_scale, double eps, int64_t dbgp,
     int64_t stream) { vfgns::b1vp2::vp2_launch(qkv, page_table, pt_stride, seq_lens, cache_loc, k_cache, v_cache,
     inv_freq, out, B, window, c2, k_rscale, v_rscale, v_scale, eps, dbgp, stream); }
+void muse_vp2_launch_e(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t seq_lens, int64_t cache_loc,
+    int64_t k_cache, int64_t v_cache, int64_t inv_freq, int64_t out, int64_t B, int64_t window, double c2,
+    double k_rscale, double v_rscale, double v_scale, double eps, int64_t dbgp, int64_t stream,
+    int64_t early) { vfgns::b1vp2::vp2_launch(qkv, page_table, pt_stride, seq_lens, cache_loc, k_cache, v_cache,
+    inv_freq, out, B, window, c2, k_rscale, v_rscale, v_scale, eps, dbgp, stream, early); }
 void muse_vfg_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t seq_lens, int64_t cache_loc,
     int64_t k_cache, int64_t v_cache, int64_t inv_freq, int64_t out, int64_t B, int64_t NS, int64_t window, double c2,
     double k_rscale, double v_rscale, double v_scale, double eps, int64_t ws, int64_t dbgp,

@@ -111,6 +111,10 @@ SW_PROJ = _flag("OKC_SW_PROJ", "1")
 # for qkv_gate (m <= 16) and the gemm_ag pooler / unpooler slices (m <= 64 / 32); off, those take F.linear (the old
 # qkv_gate MMA-pack route measured the same 16.7 us at m 8 and is not carried).
 SW_SMALLM = _flag("OKC_SW_SMALLM", "1")
+# W-staged own GEMMs at verify m <= 32 (okc_patch/wsc2.py; muse-opt serving/kernels/megakernel LOG M5-M5.4): qkv_gate at
+# m 17-32 (KQ3) and o_proj at m 1-32 (KO2b) load their weight before griddepcontrol.wait, beside the kernel in front (the
+# FFN-boundary all-gather norm with a 100 % carveout; VP2 with an entry trigger + the carveout). Not bitwise (new math).
+SW_WSC2 = _flag("OKC_SW_WSC2", "0")
 # Pinned cuBLASLt configs (okc_patch/lt.py) at measured verify (N, K, m) entries outside smallm's range, each >= 5 %
 # per call over F.linear in two runs (serving/kernels/lt/RESULTS.md); dispatched after smallm.
 SW_LT = _flag("OKC_SW_LT", "1")
