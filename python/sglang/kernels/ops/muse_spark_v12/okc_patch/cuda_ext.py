@@ -21,6 +21,7 @@ _VFG_EXT = None
 _DRAFT_EXT = None
 _FTNORM_EXT = None
 _ROUTE_EXT = None
+_PGR_EXT = None
 
 def _build_dir(name: str):
     """None (torch's default build directory) when that is writable, else one under the temp dir: a read-only home or
@@ -66,6 +67,7 @@ _PREBUILD = ("smallm_ext", "lt", "pg_ext", "pg_narrow_ext", "pg_narrow64_ext", "
 # M1-RS's two gg2 + receiver modules (pg_rs_ext), only with OKC_SW_M1RS on: left to their first call they built serially
 # inside the prefill capture, ~50 s each on the cold boot's critical path (S23 CB 612 s vs cand13's 512)
 _PREBUILD_M1RS = ("pg_rs_main_ext", "pg_rs_narrow_ext")
+_PREBUILD_PGR = ("pgr_ext",)   # OKC_SW_PGR
 _PREBUILD_RUN = """import sys
 from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext, lt
 try:
@@ -85,11 +87,11 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_N4, QK_FOLD, SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_N4, QK_FOLD, SW_M1RS, SW_PGR
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     names = (_PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("pg_n4_ext",) if PG64_N4 else ())
-             + (("ftnorm_ext",) if QK_FOLD else ()))
+             + (("ftnorm_ext",) if QK_FOLD else ()) + (_PREBUILD_PGR if SW_PGR else ()))
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -222,6 +224,18 @@ def pg_n4_ext():
                     verbose=False,
                 )
     return _PG_N4_EXT
+
+
+def pgr_ext():
+    """pg_route_f (_cuda_src_pgr.py): route() of pg's 64-token-block build on a short chain (OKC_SW_PGR)."""
+    global _PGR_EXT
+    if _PGR_EXT is None:
+        with _lock:
+            if _PGR_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pgr import _CUDA_SRC_PGR
+
+                _PGR_EXT = _pg_load("okc_pgr_n24x64_v1", _CUDA_SRC_PGR, ["route"], ["-DPGN_WSET=24", "-DPGN_XNT=64"])
+    return _PGR_EXT
 
 
 def pg_rs_ext(narrow: bool):
