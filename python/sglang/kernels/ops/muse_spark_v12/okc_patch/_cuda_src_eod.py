@@ -1,6 +1,8 @@
-"""CUDA source of the EOD prefill MoE path (OKC_EOD; muse-opt docs/serving/review-1031/EOD.md 5.2).
+"""CUDA source of the EOD prefill MoE path (OKC_EOD; muse-opt docs/serving/review-1031/EOD.md 5.2), compiled after
+pg's _CUDA_SRC in one module (cuda_ext.pg_eod_ext: cuda_sources=[_CUDA_SRC, _CUDA_SRC_EOD]).
 
-eod_gemm is pg_gemm<1,5,0,3,1,0> (the wide build's gg1) with two additions behind its EOD template bit set 11:
+eod_gemm is pg_gemm<1,5,0,3,1,0> (the wide build's gg1; this copy was cut from pg text c5a10c1b) with two additions behind
+its EOD template bit set 11:
   - copiers: warps 1-3 of each CTA (idle in pg_gemm) push the own SP shard's route rows into every rank's symm-mem token
     images through peer pointers, in (local slot, route id) order; per slot each warp fences (fence.acq_rel.sys) and
     counts in a local epoch-monotonic counter, and the call's last warp for a slot adds 1 to that slot's counter on
@@ -12,29 +14,11 @@ eod_galign: every rank derives every destination's layout from the gathered ids,
 served replica cut (owner = pg_rep_split's rule), deterministically: routes sit in route-id order inside each
 (rank, slot) bucket; outputs are the own layout in align_local's formats and this rank's push list.
 eod_rep_cut: pg_rep_count + pg_rep_cut of split_replicas, without its split pass.
-eod_source(base) builds the module from pg's _CUDA_SRC: pg's text up to its host section, eod_gemm (an edited copy of
-pg_gemm) and these host entry points; anchors are matched as token sequences (any whitespace between tokens).
+Regenerate (muse-opt serving/kernels/eod/eod_port_gen.py) whenever pg_gemm's text changes.
 """
-import re
 
-_PG_HEAD = 'template<int GATED,int NST,int MODE,int WSET=3,int PAIR64=1,int SPL=0>__global__ void __launch_bounds__(384,1)pg_gemm('
-_EOD_HEAD = ('template<int GATED,int NST,int MODE,int WSET=3,int PAIR64=1,int SPL=0,int EOD=0>__global__ void __launch_bounds__(384,1)'
-     'eod_gemm(')
-_EDITS = (
-    ('int NWT,int numel,int snake,__nv_bfloat16*m1,unsigned*m1_ep){',
-     'int NWT,int numel,int snake,__nv_bfloat16*m1,unsigned*m1_ep,const __grid_constant__ EodArgs eod){'),
-    ('const int wg=tid>>7;',
-     'const int wg=((EOD&2)!=0)?__shfl_sync(0xFFFFFFFFu,tid>>7,0):(tid>>7);'),
-    ('if(tid==0){int sl=0,rnd=0;',
-     ('if constexpr((EOD&2)!=0){const int wu=__shfl_sync(0xFFFFFFFFu,tid>>5,0);if(wu>=1){eod_copy<EOD>(eod,wu);return;}}if(tid='
-     '=0){int sl=0,rnd=0;unsigned eod_mask=0u;if constexpr((EOD&4)!=0){if(eod.trace!=nullptr){eod.trace[blockIdx.x]=eod_now();'
-     'if(blockIdx.x==0){for(int q=0;q<8;q++)eod.trace[236 + q]=eod.chunk!=nullptr?(unsigned long long)eod_ld(eod.chunk + q):0u'
-     'll;eod.trace[236 + 8]=eod.peer!=nullptr?(unsigned long long)eod_ld(eod.peer):0ull;eod.trace[236 + 9]=(unsigned long long'
-     ')eod_ld(eod.done);}}}')),
-    ('const char*ws=wsf +((size_t)e*NWT + wt)*(size_t)NKT*WSB;',
-     'const char*ws=wsf +((size_t)e*NWT + wt)*(size_t)NKT*WSB;if constexpr((EOD&1)!=0){eod_gate<EOD>(eod,e,eod_mask);}'),
-)
-_CUDA_SRC_EOD_DEV = r"""
+_CUDA_SRC_EOD = r"""namespace pgk{
+
 struct EodArgs{int*done;const int*peer;const int*rank_of;const int*needv;const int*chunk;int done_target;int nidx;
 const int4*ent;const int*woff;const char*src;char*dst[8];const unsigned*rank_t0;unsigned long long*trace;
 int*rcnt[8];unsigned*lcnt;int epoch;int ndst;const unsigned*ep;};
@@ -81,17 +65,77 @@ if(a.rank_t0!=nullptr){const unsigned long long due=t0 + a.rank_t0[r];while(!__a
 if(a.chunk!=nullptr){const int nd=(en.z>>16)&0xFF;if(nd>0){const int*f=a.chunk +(((unsigned)en.z)>>24);
 while(!__all_sync(0xFFFFFFFFu,eod_ld(f)>=nd))__nanosleep(64);}}
 eod_row(a,en,lane);}for(;cur<a.nidx;cur++)eod_signal<EOD>(a,cur,lane,w);}
-"""
-_CUDA_SRC_EOD = r"""
-static int pg_num_sms(){static int n=0;if(!n)n=at::cuda::getCurrentDeviceProperties()->multiProcessorCount;return n;}
-template<typename... KArgs,typename... Args>static void pg_launch(void(*k)(KArgs...),dim3 grid,dim3 block,size_t smem,Args... args){
+template<int GATED,int NST,int MODE,int WSET=3,int PAIR64=1,int SPL=0,int EOD=0>__global__ void __launch_bounds__(384,1)eod_gemm(const char*__restrict__ xg,const char*__restrict__ wsf,const float*__restrict__ gs,void*__restrict__ out,const int*__restrict__ sorted_ids,const int*__restrict__ block_experts,const int*__restrict__ live,
+int NWT,int numel,int snake,__nv_bfloat16*m1,unsigned*m1_ep,const __grid_constant__ EodArgs eod){extern __shared__ __align__(1024)char smem[];const int tid=threadIdx.x;const unsigned sbase=smem_u32(smem);
+if(sbase&1023)__trap();const unsigned mb=sbase + NST*SB;int*meta=reinterpret_cast<int*>(smem + NST*SB + 2*NST*8);const unsigned ebase=mb + BAR_BYTES;const unsigned rbase=ebase +(MODE==4?0:2*(GATED?EPI1:EPI2));
+if(tid<NST){mbar_init(mb + tid*8,1);mbar_init(mb + NST*8 + tid*8,256);}pdl_wait();pdl_trigger();if(SPL&&tid==0)meta[8]=n_wide_entries(live);__syncthreads();const int n_items=(SPL?meta[8]:live[0])*NWT;
+const int wg=((EOD&2)!=0)?__shfl_sync(0xFFFFFFFFu,tid>>7,0):(tid>>7);if(wg==0){reg_dec<PREGS>();if constexpr((EOD&2)!=0){const int wu=__shfl_sync(0xFFFFFFFFu,tid>>5,0);if(wu>=1){eod_copy<EOD>(eod,wu);
+return;}}if(tid==0){int sl=0,rnd=0;unsigned eod_mask=0u;if constexpr((EOD&4)!=0){if(eod.trace!=nullptr){eod.trace[blockIdx.x]=eod_now();if(blockIdx.x==0){for(int q=0;q<8;q++)eod.trace[236 + q]=eod.chunk!=nullptr?(unsigned long long)eod_ld(eod.chunk + q):0ull;
+eod.trace[236 + 8]=eod.peer!=nullptr?(unsigned long long)eod_ld(eod.peer):0ull;eod.trace[236 + 9]=(unsigned long long)eod_ld(eod.done);}}}int item=sched_item(0,blockIdx.x,gridDim.x,snake);int ent_n=item<n_items?live[1 + item/NWT]:0;
+int e_n=item<n_items?block_experts[ent_n&0xFFFFF]:0;float g_n=(GATED&&item<n_items)?gs[e_n]:0.f;for(int j=0;item<n_items;j++){const int wt=item%NWT;const int ent=ent_n,e=e_n;const float gsv=g_n;const int pm=ent&0xFFFFF,wcode=ent>>20;
+const int nv=eff_nv<WSET>(wcode);const int nxt=sched_item(j + 1,blockIdx.x,gridDim.x,snake);if(nxt<n_items)ent_n=live[1 + nxt/NWT];
+int*mt=meta +(j&1)*4;mt[0]=pm;mt[1]=wt;mt[2]=wcode;mt[3]=__float_as_int(gsv);const char*xs=xg +(size_t)pm*NKT*XB;const char*ws=wsf +((size_t)e*NWT + wt)*(size_t)NKT*WSB;if constexpr((EOD&1)!=0){eod_gate<EOD>(eod,e,eod_mask);
+}
+#ifdef PGN_WSET
+const bool pr=PAIR64&&nv<=64;
+#else
+const bool pr=PAIR64&&nv==64;
+#endif
+const int nslot=pr?NKT/2:NKT;for(int ks=0;ks<nslot;ks++){if(rnd>0)mbar_wait(mb + NST*8 + sl*8,(rnd - 1)&1);const unsigned st=sbase + sl*SB;const bool rid_tma= !GATED&&MODE!=4&&ks==0;const unsigned ridb=rid_tma?XNT*4:0;
+if(rid_tma)bulk_g2s(rbase +(j&1)*(XNT*4),sorted_ids +(size_t)pm*XNT,XNT*4,mb + sl*8);if(!pr){const int kt=ks;mbar_expect_tx(mb + sl*8,nv*128 + WSB + ridb);
+if(GATED){bulk_g2s(st,xs +(size_t)kt*XB,nv*128,mb + sl*8);}else{bulk_g2s(st,xs +(size_t)kt*XB,nv*64,mb + sl*8);bulk_g2s(st + XB/2,xs +(size_t)kt*XB + XB/2,nv*64,mb + sl*8);}bulk_g2s(st + XB,ws +(size_t)kt*WSB,WSB,mb + sl*8);
+}else{const int kt=2*ks;
+#ifdef PGN_WSET
+mbar_expect_tx(mb + sl*8,2*nv*128 + 2*WSB + ridb);
+#else
+mbar_expect_tx(mb + sl*8,2*8192 + 2*WSB + ridb);
+#endif
+#pragma unroll
+for(int sub=0;sub<2;sub++){const char*xk=xs +(size_t)(kt + sub)*XB;if(GATED){
+#ifdef PGN_WSET
+bulk_g2s(st + sub*8192,xk,nv*128,mb + sl*8);}else{bulk_g2s(st + sub*8192,xk,nv*64,mb + sl*8);bulk_g2s(st + sub*8192 + 4096,xk + XB/2,nv*64,mb + sl*8);
+#else
+bulk_g2s(st + sub*8192,xk,8192,mb + sl*8);}else{bulk_g2s(st + sub*8192,xk,4096,mb + sl*8);bulk_g2s(st + sub*8192 + 4096,xk + XB/2,4096,mb + sl*8);
+#endif
+}}bulk_g2s(st + 16384,ws +(size_t)kt*WSB,2*WSB,mb + sl*8);}if(++sl==NST){sl=0;rnd++;}if(ks==8&&nxt<n_items)e_n=block_experts[ent_n&0xFFFFF];if(GATED&&ks==16&&nxt<n_items)g_n=gs[e_n];}item=nxt;}}return;
+}reg_inc<CREGS>();Ctx c;c.smem=smem;c.sbase=sbase;c.mb=mb;c.cw=wg - 1;c.bar=1 + c.cw;c.hf=c.cw;c.woff=0;c.ctid=tid - 128;c.wtid=tid&127;c.lw=(tid>>5)&3;c.lane=tid&31;
+c.r0l=c.cw*64 + c.lw*16 +(c.lane>>2);c.r1l=c.r0l + 8;c.sfo=16*(c.cw*32 + c.lw*8 +(c.lane>>2));c.dhi=GATED?((1ull<<16)|((unsigned long long)(1024>>4)<<32)|(1ull<<62)):((1ull<<16)|((unsigned long long)(512>>4)<<32)|(2ull<<62));
+c.epi=ebase + c.cw*(GATED?EPI1:EPI2);c.sl=0;c.cph=0;c.rsl=0;const int wtid=c.wtid;const int*rid_s=reinterpret_cast<const int*>(smem +(rbase - sbase));
+for(int j=0,item=sched_item(0,blockIdx.x,gridDim.x,snake);item<n_items;j++,item=sched_item(j,blockIdx.x,gridDim.x,snake)){mbar_wait(c.mb + c.sl*8,c.cph);const volatile int*mt=meta +(j&1)*4;const int pm=mt[0],wt=mt[1],wcode=mt[2];
+const float gsv=__int_as_float(mt[3]);const int*rids=rid_s +(j&1)*XNT;
+#ifdef PGN_WSET
+float acc[XNT/2];
+#else
+float acc[128];
+#endif
+unsigned bA[16],bB[16];if(MODE!=0){
+#pragma unroll
+for(int i=0;i<16;i++){bA[i]=0x3F803F80u;bB[i]=0x3F803F80u;}}const int nv=eff_nv<WSET>(wcode);
+#ifdef PGN_WSET
+if((WSET&16)&&nv==16)item_body<GATED,NST,MODE,16,PAIR64>(c,acc,bA,bB,pm,wt,gsv,rids,out,NWT,numel,m1);else if((WSET&8)&&nv==32)item_body<GATED,NST,MODE,32,PAIR64>(c,acc,bA,bB,pm,wt,gsv,rids,out,NWT,numel,m1);
+else if((WSET&1)&&nv==64)item_body<GATED,NST,MODE,64,PAIR64>(c,acc,bA,bB,pm,wt,gsv,rids,out,NWT,numel,m1);else
+item_body<GATED,NST,MODE,XNT,PAIR64>(c,acc,bA,bB,pm,wt,gsv,rids,out,NWT,numel,m1);
+#else
+if((WSET&1)&&nv==64)item_body<GATED,NST,MODE,64,PAIR64>(c,acc,bA,bB,pm,wt,gsv,rids,out,NWT,numel,m1);else if((WSET&2)&&nv==128)item_body<GATED,NST,MODE,128,PAIR64>(c,acc,bA,bB,pm,wt,gsv,rids,out,NWT,numel,m1);
+else if((WSET&4)&&nv==192)item_body<GATED,NST,MODE,192,PAIR64>(c,acc,bA,bB,pm,wt,gsv,rids,out,NWT,numel,m1);else
+item_body<GATED,NST,MODE,256,PAIR64>(c,acc,bA,bB,pm,wt,gsv,rids,out,NWT,numel,m1);
+#endif
+}if(GATED&&wtid==0)bulk_wait0();
+#if defined(PG_M1_STORE) || defined(PG_M1RS)
+if(!GATED&&m1_ep!=nullptr){named_bar_sync(3,256);if(c.ctid==0)asm volatile("fence.acq_rel.sys;\n\tmultimem.red.release.sys.global.add.u32 [%0], %1;" :: "l"(m1_ep),"r"(1u): "memory");}
+#endif
+}
+}
+
+static int eod_num_sms(){static int n=0;if(!n)n=at::cuda::getCurrentDeviceProperties()->multiProcessorCount;return n;}
+template<typename... KArgs,typename... Args>static void eod_klaunch(void(*k)(KArgs...),dim3 grid,dim3 block,size_t smem,Args... args){
 cudaLaunchConfig_t cfg={};cfg.gridDim=grid;cfg.blockDim=block;cfg.dynamicSmemBytes=smem;cfg.stream=at::cuda::getCurrentCUDAStream();
 cfg.numAttrs=0;C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg,k,static_cast<KArgs>(args)...));}
 template<int EOD>static void eod_launch(const torch::Tensor&xg,const torch::Tensor&wsf,const float*gs,void*out,const torch::Tensor&be,
 const torch::Tensor&live,int grid,int snake,const pgk::EodArgs&a){auto fn=pgk::eod_gemm<1,5,0,3,1,0,EOD>;constexpr int smem=pgk::smem_bytes<1,0>(5);
 static bool set=false;if(!set){C10_CUDA_CHECK(cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));set=true;}
 const int NWT=wsf.size(1);TORCH_CHECK(wsf.size(2)==pgk::NKT&&wsf.size(3)==pgk::WSB,"eod: wsf layout");
-pg_launch(fn,dim3(grid>0?grid:pg_num_sms()),dim3(384),smem,reinterpret_cast<const char*>(xg.data_ptr()),reinterpret_cast<const char*>(wsf.data_ptr()),
+eod_klaunch(fn,dim3(grid>0?grid:eod_num_sms()),dim3(384),smem,reinterpret_cast<const char*>(xg.data_ptr()),reinterpret_cast<const char*>(wsf.data_ptr()),
 gs,out,(const int*)nullptr,be.data_ptr<int>(),live.data_ptr<int>(),NWT,0,snake,(__nv_bfloat16*)nullptr,(unsigned*)nullptr,a);}
 void eod_gg1(torch::Tensor xg,torch::Tensor wsf,torch::Tensor gs,torch::Tensor inter,torch::Tensor block_experts,torch::Tensor live,
 int64_t numel,int64_t mode,torch::Tensor args){TORCH_CHECK(args.device().is_cpu()&&args.scalar_type()==at::kLong&&args.numel()>=32,"eod: int64 cpu args");
@@ -102,7 +146,7 @@ a.src=reinterpret_cast<const char*>(v[9]);for(int i=0;i<8;i++)a.dst[i]=reinterpr
 a.rank_t0=reinterpret_cast<const unsigned*>(v[18]);a.trace=reinterpret_cast<unsigned long long*>(v[19]);const int grid=(int)v[20];
 for(int i=0;i<8;i++)a.rcnt[i]=reinterpret_cast<int*>(v[22 + i]);a.lcnt=reinterpret_cast<unsigned*>(v[30]);a.epoch=(int)(v[31]&0x7fffffff);
 a.ndst=(int)(v[31]>>32);a.ep=reinterpret_cast<const unsigned*>(v[21]);
-TORCH_CHECK(grid==0||grid==pg_num_sms(),"eod: copier lists assume one CTA per SM");
+TORCH_CHECK(grid==0||grid==eod_num_sms(),"eod: copier lists assume one CTA per SM");
 const int snake=(numel/8<=4096)?1:0;const float*gs_p=gs.data_ptr<float>();void*o=inter.data_ptr();
 TORCH_CHECK(mode==11,"eod: the served build has mode 11 only");eod_launch<11>(xg,wsf,gs_p,o,block_experts,live,grid,snake,a);}
 void eod_rep_cut(torch::Tensor ids,torch::Tensor tab,torch::Tensor cnt,torch::Tensor bc,torch::Tensor cut,int64_t sb){
@@ -173,40 +217,3 @@ ga2b::ga2b_scatter<<<nch,ga2b::NT,smem,st>>>(ids.data_ptr<int>(),numel,tabs.data
 hist.data_ptr<int>(),nch,(int)me,c0,nown,(int)(me*S),(int)BM,nblocks,(int)W,N,sid.data_ptr<int>(),
 reinterpret_cast<int4*>(ent.data_ptr<int>()),npad.data_ptr<int>(),be.data_ptr<int>(),epp);C10_CUDA_KERNEL_LAUNCH_CHECK();}
 """
-
-
-_GAP = r"(?:\s|//[^\n]*\n|/\*(?:.|\n)*?\*/)"
-
-
-def _pat(anchor):
-    """Token pattern of an anchor: between tokens any whitespace or comments, and at least one between two words."""
-    toks = re.findall(r"[A-Za-z0-9_]+|\S", anchor)
-    out = []
-    for k, t in enumerate(toks):
-        if k:
-            word = (toks[k - 1][-1].isalnum() or toks[k - 1][-1] == "_") and (t[0].isalnum() or t[0] == "_")
-            out.append(_GAP + ("+" if word else "*"))
-        out.append(re.escape(t))
-    return "".join(out)
-
-
-def _span(text, anchor, what):
-    m = list(re.finditer(_pat(anchor), text))
-    if len(m) != 1:
-        raise RuntimeError(f"EOD source: anchor {what} matched {len(m)} times")
-    return m[0].span()
-
-
-def eod_source(base):
-    """pg's _CUDA_SRC -> the EOD module source (pg text to its host section, eod_gemm, the EOD host entry points)."""
-    i, _ = _span(base, _PG_HEAD, "pg_gemm head")
-    j, _ = _span(base, "constexpr int AL_MAX=64;", "AL_MAX")
-    h, _ = _span(base, "static int pg_num_sms(){", "host section")
-    if not i < j < h:
-        raise RuntimeError("EOD source: anchors out of order")
-    gemm = base[i:j]
-    for old, new in _EDITS:
-        a, b = _span(gemm, old, old[:24])
-        gemm = gemm[:a] + new + gemm[b:]
-    a, b = _span(gemm, _PG_HEAD, "eod_gemm head")
-    return base[:j] + _CUDA_SRC_EOD_DEV + gemm[:a] + _EOD_HEAD + gemm[b:] + base[j:h] + _CUDA_SRC_EOD
