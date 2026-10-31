@@ -244,8 +244,8 @@ def pg_rs_ext(narrow: bool):
 
 def pg_eod_ext():
     """OKC_EOD (okc_patch/eod.py): pg's text followed by _cuda_src_eod's (eod_gemm: the wide gg1 plus push copiers and
-    per-slot gates; the global align; the replica cut) in a module of its own, built only with OKC_EOD on, so the served
-    pg modules keep their text and builds."""
+    per-slot gates; the size-ordered global align; the replica cut) in a module of its own, built only with OKC_EOD on,
+    so the served pg modules keep their text and builds."""
     global _PG_EOD_EXT
     if _PG_EOD_EXT is None:
         with _lock:
@@ -254,12 +254,13 @@ def pg_eod_ext():
                 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_pg import _CUDA_SRC
 
                 _PG_EOD_EXT = _load_inline(
-                    name="okc_pg_eod_v3",
+                    name="okc_pg_eod_v3c",
                     cpp_sources="void eod_gg1(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
                     "torch::Tensor, int64_t, int64_t, torch::Tensor);\n"
                     "void eod_rep_cut(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t);\n"
                     "void eod_galign(torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, "
-                    "int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);",
+                    "int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+                    "torch::Tensor);",
                     cuda_sources=[_CUDA_SRC, _CUDA_SRC_EOD],
                     functions=["eod_gg1", "eod_rep_cut", "eod_galign"],
                     extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],

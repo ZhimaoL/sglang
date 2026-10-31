@@ -2,9 +2,11 @@
 
 Every rank keeps its own (pre-normalized) SP shard rows. After the scores / ids gather, every rank derives every
 destination's layout from the gathered ids, the 8 ranks' replica tables and the served replica cut (eod_galign,
-deterministic, so all ranks agree), and its gg1 (eod_gemm: the pg wide build's gg1 plus copier warps and per-slot gates)
-pushes the own rows into every rank's symm-mem token images while it computes; a slot's items start once all 8 sources
-have released that slot. gg2 and the M1-RS combine are today's.
+deterministic, so all ranks agree): each destination's slots sit in its layout by (route count ascending, slot), and a
+route's push key / counter is its slot's position there (rank_of: this rank's slot -> position, written per call). Its
+gg1 (eod_gemm: the pg wide build's gg1 plus copier warps and per-slot gates) pushes the own rows into every rank's
+symm-mem token images in key order while it computes; a slot's items start once all 8 sources have released its
+position. gg2 and the M1-RS combine are today's (gg2 reads block_experts' weight slots, so the order is free there).
 
 Image reuse needs no handshake: EOD runs only where M1-RS runs for the same call, every rank's gg1 of a layer precedes
 its gg2 releases on the stream, and every rank's M1-RS receive of that layer waits for all world x SMs releases before
@@ -62,7 +64,7 @@ def _setup(device, nl):
                   "cnt_ptrs": [int(p) for p in hc.buffer_ptrs], "nblocks": nblocks, "nl": nl,
                   "lcnt": torch.zeros((64,), dtype=torch.int32, device=device),
                   "ep": torch.zeros((1,), dtype=torch.int32, device=device),
-                  "rank_of": torch.arange(64, dtype=torch.int32, device=device),
+                  "rank_of": torch.zeros((64,), dtype=torch.int32, device=device),   # eod_galign writes it per call
                   "W": 3 * torch.cuda.get_device_properties(device).multi_processor_count,
                   "rank": g.rank_in_group, "group": g, "woff": {}, "calls": 0}
     _STATE[key] = st
@@ -153,7 +155,8 @@ def forward(layer, x, topk_scores, topk_ids):
     be = torch.empty((nblocks,), dtype=torch.int32, device=dev)
     sid = torch.empty((nblocks * _BM,), dtype=torch.int32, device=dev)
     ent = torch.empty((S * 8, 4), dtype=torch.int32, device=dev)
-    ext.eod_galign(ids, tabs, cut, st["rank"], S, _BM, st["W"], nl, hist, npad, be, sid, ent, st["ep"])
+    ext.eod_galign(ids, tabs, cut, st["rank"], S, _BM, st["W"], nl, hist, npad, be, sid, ent, st["ep"],
+                   st["rank_of"])
     live = torch.empty((nblocks + 1,), dtype=torch.int32, device=dev)
     pg = pg_moe._ext(_BM)
     pg.tiles(be, npad, sid, live, nblocks, _BM, numel, pg_moe._WMASK, state["pg_wsf13"].shape[0])

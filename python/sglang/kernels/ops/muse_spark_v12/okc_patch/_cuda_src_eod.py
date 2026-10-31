@@ -4,15 +4,16 @@ pg's _CUDA_SRC in one module (cuda_ext.pg_eod_ext: cuda_sources=[_CUDA_SRC, _CUD
 eod_gemm is pg_gemm<1,5,0,3,1,0> (the wide build's gg1; this copy was cut from pg text c5a10c1b) with two additions behind
 its EOD template bit set 11:
   - copiers: warps 1-3 of each CTA (idle in pg_gemm) push the own SP shard's route rows into every rank's symm-mem token
-    images through peer pointers, in (local slot, route id) order; per slot each warp fences (fence.acq_rel.sys) and
-    counts in a local epoch-monotonic counter, and the call's last warp for a slot adds 1 to that slot's counter on
-    every rank (fence.acq_rel.sys, then red.relaxed.sys);
-  - gates: before an item's first k-tile the TMA thread waits until its slot's counter reaches 8 x epoch (relaxed .sys
-    loads, then fence.acq_rel.sys and fence.proxy.async.global). The epoch is a device word bumped once per call by the
-    global align, so a captured graph re-reads it on every replay; counters never reset.
+    images through peer pointers, in (key, route id) order, key = the route's slot's position in its destination's size
+    order; per key each warp fences (fence.acq_rel.sys) and counts in a local epoch-monotonic counter, and the call's
+    last warp for a key adds 1 to that key's counter on every rank (fence.acq_rel.sys, then red.relaxed.sys);
+  - gates: before an item's first k-tile the TMA thread waits until the counter of its slot's position (rank_of[slot])
+    reaches 8 x epoch (relaxed .sys loads, then fence.acq_rel.sys and fence.proxy.async.global). The epoch is a device
+    word bumped once per call by the global align, so a captured graph re-reads it on every replay; counters never reset.
 eod_galign: every rank derives every destination's layout from the gathered ids, the 8 ranks' replica tables and the
-served replica cut (owner = pg_rep_split's rule), deterministically: routes sit in route-id order inside each
-(rank, slot) bucket; outputs are the own layout in align_local's formats and this rank's push list.
+served replica cut (owner = pg_rep_split's rule), deterministically: each destination's slots sit in its layout by
+(route count ascending, slot), routes in route-id order inside each (rank, slot) bucket; outputs are the own layout in
+align_local's formats (block_experts keeps the weight slot), this rank's push list and rank_of (slot -> position).
 eod_rep_cut: pg_rep_count + pg_rep_cut of split_replicas, without its split pass.
 Regenerate (muse-opt serving/kernels/eod/eod_port_gen.py) whenever pg_gemm's text changes.
 """
@@ -167,53 +168,66 @@ for(int i=lo + t;i<hi;i +=NT){const int e=ids[i];if((unsigned)e>=256u)continue;c
 atomicAdd(&h[d*NL +(tb[d*256 + e]&0xFF)],1);}__syncthreads();if(t<8*NL)hist[blockIdx.x*NBMAX + t]=h[t];}
 // one CTA per 4096-route chunk: its prefix / totals / offsets / push bases from hist (every CTA redundantly), CTA 0 also
 // writes the own layout's n_padded, block_experts and pads and bumps the epoch word; then the stable ranks and the writes
-__global__ void __launch_bounds__(NT)ga2b_scatter(const int*__restrict__ ids,int numel,const int*__restrict__ tabs,
+}
+namespace ga2c{
+constexpr int NT=512,NWP=NT/32,CH=4096,PER=CH/NWP,NBMAX=512,NLMAX=64;
+__device__ __forceinline__ int owner_of(const int*tb,const int*ct,int e,int t){const int v=tb[e];
+return(((v>>11)&1)&&t<ct[e])?((v>>12)&7):((v>>8)&7);}
+// galign2b + size order: each destination's slots sit in its layout by (count ascending, slot), and a route's counter /
+// push key is its slot's position there; rank_of (this rank's slot -> position) is written for the gate
+__global__ void __launch_bounds__(NT)ga2c_scatter(const int*__restrict__ ids,int numel,const int*__restrict__ tabs,
 const int*__restrict__ cut,int NL,const int*__restrict__ hist,int nch,int me,int c0,int nown,int row0,int BM,int nblocks,
-int W,int N,int*__restrict__ sid,int4*__restrict__ ent,int*__restrict__ npad,int*__restrict__ be,unsigned*__restrict__ ep){
-extern __shared__ int sm[];const int B=8*NL;int*tb=sm;int*ct=tb + 8*256;int*hw=ct + 256;int*hr=hw + NWP*B;int*pre=hr + NWP*NL;
-int*tot=pre + B;int*so=tot + B;int*pb=so + 8*(NL + 1);int*tos=pb + NL;const int t=threadIdx.x,w=t>>5,lane=t&31,c=blockIdx.x;
+int W,int N,int*__restrict__ sid,int4*__restrict__ ent,int*__restrict__ npad,int*__restrict__ be,unsigned*__restrict__ ep,
+int*__restrict__ rank_of){extern __shared__ int sm[];const int B=8*NL;int*tb=sm;int*ct=tb + 8*256;int*hw=ct + 256;
+int*hr=hw + NWP*B;int*pre=hr + NWP*NL;int*tot=pre + B;int*so=tot + B;int*kk=so + B;int*inv=kk + B;int*pb=inv + B;
+int*tos=pb + NL;int*npd=tos + NL;const int t=threadIdx.x,w=t>>5,lane=t&31,c=blockIdx.x;
 for(int i=t;i<8*256;i +=NT)tb[i]=tabs[i];if(t<256)ct[t]=cut[t];for(int i=t;i<NWP*B;i +=NT)hw[i]=0;for(int i=t;i<NWP*NL;i +=NT)hr[i]=0;
 for(int b=t;b<B;b +=NT){int p=0,q=0;
 #pragma unroll 8
 for(int k=0;k<nch;k++){const int v=hist[k*NBMAX + b];q +=v;p +=k<c?v:0;}pre[b]=p;tot[b]=q;}
+__syncthreads();
+for(int b=t;b<B;b +=NT){const int d=b/NL,s=b - d*NL,v=tot[b];int k=0;
+for(int q=0;q<NL;q++){const int u=tot[d*NL + q];k +=(u<v)||(u==v&&q<s);}kk[b]=k;inv[d*NL + k]=s;}
+__syncthreads();
 const bool own=c>=c0&&c<c0 + nown;
-if(own&&t<NL){int a=0,q=0;for(int k=0;k<nown;k++){int v=0;for(int d=0;d<8;d++)v +=hist[(c0 + k)*NBMAX + d*NL + t];
+if(t<8){int acc=0;for(int k=0;k<NL;k++){const int s=inv[t*NL + k];so[t*NL + s]=acc;acc +=(tot[t*NL + s]+ BM - 1)/BM*BM;}npd[t]=acc;}
+if(own&&t<NL){int a=0,q=0;for(int k=0;k<nown;k++){int v=0;for(int d=0;d<8;d++)v +=hist[(c0 + k)*NBMAX + d*NL + inv[d*NL + t]];
 if(k<c - c0)a +=v;q +=v;}pb[t]=a;tos[t]=q;}
 __syncthreads();
-if(t<8){int acc=0;for(int q=0;q<NL;q++){so[t*(NL + 1)+ q]=acc;acc +=(tot[t*NL + q]+ BM - 1)/BM*BM;}so[t*(NL + 1)+ NL]=acc;}
 if(own&&t==32){int acc=0;for(int q=0;q<NL;q++){const int v=tos[q];pb[q]+=acc;acc +=v;}}
+if(c==0){const int*som=so + me*NL;if(t==0){*npad=npd[me];if(ep!=nullptr)*ep +=1u;}if(t<NLMAX)rank_of[t]=t<NL?kk[me*NL + t]:0;
+for(int b=t;b<nblocks;b +=NT){const int pos=b*BM;int e= -1;for(int q=0;q<NL;q++){const int s0=som[q],s1=s0 +(tot[me*NL + q]+ BM - 1)/BM*BM;
+if(pos>=s0&&pos<s1)e=q;}be[b]=e;}
+for(int q=0;q<NL;q++){const int n=tot[me*NL + q],s0=som[q],s1=s0 +(n + BM - 1)/BM*BM;for(int p=s0 + n + t;p<s1;p +=NT)sid[p]=numel;}}
 __syncthreads();
-if(c==0){const int*som=so + me*(NL + 1);if(t==0){*npad=som[NL];if(ep!=nullptr)*ep +=1u;}
-for(int b=t;b<nblocks;b +=NT){const int pos=b*BM;int e= -1;for(int q=0;q<NL;q++)if(pos>=som[q]&&pos<som[q + 1])e=q;be[b]=e;}
-for(int q=0;q<NL;q++){const int n=tot[me*NL + q];for(int p=som[q]+ n + t;p<som[q + 1];p +=NT)sid[p]=numel;}}
 const int lo=c*CH + w*PER;const unsigned lt=(1u<<lane)- 1u;int rg[PER/32],rr[PER/32],bb[PER/32];
 #pragma unroll
-for(int it=0;it<PER/32;it++){const int i=lo + it*32 + lane;const int e=i<numel?ids[i]: -1;int b= -1,s= -1;
-if((unsigned)e<256u){const int d=owner_of(tb,ct,e,i>>3);s=tb[d*256 + e]&0xFF;b=d*NL + s;}bb[it]=b;
+for(int it=0;it<PER/32;it++){const int i=lo + it*32 + lane;const int e=i<numel?ids[i]: -1;int b= -1,k= -1;
+if((unsigned)e<256u){const int d=owner_of(tb,ct,e,i>>3);b=d*NL +(tb[d*256 + e]&0xFF);k=kk[b];}bb[it]=b;
 const unsigned m=__match_any_sync(0xFFFFFFFFu,b);const int base=b>=0?hw[w*B + b]:0;__syncwarp();rg[it]=base + __popc(m&lt);
 if(b>=0&&lane==__ffs(m)- 1)hw[w*B + b]=base + __popc(m);__syncwarp();rr[it]=0;
-if(own){const unsigned m2=__match_any_sync(0xFFFFFFFFu,s);const int b2=s>=0?hr[w*NL + s]:0;__syncwarp();rr[it]=b2 + __popc(m2&lt);
-if(s>=0&&lane==__ffs(m2)- 1)hr[w*NL + s]=b2 + __popc(m2);__syncwarp();}}
+if(own){const unsigned m2=__match_any_sync(0xFFFFFFFFu,k);const int b2=k>=0?hr[w*NL + k]:0;__syncwarp();rr[it]=b2 + __popc(m2&lt);
+if(k>=0&&lane==__ffs(m2)- 1)hr[w*NL + k]=b2 + __popc(m2);__syncwarp();}}
 __syncthreads();for(int b=t;b<B;b +=NT){int acc=0;for(int q=0;q<NWP;q++){const int v=hw[q*B + b];hw[q*B + b]=acc;acc +=v;}}
 if(own&&t<NL){int acc=0;for(int q=0;q<NWP;q++){const int v=hr[q*NL + t];hr[q*NL + t]=acc;acc +=v;}}
 __syncthreads();const int nq=N/W,nm=N%W;
 #pragma unroll
-for(int it=0;it<PER/32;it++){const int b=bb[it];if(b<0)continue;const int i=lo + it*32 + lane;const int d=b/NL,s=b - d*NL;
-const int pos=so[d*(NL + 1)+ s]+ pre[b]+ hw[w*B + b]+ rg[it];if(d==me)sid[pos]=i;
-if(own){const int j=pb[s]+ hr[w*NL + s]+ rr[it];const int q=j%W;
-ent[j/W + q*nq + min(q,nm)]=make_int4((i>>3)- row0,(pos/BM)|(d<<24),(pos%BM)|(s<<8),0);}}}
+for(int it=0;it<PER/32;it++){const int b=bb[it];if(b<0)continue;const int i=lo + it*32 + lane;const int d=b/NL,k=kk[b];
+const int pos=so[b]+ pre[b]+ hw[w*B + b]+ rg[it];if(d==me)sid[pos]=i;
+if(own){const int j=pb[k]+ hr[w*NL + k]+ rr[it];const int q=j%W;
+ent[j/W + q*nq + min(q,nm)]=make_int4((i>>3)- row0,(pos/BM)|(d<<24),(pos%BM)|(k<<8),0);}}}
 }
 void eod_galign(torch::Tensor ids,torch::Tensor tabs,torch::Tensor cut,int64_t me,int64_t S,int64_t BM,int64_t W,int64_t NL,
-torch::Tensor hist,torch::Tensor npad,torch::Tensor be,torch::Tensor sid,torch::Tensor ent,torch::Tensor ep){
-TORCH_CHECK(ids.is_cuda()&&ids.scalar_type()==torch::kInt32&&ids.is_contiguous()&&tabs.numel()==8*256&&cut.numel()>=256,"galign2b: inputs");
-const int numel=(int)ids.numel(),nch=numel/ga2b::CH,nblocks=(int)be.numel(),N=(int)(S*8),c0=(int)(me*S*8/ga2b::CH),nown=N/ga2b::CH;
-TORCH_CHECK(numel%ga2b::CH==0&&N%ga2b::CH==0&&nown>=1&&nown<=8&&NL>=1&&NL<=ga2b::NLMAX,"galign2b: shapes");
-TORCH_CHECK(hist.numel()>=(long)nch*ga2b::NBMAX&&ent.numel()>=(long)N*4&&sid.numel()>=(long)nblocks*BM,"galign2b: buffers");
-const int B=8*(int)NL;const size_t smem=(size_t)(8*256 + 256 + ga2b::NWP*B + ga2b::NWP*(int)NL + 2*B + 8*((int)NL + 1)+ 2*(int)NL)*4;
-static bool set=false;if(!set){C10_CUDA_CHECK(cudaFuncSetAttribute(ga2b::ga2b_scatter,cudaFuncAttributeMaxDynamicSharedMemorySize,64*1024));set=true;}
+torch::Tensor hist,torch::Tensor npad,torch::Tensor be,torch::Tensor sid,torch::Tensor ent,torch::Tensor ep,torch::Tensor rank_of){
+TORCH_CHECK(ids.is_cuda()&&ids.scalar_type()==torch::kInt32&&ids.is_contiguous()&&tabs.numel()==8*256&&cut.numel()>=256&&rank_of.numel()>=64,"galign2c: inputs");
+const int numel=(int)ids.numel(),nch=numel/ga2c::CH,nblocks=(int)be.numel(),N=(int)(S*8),c0=(int)(me*S*8/ga2c::CH),nown=N/ga2c::CH;
+TORCH_CHECK(numel%ga2c::CH==0&&N%ga2c::CH==0&&nown>=1&&nown<=8&&NL>=1&&NL<=ga2c::NLMAX,"galign2c: shapes");
+TORCH_CHECK(hist.numel()>=(long)nch*ga2c::NBMAX&&ent.numel()>=(long)N*4&&sid.numel()>=(long)nblocks*BM,"galign2c: buffers");
+const int B=8*(int)NL;const size_t smem=(size_t)(8*256 + 256 + ga2c::NWP*B + ga2c::NWP*(int)NL + 5*B + 2*(int)NL + 8)*4;
+static bool set=false;if(!set){C10_CUDA_CHECK(cudaFuncSetAttribute(ga2c::ga2c_scatter,cudaFuncAttributeMaxDynamicSharedMemorySize,64*1024));set=true;}
 auto st=at::cuda::getCurrentCUDAStream();unsigned*epp=ep.numel()?reinterpret_cast<unsigned*>(ep.data_ptr<int>()):nullptr;
 ga2b::ga2b_count<<<nch,ga2b::NT,0,st>>>(ids.data_ptr<int>(),numel,tabs.data_ptr<int>(),cut.data_ptr<int>(),(int)NL,hist.data_ptr<int>());
-ga2b::ga2b_scatter<<<nch,ga2b::NT,smem,st>>>(ids.data_ptr<int>(),numel,tabs.data_ptr<int>(),cut.data_ptr<int>(),(int)NL,
+ga2c::ga2c_scatter<<<nch,ga2c::NT,smem,st>>>(ids.data_ptr<int>(),numel,tabs.data_ptr<int>(),cut.data_ptr<int>(),(int)NL,
 hist.data_ptr<int>(),nch,(int)me,c0,nown,(int)(me*S),(int)BM,nblocks,(int)W,N,sid.data_ptr<int>(),
-reinterpret_cast<int4*>(ent.data_ptr<int>()),npad.data_ptr<int>(),be.data_ptr<int>(),epp);C10_CUDA_KERNEL_LAUNCH_CHECK();}
+reinterpret_cast<int4*>(ent.data_ptr<int>()),npad.data_ptr<int>(),be.data_ptr<int>(),epp,rank_of.data_ptr<int>());C10_CUDA_KERNEL_LAUNCH_CHECK();}
 """
