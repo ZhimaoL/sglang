@@ -14,11 +14,16 @@ Memory per captured layer per rank (32 local experts, I = H = 4096): 640 + 320 M
 replica).
 """
 
+import logging
+
 import torch
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_MAX_T, PG_GN_SPLIT, PG_NARROW_MAX_T, PG_NARROW_MIN_T, SW_PDL
 from sglang.kernels.ops.muse_spark_v12.okc_patch import cuda_ext
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import pg_ext, pg_narrow64_ext, pg_narrow_ext
+from sglang.kernels.ops.muse_spark_v12.okc_patch import PG_REP_CUT
+
+logger = logging.getLogger(__name__)
 
 _BLOCK_M = 256
 _CFG = 350        # the bank's shipped pg configuration (widths 64 / 128 / 256, 5 stages)
@@ -176,10 +181,14 @@ def assign_replicas(topk_ids, tab, rank, as_map=False, passes=False):
     return out
 
 
+_REP_CUT_LOGGED: list = []
+
+
 def split_replicas(topk_ids, tab, rank):
     """Prefill form of assign_replicas: [T, 8] global top-k ids -> [T, 8] int32 local slots on this rank (-1: another
     rank computes the route), each replicated expert's routes split between its two holders at a token boundary so
-    their routed-token loads level (pg_rep_cut / pg_rep_split in _cuda_src_pg.py). Same decision on every rank."""
+    their routed-token loads level (pg_rep_cut / pg_rep_split in _cuda_src_pg.py; OKC_PG_REP_CUT=cost: their pg block
+    costs level instead). Same decision on every rank."""
     T = topk_ids.shape[0]
     n_rep = tab.numel() - 256
     sb = 64   # token block of the cut; coarser when the per-block counts would not fit the CTA's shared memory
@@ -190,7 +199,11 @@ def split_replicas(topk_ids, tab, rank):
     bc = torch.empty((max(1, n_rep * -(-T // sb)),), dtype=torch.int32, device=ids.device)
     cut = torch.empty((256,), dtype=torch.int32, device=ids.device)
     out = torch.empty(ids.shape, dtype=torch.int32, device=ids.device)
-    pg_ext().rep_split(ids, tab, cnt, bc, cut, out, rank, sb)
+    cost = PG_REP_CUT == "cost"
+    if cost and not _REP_CUT_LOGGED:
+        _REP_CUT_LOGGED.append(T)
+        logger.info("OKC pg replica cut by block cost active (first T=%d).", T)
+    pg_ext().rep_split(ids, tab, cnt, bc, cut, out, rank | (256 if cost else 0), sb)   # bits 8+: the cut mode
     return out
 
 
