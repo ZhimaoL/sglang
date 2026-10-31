@@ -193,7 +193,7 @@ SP_PRENORM_SHARD = _flag("OKC_SP_PRENORM_SHARD", "1")
 SP_PRENORM_EARLY = _flag("OKC_SP_PRENORM_EARLY", "1")
 # FIRSTTURN #1 (okc_patch/ft_norm.py, _cuda_src_ftnorm.py; bit-identical): the extend's per-head q / k norm (and
 # rope) folded into the FP8 q / KV-cache write: one launch for FusedQKNorm + fused_fp8_qkv_kv_cache.
-QK_FOLD = _flag("OKC_QK_FOLD", "0")
+QK_FOLD = _flag("OKC_QK_FOLD", "1")
 # pg calls of >= OKC_PG_LOCAL_ALIGN_MIN_TOKENS tokens align their routes with the prefill bank's local-slot align
 # (pg_moe.align_local: one count into the local-slot counters) instead of the cast + map gather + 256-expert
 # moe_align_block_size chain (1xH200: 16K-token call 127.7 -> 19.7 us GPU, bit-identical pg rows).
