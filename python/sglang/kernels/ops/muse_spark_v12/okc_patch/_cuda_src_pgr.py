@@ -1,15 +1,7 @@
-"""pg_route_f (OKC_SW_PGR): pg_route's small front end (_cuda_src_pg.py) on a shorter, leaner chain, for verify calls of
-<= 2048 routes on pg's 64-token-block build (cuda_ext.pgr_ext: -DPGN_XNT=64 -DPGN_WSET=24, pg_narrow64_ext's geometry).
-Same outputs as pg_route (local_ids, sorted_ids, block_experts, live; the replica decision is rep_owner's with passes 0).
-The served kernel is one CTA of 32 warps that repeats work in every warp (two match.any passes, scattered sorted_ids
-stores, a sentinel pass over every block); here, 16 warps:
-  - one route per lane per round; a lane's rank among its expert's routes in the round comes from a per-warp bit row
-    (one shared OR per route); rounds chain through the warp's count row
-  - one thread per expert turns the 16 warp rows into bases and totals while one warp runs the owner loop (branch-free,
-    from the active set) and then lays out the slots' blocks for every warp
-  - sorted_ids is staged in shared memory, prefilled with the sentinel and written out coalesced; one warp per live run
-Keys are GLOBAL experts: each slot holds one expert (rep_table / the home map), so an expert's routes in route order are
-its slot's.
+"""pg_route_f (OKC_SW_PGR): pg_route (_cuda_src_pg.py) for verify calls of <= 2048 routes on the 64-token-block build,
+same outputs (the replica decision is rep_owner's, passes 0) on a leaner chain: 16 warps, per-warp bit rows rank each
+round's routes per GLOBAL expert (each slot holds one expert), an expert pass beside one owner-loop / layout warp, and
+sorted_ids staged in shared memory with the sentinel prefilled, written out coalesced.
 """
 
 _CUDA_SRC_PGR = r"""
