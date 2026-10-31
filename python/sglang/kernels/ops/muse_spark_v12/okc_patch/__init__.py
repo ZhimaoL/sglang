@@ -360,3 +360,8 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "ANY_ATTN"]
 SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "1")  # M 33..128: fused AG + norm, row kernel at 1024 threads
 __all__ += ["SW_AG_NORM_WIDE"]
+# The SP prefill o projection's 2048-row chunk GEMMs (sp_tp_ce.matmul_rs_steps, 8 per layer-chunk) at okc_patch.lt's
+# pinned cuBLASLt config instead of torch.mm's heuristic one: rows bit-equal, -6.7 us per call in a CUDA graph on dev2
+# (serving/kernels/lt/chunkpin_probe.py, 10-31; FT-LEVERS update). Default off until its A/B.
+LT_PREFILL_O = _flag("OKC_LT_PREFILL_O", "0")
+__all__ += ["LT_PREFILL_O"]

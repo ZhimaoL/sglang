@@ -29,6 +29,8 @@ import os
 
 import torch
 
+from sglang.kernels.ops.muse_spark_v12.okc_patch import LT_PREFILL_O
+
 logger = logging.getLogger(__name__)
 
 # Session SI's 8-GPU bench (16K / 8K chunks, ms per layer vs torch's fused ops): matmul + RS -0.055..-0.065 at 16K and
@@ -173,6 +175,18 @@ def ag_matmul_steps(st, x_shard, weight):
     return out
 
 
+def _chunk_mm(x, weight, wt, out=None):
+    """torch.mm(x, wt) for one matmul_rs chunk; OKC_LT_PREFILL_O: okc_patch.lt's claimed config for the shape, whose
+    rows are the same bytes (the call falls back to torch.mm whenever lt declines)."""
+    if LT_PREFILL_O:
+        from sglang.kernels.ops.muse_spark_v12.okc_patch import lt as _lt
+
+        y = _lt.lt_prefill_mm(x, weight, out)
+        if y is not None:
+            return y
+    return torch.mm(x, wt) if out is None else torch.mm(x, wt, out=out)
+
+
 def matmul_rs_steps(st, x, weight):
     """Generator (yields the stream that needs a barrier; returns [S, N]): x [W*S, K] @ weight [N, K]^T, reduce-scattered
     over the ranks. st: rank, world, o (flat views of every rank's receive buffer), streams."""
@@ -192,7 +206,7 @@ def matmul_rs_steps(st, x, weight):
         rows = lambda j: x[j * S:(j + 1) * S]   # noqa: E731
     keep = []
     for j, dest in enumerate(_order(me, W)):
-        part = torch.mm(rows(dest), wt)
+        part = _chunk_mm(rows(dest), weight, wt)
         keep.append(part)
         ev = torch.cuda.Event()
         ev.record(cur)
@@ -200,7 +214,7 @@ def matmul_rs_steps(st, x, weight):
         s.wait_event(ev)
         with torch.cuda.stream(s):
             st.o[dest][me * S * N:(me + 1) * S * N].copy_(part.view(-1))
-    torch.mm(rows(me), wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
+    _chunk_mm(rows(me), weight, wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
     ev = torch.cuda.Event()
     ev.record(cur)
     X.wait_event(ev)

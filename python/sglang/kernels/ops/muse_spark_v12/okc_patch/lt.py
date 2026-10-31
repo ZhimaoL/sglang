@@ -5,11 +5,13 @@ other versions decline); reads the resident [N, K] bf16 weight, fp32 split-K par
 prepare(weight) at weight load validates (AlgoCheck) and warms the entries of the weight and its row slices.
 """
 
+import logging
 import threading
 
 import torch
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_LT
+from sglang.kernels.ops.muse_spark_v12.okc_patch import LT_PREFILL_O
 LT_VERSION = 130101
 
 # (N, K) -> {M: (layout, tile, split-K, custom option, cluster shape)}; every entry is algo 66 (nvjet), stages
@@ -237,3 +239,44 @@ def prepare(weight):
                     usable += lt_gemm(torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device),
                                       weight[:n]) is not None
     return usable
+
+
+# SP prefill chunk GEMMs (sp_tp_ce, OKC_LT_PREFILL_O): (N, K) -> {M: (layout, tile, split-K, custom option, cluster)},
+# claimed by serving/kernels/lt/chunkpin_probe.py (dev2, 10-31) only where a config's rows equal torch.mm's bit for bit
+# and it ran >= 2 us per call faster in a CUDA graph: the o projection's 2048-row chunk, -6.7 us of torch.mm's 61.5.
+_PREFILL = {(8192, 1024): {2048: (0, 184, 1, 0, 5)}}
+_prefill_logged: list = []
+_log = logging.getLogger(__name__)
+
+
+def lt_prefill_mm(x, weight, out=None):
+    """x [m, k] @ weight [n, k]^T at a claimed SP-chunk entry, into out [m, n] when given (else a new tensor);
+    None = declined (the caller runs torch.mm). Registers outside capture: the breakable graph's eager warm-ups do."""
+    if not (SW_LT and LT_PREFILL_O) or weight.dim() != 2 or x.dim() != 2:
+        return None
+    n, k = weight.shape
+    m = x.shape[0]
+    spec = _PREFILL.get((n, k), {}).get(m)
+    if (spec is None or x.shape[1] != k or x.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16
+            or not (x.is_cuda and x.is_contiguous() and weight.is_contiguous())):
+        return None
+    if out is not None and not (out.is_contiguous() and tuple(out.shape) == (m, n) and out.dtype is torch.bfloat16
+                                and out.data_ptr() % 16 == 0):
+        return None
+    dev = x.device.index
+    ent = _IDX.get((dev, n, k, m))
+    if ent is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        ent = _register(dev, n, k, m, spec)
+    idx, ws_bytes, al_x, al_w = ent
+    if idx < 0 or x.data_ptr() % al_x or weight.data_ptr() % al_w:
+        return None
+    y = torch.empty((m, n), dtype=torch.bfloat16, device=x.device) if out is None else out
+    if not _EXT.lt_mm(x, weight, y, _workspace(dev) if ws_bytes else weight, idx):
+        _IDX[(dev, n, k, m)] = (-1, 0, 1, 1)
+        return None
+    if not _prefill_logged:
+        _prefill_logged.append(m)
+        _log.info("OKC lt prefill chunk GEMM pinned (n %d, k %d, first m %d).", n, k, m)
+    return y
