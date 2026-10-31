@@ -231,6 +231,11 @@ EOD = _flag("OKC_EOD", "0")
 # poison read's negative control: its outputs must differ).
 EOD_POISON = _flag("OKC_EOD_POISON", "0")
 EOD_UNGATED = _flag("OKC_EOD_UNGATED", "0")
+# ... OKC_EOD_DROP_RANK = r: rank r pushes nothing (gates on; the peers read stale rows: a control that must differ);
+# OKC_EOD_EPOCH_DIR: a file `epoch` touched there makes every rank log its device epoch word (EOD calls executed, eager
+# and replayed), read on a side stream; the harness touches it between phases, with the server idle.
+EOD_DROP_RANK = int(os.environ.get("OKC_EOD_DROP_RANK", "-1"))
+EOD_EPOCH_DIR = os.environ.get("OKC_EOD_EPOCH_DIR", "")
 
 # Prefill attention (prefill_fmha.py): the prefill lane's FP8 FMHA (fmha7) in place of FA3's extend call. Per request:
 # full layers from OKC_PFMHA_MIN_TOKENS new tokens, sliding layers from OKC_PFMHA_SLIDING_MIN_TOKENS (1xH200 over a 75K

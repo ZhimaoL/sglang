@@ -16,6 +16,7 @@ Buffers (images, counters) are symmetric, made on the first eager call (never in
 ranks like okc_patch.m1's; a rank where setup fails takes the gathered path with all the others.
 """
 import logging
+import os
 import sys
 
 import torch
@@ -52,7 +53,7 @@ def _setup(device, nl):
 
         g = get_tp_group()
         name = g.device_group.group_name
-        nblocks = _blocks(_sw.M1RS_MAX_T, nl)
+        nblocks = _blocks(_sw.M1RS_MAX_T, 64)   # every layer's slot count fits (+64 MiB / rank over 33 slots)
         img = agreed(lambda: symm_mem.empty(nblocks * 64 * _BM * 64, dtype=torch.bfloat16, device=device))
         hi = img is not None and agreed(lambda: symm_mem.rendezvous(img, name))
         cnt = hi and agreed(lambda: symm_mem.empty(64, dtype=torch.int32, device=device))
@@ -70,15 +71,46 @@ def _setup(device, nl):
                   "W": 3 * torch.cuda.get_device_properties(device).multi_processor_count,
                   "rank": g.rank_in_group, "group": g, "woff": {}, "calls": 0}
     _STATE[key] = st
+    if st is not None and _sw.EOD_EPOCH_DIR:
+        _epoch_probe(st, device)
     return st
 
 
+def _epoch_probe(st, device):
+    """OKC_EOD_EPOCH_DIR (identity harness only): log the device epoch word whenever <dir>/epoch's mtime moves."""
+    import threading
+    import time
+
+    host = torch.empty((1,), dtype=torch.int32).pin_memory()
+
+    def run():
+        torch.cuda.set_device(device)
+        s, seen = torch.cuda.Stream(device=device), 0.0
+        while True:
+            time.sleep(0.5)
+            try:
+                m = os.path.getmtime(os.path.join(_sw.EOD_EPOCH_DIR, "epoch"))
+            except OSError:
+                continue
+            if m > seen:
+                seen = m
+                with torch.cuda.stream(s):
+                    host.copy_(st["ep"], non_blocking=True)
+                s.synchronize()
+                logger.info("OKC EOD device epoch: %d (rank %d).", int(host[0]), st["rank"])
+
+    threading.Thread(target=run, daemon=True, name="okc-eod-epoch").start()
+
+
 def _p1ss_pass():
-    """True inside a P1-SS two-child pass (okc/x-p1ss-*: muse_spark._OKC_P1SS["child"] is set for each stage and cleared
-    after the pass). One image set, counter set and epoch word per device serve one forward at a time, and a gated gg1
-    beside the other child's kernels could wait on a peer that waits on it (qa-eod E3 item 2)."""
+    """True inside a P1-SS two-child pass (the w1b family marks each stage in muse_spark._OKC_P1SS["child"] and
+    clears it after the pass), and whenever P1-SS is switched on but that mark is missing (fail closed). One image
+    set, counter set and epoch word per device serve one forward at a time, and a gated gg1 beside the other child's
+    kernels could wait on a peer that waits on it (qa-eod E3 item 2)."""
     st = getattr(sys.modules.get("sglang.srt.models.muse_spark"), "_OKC_P1SS", None)
-    return isinstance(st, dict) and st.get("child") is not None
+    if isinstance(st, dict):
+        return st.get("child") is not None
+    return bool(getattr(_sw, "SW_P1SS", False)) or os.environ.get("OKC_SW_P1SS", "0") == "1"
 
 
 def active(layer, tokens, device):
@@ -193,8 +225,11 @@ def forward(layer, x, topk_scores, topk_ids):
     pg.tiles(be, npad, sid, live, nblocks, _BM, numel, pg_moe._WMASK, state["pg_wsf13"].shape[0])
     inter_t = torch.empty((nblocks * 64 * _BM * 64,), dtype=torch.bfloat16, device=dev)
     x = x.contiguous()
+    woff = st["woff"][S * 8]
+    if _sw.EOD_DROP_RANK == st["rank"]:   # identity-harness control: this rank pushes nothing, the gates stay on
+        woff = st.setdefault("woff0", torch.zeros_like(woff))
     args = ([st["cnt"].data_ptr(), 0, st["rank_of"].data_ptr(), 0, 0, 0, nl, ent.data_ptr(),
-             st["woff"][S * 8].data_ptr(), x.data_ptr()] + st["img_ptrs"] + [0, 0, 0, st["ep"].data_ptr()]
+             woff.data_ptr(), x.data_ptr()] + st["img_ptrs"] + [0, 0, 0, st["ep"].data_ptr()]
             + st["cnt_ptrs"] + [st["lcnt"].data_ptr(), ((0 if _sw.EOD_UNGATED else 8) << 32) | 0x7FFFFFFF])
     ext.eod_gg1(st["img"], state["pg_wsf13"], state["w13_gs32"], inter_t, be, live, numel, 11,
                 torch.tensor(args, dtype=torch.int64))
