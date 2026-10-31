@@ -16,6 +16,8 @@ import torch
 
 from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_smallm import TABLE
 from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import smallm_ext
+from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_WSC2
+from sglang.kernels.ops.muse_spark_v12.okc_patch import wsc2 as _wsc2
 
 _NTS = (8, 16, 32, 64)
 
@@ -36,6 +38,10 @@ def gemm(x, weight):
         return None
     if x.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16 or not (x.is_cuda and weight.is_cuda):
         return None
+    if SW_WSC2:   # a GEMM marked by the kernel in front (okc_patch/wsc2.py): KQ3 / KO2b
+        out = _wsc2.gemm(x, weight)
+        if out is not None:
+            return out
     k = x.shape[-1]
     m = x.numel() // k if k else 0
     n = weight.shape[0]

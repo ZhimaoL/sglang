@@ -85,11 +85,11 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_N4, QK_FOLD, SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_N4, QK_FOLD, SW_M1RS, SW_WSC2
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     names = (_PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("pg_n4_ext",) if PG64_N4 else ())
-             + (("ftnorm_ext",) if QK_FOLD else ()))
+             + (("ftnorm_ext",) if QK_FOLD else ()) + (("wsc2_ext",) if SW_WSC2 else ()))
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -392,6 +392,29 @@ def smallm_ext():
     return _SMALLM_EXT
 
 
+
+_WSC2_EXT = None
+
+
+def wsc2_ext():
+    """OKC_SW_WSC2's KQ3 / KO2b (_cuda_src_wsc2.py): TMA tensor maps + wgmma + clusters, sm_90a."""
+    global _WSC2_EXT
+    if _WSC2_EXT is None:
+        with _lock:
+            if _WSC2_EXT is None:
+                from sglang.kernels.ops.muse_spark_v12.okc_patch._cuda_src_wsc2 import _CUDA_SRC
+
+                _WSC2_EXT = _load_inline(
+                    name="okc_wsc2_v1",
+                    cpp_sources="void wsc2_launch(int64_t, torch::Tensor, torch::Tensor, torch::Tensor);",
+                    cuda_sources=[_CUDA_SRC],
+                    functions=["wsc2_launch"],
+                    extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+                    extra_ldflags=["-lcuda"],
+                    verbose=False,
+                )
+    return _WSC2_EXT
+
 _WST_CPP = """
 void wst_attn_fqbt(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, double, int64_t, int64_t, int64_t,
@@ -438,6 +461,10 @@ void muse_vp2_launch(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t
                      int64_t k_cache, int64_t v_cache, int64_t inv_freq, int64_t out, int64_t B, int64_t window,
                      double c2, double k_rscale, double v_rscale, double v_scale, double eps, int64_t dbgp,
                      int64_t stream);
+void muse_vp2_launch_e(int64_t qkv, int64_t page_table, int64_t pt_stride, int64_t seq_lens, int64_t cache_loc,
+                       int64_t k_cache, int64_t v_cache, int64_t inv_freq, int64_t out, int64_t B, int64_t window,
+                       double c2, double k_rscale, double v_rscale, double v_scale, double eps, int64_t dbgp,
+                       int64_t stream, int64_t early);
 """
 
 
@@ -456,7 +483,7 @@ def vfg_ext():
                     name="okc_vfg_verify_v2",
                     cpp_sources=[_VFG_CPP],
                     cuda_sources=[_CUDA_SRC],
-                    functions=["muse_vfg_launch", "muse_vp2_launch"],
+                    functions=["muse_vfg_launch", "muse_vp2_launch", "muse_vp2_launch_e"],
                     extra_cuda_cflags=[
                         "-O3",
                         "-gencode=arch=compute_90a,code=sm_90a",

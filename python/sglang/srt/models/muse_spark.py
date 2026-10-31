@@ -1458,6 +1458,10 @@ class MuseSpark1xDecoderLayer(nn.Module):
     def bind_next_layer(self, next_layer: MuseSpark1xDecoderLayer) -> None:
         # Not a submodule: the model owns it. The Helion verify tail computes its QKV.
         object.__setattr__(self, "_next_layer", next_layer)
+        # OKC_SW_WSC2: the GEMM behind the FFN boundary is the next layer's qkv
+        w = getattr(getattr(next_layer.self_attn, "qkv_proj", None), "weight", None)
+        if okc_patch.SW_WSC2 and self._fused_ffn_boundary is not None and w is not None and w.dim() == 2:
+            self._fused_ffn_boundary._okc_wsc2_next = tuple(w.shape)
 
     def forward(
         self,

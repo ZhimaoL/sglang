@@ -138,8 +138,10 @@ def all_gather_norm_residual(
     pre_weight: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
     beta: Optional[torch.Tensor] = None,
+    carveout: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return BF16 normalized output and FP32 residual for the gathered branch."""
+    """Return BF16 normalized output and FP32 residual for the gathered branch. ``carveout`` (OKC_SW_WSC2): the launch's
+    preferred shared-memory carveout in percent (< 0: none)."""
     num_tokens, hidden_size = stream.shape
     config = _launch_config(hidden_size, num_tokens)
     output = torch.empty(
@@ -167,5 +169,6 @@ def all_gather_norm_residual(
         beta,
         post_eps,
         pre_eps,
+        int(carveout),
     )
     return output, new_stream
