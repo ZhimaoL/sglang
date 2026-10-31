@@ -1045,7 +1045,8 @@ struct VP2Smem {
 
 // kEarly (OKC_SW_WSC2): trigger the dependents once the prologue's loads are issued, so a PDL-launched W-staged o_proj
 // (KO2b) lands beside this kernel's CTAs and loads its weight during the attention; it still waits for this kernel
-// before it reads the output.
+// before it reads the output. The RoPE angle block runs before the trigger: below it, ptxas serialised its F2F.F64 /
+// MUFU chain behind PREEXIT (+0.6 us at m 32; muse-opt megakernel LOG M5.24-M5.26).
 template <bool kEarly = false>
 __global__ void __launch_bounds__(256, 1)
 vp2_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_table,
@@ -1144,10 +1145,15 @@ vp2_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
   }
+  if constexpr (kEarly) {   // RoPE angles above the trigger, off PREEXIT's path (vp2<false> keeps its order)
+    float sn_, cs_;
+    v_sincos((float)(seq + (tid >> 5)) * nk_ifr, &sn_, &cs_);
+    sm.tab[tid] = make_float2(cs_, sn_);
+  }
   // kEarly: after the prologue's q / first-KV-tile cp.async issue, so this kernel's own loads go out first
   if constexpr (kEarly) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   Q_ST(3 + 16 * wg);
-  {
+  if constexpr (!kEarly) {
     float sn_, cs_;
     v_sincos((float)(seq + (tid >> 5)) * nk_ifr, &sn_, &cs_);
     sm.tab[tid] = make_float2(cs_, sn_);
