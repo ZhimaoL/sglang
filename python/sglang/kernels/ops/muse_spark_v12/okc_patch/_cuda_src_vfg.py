@@ -1043,8 +1043,9 @@ struct VP2Smem {
 };
 #define Q_ST(i) do { } while (0)
 
-// kEarly (OKC_SW_WSC2): trigger the dependents at entry, so a PDL-launched W-staged o_proj (KO2b) lands beside this
-// kernel's CTAs and loads its weight during the attention; it still waits for this kernel before it reads the output.
+// kEarly (OKC_SW_WSC2): trigger the dependents once the prologue's loads are issued, so a PDL-launched W-staged o_proj
+// (KO2b) lands beside this kernel's CTAs and loads its weight during the attention; it still waits for this kernel
+// before it reads the output.
 template <bool kEarly = false>
 __global__ void __launch_bounds__(256, 1)
 vp2_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_table,
@@ -1053,7 +1054,6 @@ vp2_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
            int window, float c2, float k_rscale, float v_rscale, float eps,
            unsigned long long* __restrict__ dbgp, __nv_bfloat16* __restrict__ out, float v_scale,
            int pt_stride) {
-  if constexpr (kEarly) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   {
     int const b = (int)blockIdx.y;
     qkv += (long long)b * 8 * V_QKVW;
@@ -1144,6 +1144,8 @@ vp2_kernel(const __nv_bfloat16* __restrict__ qkv, const int* __restrict__ page_t
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
   }
+  // kEarly: after the prologue's q / first-KV-tile cp.async issue, so this kernel's own loads go out first
+  if constexpr (kEarly) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   Q_ST(3 + 16 * wg);
   {
     float sn_, cs_;
