@@ -70,6 +70,9 @@ def _setup(device, nl):
                   "rank_of": torch.zeros((64,), dtype=torch.int32, device=device),   # eod_galign writes it per call
                   "W": 3 * torch.cuda.get_device_properties(device).multi_processor_count,
                   "rank": g.rank_in_group, "group": g, "woff": {}, "calls": 0}
+            for t in range(_CHUNK, _sw.M1RS_MAX_T + 1, _CHUNK):   # woff for every T the predicate admits
+                _woff(st, t, device)
+            st["seen"] = set()
             logger.info("OKC EOD setup: images %.3f GiB (%d blocks), %.2f GiB free after.",
                         img.numel() * 2 / 2**30, nblocks, torch.cuda.mem_get_info(device)[0] / 2**30)   # MEM-F5
     _STATE[key] = st
@@ -79,15 +82,14 @@ def _setup(device, nl):
 
 
 def _epoch_probe(st, device):
-    """OKC_EOD_EPOCH_DIR (identity harness only): log the device epoch word whenever <dir>/epoch's mtime moves."""
+    """OKC_EOD_EPOCH_DIR (identity harness only): log the device epoch word whenever <dir>/epoch's mtime moves. The
+    thread makes no CUDA call before the first touch (the harness touches between phases, never near a capture)."""
     import threading
     import time
 
-    host = torch.empty((1,), dtype=torch.int32).pin_memory()
-
     def run():
-        torch.cuda.set_device(device)
-        s, seen = torch.cuda.Stream(device=device), 0.0
+        s = host = None
+        seen = 0.0
         while True:
             time.sleep(0.5)
             try:
@@ -96,6 +98,9 @@ def _epoch_probe(st, device):
                 continue
             if m > seen:
                 seen = m
+                if s is None:
+                    torch.cuda.set_device(device)
+                    s, host = torch.cuda.Stream(device=device), torch.empty((1,), dtype=torch.int32).pin_memory()
                 with torch.cuda.stream(s):
                     host.copy_(st["ep"], non_blocking=True)
                 s.synchronize()
@@ -139,6 +144,10 @@ def active(layer, tokens, device):
         if getattr(layer, "_okc_eod_tabs", None) is None:
             _tables(layer, st, device)
         _woff(st, tokens, device)                       # S * 8 = T entries per rank
+    key = (getattr(layer, "_okc_layer_idx", -1), tokens)
+    if key not in st["seen"]:                           # once per (layer, T): the boot warm-ups record every one
+        st["seen"].add(key)
+        logger.info("OKC EOD layer %d eligible at T=%d (%d slots).", key[0], tokens, layer.num_local_experts)
     return True
 
 
