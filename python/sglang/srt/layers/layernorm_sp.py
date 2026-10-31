@@ -73,6 +73,7 @@ class _OkcHopperSP:
     symm_min_tokens: int = 0
     min_tokens: int = 0
     rows_buf = None   # OKC_SP_AG_ROWSFIRST: the rows gather's persistent [MAX_TOKENS, moe width] bf16 output
+    w1b = None   # P1-SS + W1b: the push transport's state (okc_patch/w1b.py), made at boot
 
 
 _okc_hopper = _OkcHopperSP()
@@ -175,6 +176,9 @@ def initialize_layernorm_sp(*, model_config) -> None:
             SW_M1RS,
             SP_AG_ROWSFIRST,
             SP_AG_ROWSFIRST_MAX_TOKENS,
+            P1SS_CUT,
+            P1SS_W1B,
+            SW_P1SS,
         )
 
         _okc_hopper.min_tokens = SP_MIN_TOKENS
@@ -185,7 +189,7 @@ def initialize_layernorm_sp(*, model_config) -> None:
 
         # Every rank evaluates the same switches, so all of them enter the collective probe together. A failed probe
         # turns off every symm-mem path (the fused linears, ext_coll's multimem gather / reduce, the copy-engine ops).
-        want = SP_SYMM or SW_EXT_AG or SW_EXT_RS or SW_M1 or SW_M1RS or SP_AG_ROWSFIRST
+        want = SP_SYMM or SW_EXT_AG or SW_EXT_RS or SW_M1 or SW_M1RS or SP_AG_ROWSFIRST or (SW_P1SS and P1SS_W1B)
         _okc_hopper.symm_ok = want and _HAS_TORCH_SYMM_MEM_FUSED and _okc_symm_probe()
         _okc_hopper.symm = SP_SYMM and _okc_hopper.symm_ok
         if want and not _okc_hopper.symm_ok:
@@ -205,6 +209,18 @@ def initialize_layernorm_sp(*, model_config) -> None:
             width = getattr(cfg, "moe_hidden_size", None) or cfg.hidden_size
             _okc_hopper.rows_buf = torch.empty((SP_AG_ROWSFIRST_MAX_TOKENS, width), dtype=torch.bfloat16,
                                                device=torch.device("cuda", torch.cuda.current_device()))
+        if SW_P1SS and P1SS_W1B and _okc_hopper.symm_ok:
+            # W1b's parity buffers (a P1-SS child's shard <= P1SS_CUT / tp rows) at boot, before graph capture and KV
+            # sizing, by ext_coll's agreed steps: a failure on any rank leaves None on all of them, and P1-SS passes
+            # then gather as before
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import ext_coll, w1b
+
+            tp = get_parallel().tp_group
+            cfg = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+            width = getattr(cfg, "moe_hidden_size", None) or cfg.hidden_size
+            _okc_hopper.w1b = w1b.setup(tp.device_group.group_name, tp.world_size, tp.rank_in_group,
+                                        torch.device("cuda", torch.cuda.current_device()), -(-P1SS_CUT // tp.world_size),
+                                        width, 2, agreed=ext_coll.agreed)
     get_flags().sp.enabled = bool(
         (get_parallel().enable_layernorm_sp or _okc_hopper.active)
         and architectures

@@ -273,6 +273,8 @@ _okc_p1ss_collect = False   # P1-SS: _forward_gathered_experts returns its _OkcG
 # last layer there is no next qkv: the registrant must push ungated there, or M_b waits on flags nobody sets.
 _OKC_POST_QKV = {}
 _OKC_POST_QKV_N = {"fired": 0, "fallback": 0, "warned": False}
+_OKC_P1SS = {"child": 0, "layers": 0}   # P1-SS: the running stage's child and the decoder layer count (_forward_p1ss)
+_OKC_W1B_GATE = []   # P1-SS + W1b: the gate (one okc_patch.w1b.Gate, made at the first gated stage)
 
 
 def okc_post_qkv_settle(layer):
@@ -1233,6 +1235,13 @@ class MuseSpark1xMoE(nn.Module):
         prenorm_shard = self._okc_prenorm_shard()
         if prenorm_shard and not prenormed:
             expert_input = self.pre_expert_norm(expert_input)
+        if _okc_p1ss_collect and layernorm_sp._okc_hopper.w1b is not None:
+            # P1-SS + W1b: the inputs go by the push transport, and the M stage's join waits for them (_okc_w1b)
+            join = _okc_w1b(self, expert_input, topk_scores, topk_ids)
+            if join is not None:
+                g = _OkcGathered(self, tp_group, expert_input.shape[0], None, None, None, prenorm_shard)
+                g.join = join
+                return g
         if rows_first is not None:
             from sglang.kernels.ops.muse_spark_v12.okc_patch import moe as okc_moe
 
@@ -1283,11 +1292,11 @@ class _OkcGathered:
         self.moe, self.tp_group, self.shard_rows = moe, tp_group, shard_rows
         self.args = (full_input, full_scores, full_ids, prenorm_shard)
         self.output, self.box = None, []
-        self.join = None   # P1-SS + W1b: the wait for the gathered rows, run when the experts start
+        self.join = None   # P1-SS + W1b: the waits for the gathered inputs, run when the experts start -> (rows, scores, ids)
 
     def experts(self, defer=False):
         if self.join is not None:
-            self.join()
+            self.args = (*self.join(), self.args[3])
         moe = self.moe
         full_input, full_scores, full_ids, prenorm_shard = self.args
         self.args = None
@@ -1347,6 +1356,44 @@ def _okc_push_gather(tp_group, x, scores, ids):
             and comm.config.num_push_blocks >= 2):
         return None
     return pg_moe.ag_rows(comm, x.contiguous(), scores.contiguous(), ids.contiguous())
+
+
+def _okc_w1b(moe, x, scores, ids):
+    """P1-SS + W1b (docs/serving/review-1031/W1B-ORDER.md; STRUCTURAL.md §3.1a push form): this child's MoE inputs at
+    layer j go by the W1b push transport into parity slot j % 2 -> the M stage's join (it settles b(j)'s gate hook, then
+    waits the flags and returns (rows, scores, ids)), or None (the section gathers as before). Child a pushes now; child
+    b stages now and pushes right after a(j+1)'s qkv GEMM (_OKC_POST_QKV), or now at the last layer or with
+    OKC_P1SS_W1B_UNGATED. Slot reuse: the next push into a slot comes two stages later, behind an A stage's all-rank qkv
+    collective, so the slot's previous consumer has finished on every rank (§3.1a reuse fence); w1b's own-source fence
+    covers the own slot. pg-only fp4 layers only, as rows-first. The predicate is the same on every rank."""
+    st = layernorm_sp._okc_hopper.w1b
+    state = getattr(moe.experts, "_okc_moe_state", None)
+    S = x.shape[0]
+    if (not moe.nvfp4_checkpoint or state is None or not state["pg_only"] or not 0 < S <= st.S_max
+            or tuple(x.shape) != (S, st.H) or x.dtype != torch.bfloat16 or scores.dtype != torch.float32
+            or ids.dtype != torch.int32 or tuple(scores.shape) != (S, 8) or tuple(ids.shape) != (S, 8)):
+        return None
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import w1b
+
+    j = moe.layer_idx
+    par, nxt = j % 2, j + 1
+    gated = _OKC_P1SS["child"] == 1 and not okc_patch.P1SS_W1B_UNGATED and nxt < _OKC_P1SS["layers"]
+    if gated:
+        if not _OKC_W1B_GATE:
+            _OKC_W1B_GATE.append(w1b.Gate())
+        gate = _OKC_W1B_GATE[0]
+        w1b.stage(st, x, scores, ids, par)
+        _OKC_POST_QKV[nxt] = lambda: w1b.push(st, par, gate, gate.record())
+    else:
+        w1b.produce(st, x, scores, ids, par)
+
+    def join():
+        if gated:
+            okc_post_qkv_settle(nxt)   # a gate hook whose qkv never came pushes now, ungated: never a hang
+        s_, i_ = w1b.wait_words(st, par, S)
+        return w1b.wait_rows(st, par, S), s_, i_
+
+    return join
 
 
 _okc_rf_state: dict = {}
@@ -1869,8 +1916,10 @@ class MuseSpark1xModel(nn.Module):
             stream = x.to(self.residual_dtype)
             st.append(dict(pos=positions[s0:s1], stream=stream, attn_input=self.layers[0].self_attn_input_norm(stream),
                            fb=fb, ctx=ctx, n=s1 - s0, sp=sp, taps=[], g=None, h=None))
+        _OKC_P1SS["layers"] = len(self.layers)
         for c, kind, j in _p1ss_order(len(self.layers)):
             s = st[c]
+            _OKC_P1SS["child"] = c
             get_forward().set("sp_active", s["sp"])
             layernorm_sp.set_sp_num_tokens(s["n"])
             with forward_context(s["ctx"]):
@@ -2051,12 +2100,23 @@ class MuseSpark1xForCausalLM(nn.Module):
         _OKC_POST_QKV.clear()   # a hook left by the previous pass's last layer never fires in this one
         n0 = (_OKC_POST_QKV_N["fired"], _OKC_POST_QKV_N["fallback"])
         logger.info("OKC P1-SS pass: %d + %d tokens", okc_patch.P1SS_CUT, positions.shape[0] - okc_patch.P1SS_CUT)
+        w1b_st = layernorm_sp._okc_hopper.w1b
+        if w1b_st is not None:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch import w1b as okc_w1b, w1b_trace as okc_w1b_trace
+        trace = okc_w1b_trace.pass_begin() if w1b_st is not None else None   # OKC_W1B_TRACE (W1B-ORDER-A2)
+        done = False
         try:
             outs = getattr(self.model, "language_model", self.model)._forward_p1ss(
                 input_ids, positions, kids, ctxs, input_embeds)
+            done = True
         finally:   # an exception must not leak a pending push (with a stale gate) into the next pass
             left = len(_OKC_POST_QKV)
             _OKC_POST_QKV.clear()
+            if w1b_st is not None and not done:
+                for par in range(w1b_st.P):
+                    okc_w1b.discard(w1b_st, par)
+            if trace is not None:
+                okc_w1b_trace.pass_end(trace, done)
         fired, fallback = _OKC_POST_QKV_N["fired"] - n0[0], _OKC_POST_QKV_N["fallback"] - n0[1]
         if fired or fallback or left:
             logger.info("OKC W1b gate hooks: %d fired, %d fallback, %d never settled", fired, fallback, left)
