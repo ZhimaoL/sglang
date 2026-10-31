@@ -2105,27 +2105,34 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                 return
 
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
-                try:
-                    self._append_target_hidden_fused(
-                        ctx_hidden=ctx_hidden,
-                        ctx_positions=positions,
-                        ctx_cache_loc=cache_loc,
-                    )
-                    return
-                except Exception as e:
-                    logger.warning(
-                        "DFLASH fused KV append-by-loc failed; falling back to sequential path: %s",
-                        e,
-                    )
-                    self._use_fused_kv_materialize = False
-                    self._fused_kv_helper = None
+            from sglang.kernels.ops.muse_spark_v12 import okc_patch
 
-            self._append_target_hidden_sequential(
-                ctx_hidden=ctx_hidden,
-                ctx_positions=positions,
-                ctx_cache_loc=cache_loc,
-            )
+            # OKC P1-SS: a two-child pass materializes the draft KV per chunk, at the sequential chunks' GEMM shapes
+            # (one 32K block can take another nvjet variant and change the draft's bits; qa-p1ss D3)
+            cut = okc_patch.P1SS_CUT if okc_patch.SW_P1SS else num_tokens
+            for s in range(0, num_tokens, cut):
+                h, p, loc = ctx_hidden[s:s + cut], positions[s:s + cut], cache_loc[s:s + cut]
+                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                    try:
+                        self._append_target_hidden_fused(
+                            ctx_hidden=h,
+                            ctx_positions=p,
+                            ctx_cache_loc=loc,
+                        )
+                        continue
+                    except Exception as e:
+                        logger.warning(
+                            "DFLASH fused KV append-by-loc failed; falling back to sequential path: %s",
+                            e,
+                        )
+                        self._use_fused_kv_materialize = False
+                        self._fused_kv_helper = None
+
+                self._append_target_hidden_sequential(
+                    ctx_hidden=h,
+                    ctx_positions=p,
+                    ctx_cache_loc=loc,
+                )
 
     def _append_target_hidden_sequential(
         self,
