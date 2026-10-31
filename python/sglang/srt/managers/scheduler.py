@@ -6055,11 +6055,7 @@ def run_scheduler_process(
         # OKC: load the eager DFlash GEMM variants before the server reports ready (court C21).
         warm = getattr(getattr(scheduler, "draft_worker", None), "okc_warm_eager_gemms", None)
         if warm is not None:
-            from sglang.kernels.ops.muse_spark_v12 import okc_patch
-
-            # OKC P1-SS: a two-chunk pass hands the draft up to two chunks of context rows
-            warm(max(server_args.chunked_prefill_size or 0, server_args.max_prefill_tokens or 0)
-                 * (2 if okc_patch.SW_P1SS else 1))
+            warm(max(server_args.chunked_prefill_size or 0, server_args.max_prefill_tokens or 0))
         # OKC: and the stock Triton kernels' per-batch variants (court C42: they compiled inside timed reps)
         from sglang.kernels.ops.muse_spark_v12.okc_patch import triton_warm
 
