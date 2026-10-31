@@ -373,3 +373,8 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "ANY_ATTN"]
 SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "1")  # M 33..128: fused AG + norm, row kernel at 1024 threads
 __all__ += ["SW_AG_NORM_WIDE"]
+# FT-LEVERS #3 (docs/serving/review-1031/FT-LEVERS.md): "cost" makes the prefill R1 cut level the two holders' pg block
+# cost instead of their routes (pg_rep_cut mode 1 = speedsplit_cut.py mode "cost"; S24 micro: -0.85 % +- 0.09 of pg's
+# slowest rank). Placement only: a route's rows are the same bytes on either holder. "route" keeps the served cut.
+PG_REP_CUT = os.environ.get("OKC_PG_REP_CUT", "route")
+__all__ += ["PG_REP_CUT"]

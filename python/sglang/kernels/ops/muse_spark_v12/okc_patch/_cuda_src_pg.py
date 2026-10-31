@@ -1168,6 +1168,10 @@ __global__ void __launch_bounds__(256) pg_rep_assign(const IdT* __restrict__ ids
 // non-replicated experts homed on r; the replicated experts by count (descending, ties: lower id) in turn: x =
 // clamp((load[home] + c[e] - load[replica]) / 2, 0, c[e]); the replica takes e's routes of the tokens before cut[e],
 // the end of the first sb-token block where e's cumulative count reaches x (0 if x is 0), the home the rest.
+// mode 1 (OKC_PG_REP_CUT=cost) levels pg block COST instead (speedsplit_cut.py mode "cost", S24: -0.85 % of pg's slowest
+// rank): bcost[r] = sum of pg_block_cost over r's experts so far; e's part is the first p in {0} u {cum} minimising
+// max(bcost[h] + cost(c - p), bcost[r] + cost(p)), found by two binary searches (cost does not fall in its argument, so
+// f_r - f_h does not fall in p); the cut is then the end of the first block whose cumulative count reaches p.
 // pg_rep_count (one CTA per sb-token block): cnt (global atomics, zeroed by the caller) and bc[j][b] per replicated
 // expert and block; pg_rep_cut (one CTA): cut[256]; pg_rep_split: route i (token i / k) -> its slot here or -1.
 __global__ void __launch_bounds__(256) pg_rep_count(const int* __restrict__ ids, int n_routes, int topk,
@@ -1193,19 +1197,27 @@ __global__ void __launch_bounds__(256) pg_rep_count(const int* __restrict__ ids,
     if (t < n_rep) bc[t * nb + b] = b_s[t];
 }
 
+__device__ __forceinline__ int pg_block_cost(int c) {   // speedsplit_cut.pg_cost: bm 256 blocks, tail widths 64 / 128 / 256
+    const int tail = c & 255;
+    return (c >> 8) * 320 + (tail ? 64 + (tail <= 64 ? 64 : tail <= 128 ? 128 : 256) : 0);
+}
+
 __global__ void __launch_bounds__(1024) pg_rep_cut(const int* __restrict__ tab, int n_rep, int sb, int nb,
                                                    const int* __restrict__ cnt_g, const int* __restrict__ bc_g,
-                                                   int* __restrict__ cut) {
+                                                   int* __restrict__ cut, int mode) {
     extern __shared__ int bc[];                 // [n_rep][nb] route counts per sb-token block, then cumulative
-    __shared__ int cnt[256], ridx[256], load[8];
+    __shared__ int cnt[256], ridx[256], load[8], bcost[8];
     const int t = threadIdx.x;
     if (t < 256) { cnt[t] = cnt_g[t]; ridx[t] = -1; }
-    if (t < 8) load[t] = 0;
+    if (t < 8) { load[t] = 0; bcost[t] = 0; }
     for (int i = t; i < n_rep * nb; i += 1024) bc[i] = bc_g[i];
     __syncthreads();
     if (t < n_rep) ridx[tab[256 + t]] = t;
     __syncthreads();
-    if (t < 256 && ridx[t] < 0) atomicAdd(&load[(tab[t] >> 8) & 7], cnt[t]);
+    if (t < 256 && ridx[t] < 0) {
+        atomicAdd(&load[(tab[t] >> 8) & 7], cnt[t]);
+        if (cnt[t]) atomicAdd(&bcost[(tab[t] >> 8) & 7], pg_block_cost(cnt[t]));
+    }
     // inclusive scan of each replicated expert's block counts: one warp per row (lane = a run of consecutive blocks)
     for (int j = t >> 5; j < n_rep; j += 32) {
         const int lane = t & 31, per = (nb + 31) / 32, b0 = lane * per, b1 = min(nb, b0 + per);
@@ -1235,14 +1247,42 @@ __global__ void __launch_bounds__(1024) pg_rep_cut(const int* __restrict__ tab, 
         for (int j = 0; j < n_rep; j++) {
             const int e = ord[j], v = tab[e], h = (v >> 8) & 7, r = (v >> 12) & 7, c = cnt[e];
             const int* cum = bc + ridx[e] * nb;
-            int x = (load[h] + c - load[r]) / 2;
-            x = x < 0 ? 0 : (x > c ? c : x);
             int part = 0, cu = 0;
-            if (x > 0) {
-                int lo = 0, hi = nb - 1;        // first block with cum >= x (cum[nb - 1] = c >= x)
-                while (lo < hi) { const int mid = (lo + hi) >> 1; if (cum[mid] >= x) hi = mid; else lo = mid + 1; }
-                part = cum[lo];
-                cu = (lo + 1) * sb;
+            if (mode == 1) {
+                const int ch = bcost[h], cr = bcost[r];
+                int lo = 0, hi = nb + 1;        // candidates i = 0..nb (p_0 = 0, p_i = cum[i - 1]): first f_r >= f_h
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1, p = mid ? cum[mid - 1] : 0;
+                    if (cr + pg_block_cost(p) >= ch + pg_block_cost(c - p)) hi = mid; else lo = mid + 1;
+                }
+                part = lo <= nb && lo ? cum[lo - 1] : 0;
+                if (lo >= 1) {                  // the left minimum f_h(p_{lo - 1}), first reached at the first i <= it
+                    const int pl = lo > 1 ? cum[lo - 2] : 0, L = ch + pg_block_cost(c - pl);
+                    if (lo > nb || L <= cr + pg_block_cost(part)) {
+                        int a = 0, b = lo - 1;
+                        while (a < b) {
+                            const int mid = (a + b) >> 1, p = mid ? cum[mid - 1] : 0;
+                            if (ch + pg_block_cost(c - p) <= L) b = mid; else a = mid + 1;
+                        }
+                        part = a ? cum[a - 1] : 0;
+                    }
+                }
+                bcost[h] = ch + pg_block_cost(c - part);
+                bcost[r] = cr + pg_block_cost(part);
+                if (part > 0) {
+                    int a = 0, b = nb - 1;      // first block with cum >= part
+                    while (a < b) { const int mid = (a + b) >> 1; if (cum[mid] >= part) b = mid; else a = mid + 1; }
+                    cu = (a + 1) * sb;
+                }
+            } else {
+                int x = (load[h] + c - load[r]) / 2;
+                x = x < 0 ? 0 : (x > c ? c : x);
+                if (x > 0) {
+                    int lo = 0, hi = nb - 1;    // first block with cum >= x (cum[nb - 1] = c >= x)
+                    while (lo < hi) { const int mid = (lo + hi) >> 1; if (cum[mid] >= x) hi = mid; else lo = mid + 1; }
+                    part = cum[lo];
+                    cu = (lo + 1) * sb;
+                }
             }
             load[r] += part;
             load[h] += c - part;
@@ -1491,6 +1531,8 @@ void rep_assign(torch::Tensor ids, torch::Tensor tab, torch::Tensor out, torch::
 
 void rep_split(torch::Tensor ids, torch::Tensor tab, torch::Tensor cnt, torch::Tensor bc, torch::Tensor cut,
                torch::Tensor out, int64_t me, int64_t sb) {
+    const int mode = (int)(me >> 8);            // bits 8+: the cut mode (0 route, 1 block cost); bits 0-7: this rank
+    me &= 255;
     const int n_rep = (int)tab.size(0) - 256;
     const int topk = (int)ids.size(1), n_routes = (int)ids.numel();
     const int nb = (int)((ids.size(0) + sb - 1) / sb);
@@ -1499,14 +1541,14 @@ void rep_split(torch::Tensor ids, torch::Tensor tab, torch::Tensor cnt, torch::T
                 cut.scalar_type() == at::kInt && cut.numel() == 256 && cnt.scalar_type() == at::kInt &&
                 cnt.numel() == 256 && bc.scalar_type() == at::kInt && bc.numel() >= n_rep * nb && n_rep >= 0 &&
                 n_rep <= 64 && ids.is_contiguous() && out.is_contiguous() && out.numel() == ids.numel() && me >= 0 &&
-                me < 8 && nb >= 1 && smem <= 48 * 1024,
+                me < 8 && nb >= 1 && smem <= 48 * 1024 && (mode == 0 || mode == 1),
                 "pg rep_split: int32 ids [T, k], table [256 + n_rep <= 64], cnt / cut [256] (cnt zeroed), "
-                "bc [n_rep x token blocks <= 12288], out like ids, rank < 8");
+                "bc [n_rep x token blocks <= 12288], out like ids, rank < 8, cut mode 0 / 1");
     auto stream = at::cuda::getCurrentCUDAStream();
     pgk::pg_rep_count<<<nb, 256, 0, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(), n_rep,
                                               (int)sb, nb, cnt.data_ptr<int>(), bc.data_ptr<int>());
     pgk::pg_rep_cut<<<1, 1024, smem, stream>>>(tab.data_ptr<int>(), n_rep, (int)sb, nb, cnt.data_ptr<int>(),
-                                               bc.data_ptr<int>(), cut.data_ptr<int>());
+                                               bc.data_ptr<int>(), cut.data_ptr<int>(), mode);
     const int grid = (n_routes + 255) / 256 < 4 * pg_num_sms() ? (n_routes + 255) / 256 : 4 * pg_num_sms();
     pgk::pg_rep_split<<<grid, 256, 0, stream>>>(ids.data_ptr<int>(), n_routes, topk, tab.data_ptr<int>(),
                                                 cut.data_ptr<int>(), (int)me, out.data_ptr<int>());
