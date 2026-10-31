@@ -128,6 +128,33 @@ def setup(group_name, world, rank, device, s_max, hidden=4096, parities=2, agree
 # next A's qkv barrier on every rank); the unit runs both. join_push (required in graph form) discharges it either way.
 GUARD = True
 
+# Optional timing trace for a profiled pass (QA-P1SS §3, the M2b read): None = off (no events, nothing recorded). A list
+# collects one dict per push / stage / mark with timing events: push stream after the gate wait, after the words, after
+# the rows; side stream around the own copy; compute-stream marks the executor places (e.g. before M_b(j)'s first wait).
+# trace_summary() turns it into microseconds after a synchronize. Never on in a served pass.
+TRACE = None
+
+
+def _tev(stream):
+    e = torch.cuda.Event(enable_timing=True)
+    e.record(stream)
+    return e
+
+
+def mark(tag, stream=None):
+    """A compute-stream timing mark for the trace (no-op when TRACE is None)."""
+    if TRACE is not None:
+        TRACE.append({"kind": "mark", "tag": tag, "t": _tev(stream or torch.cuda.current_stream())})
+
+
+def trace_summary(origin):
+    """[(kind, tag / slot, {name: us since `origin`})] for the collected trace; call after torch.cuda.synchronize()."""
+    out = []
+    for r in TRACE or []:
+        evs = {k: origin.elapsed_time(v) * 1e3 for k, v in r.items() if isinstance(v, torch.cuda.Event)}
+        out.append((r["kind"], r.get("tag", r.get("slot")), evs))
+    return out
+
 
 class Gate:
     """The push-window gate (STRUCTURAL §3.1a amendment 3; QA-P1SS §3 c): an event plus a generation counter. A stream wait
@@ -161,10 +188,14 @@ def stage(st, x, scores, ids, par):
     ready = torch.cuda.Event()
     ready.record(cur)
     st.side.wait_event(ready)
+    tr = {"kind": "stage", "slot": par, "side0": _tev(st.side)} if TRACE is not None else None
     with torch.cuda.stream(st.side):
         st.rows[par][me][me * S:(me + 1) * S].copy_(x)
     own = torch.cuda.Event()
     own.record(st.side)
+    if tr is not None:
+        tr["side1"] = _tev(st.side)
+        TRACE.append(tr)
     st.own_done[par] = own
     st.held[par] = (x, scores, ids)               # the push stream reads x; dropped after the next same-parity fence
     st.pending[par] = (S, words, x, ready)
@@ -182,6 +213,7 @@ def push(st, par, gate=None, gate_gen=None):
     if gate is not None:
         st.push.wait_event(gate.ev)
     W, me, fl = st.W, st.me, st.flags
+    tr = {"kind": "push", "slot": par, "gated": gate is not None, "go": _tev(st.push)} if TRACE is not None else None
     with torch.cuda.stream(st.push):
         for s in range(1, W):
             p = (me + s) % W
@@ -189,6 +221,11 @@ def push(st, par, gate=None, gate_gen=None):
             fl.signal(st.push, p, par, _IDS)
             st.rows[par][p][me * S:(me + 1) * S].copy_(x)
             fl.signal(st.push, p, par, _ROWS)
+            if tr is not None and s == 1:
+                tr["first_rows"] = _tev(st.push)
+    if tr is not None:
+        tr["rows_done"] = _tev(st.push)
+        TRACE.append(tr)
     done = torch.cuda.Event()
     done.record(st.push)
     st.ce_done[par] = done
