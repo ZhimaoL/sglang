@@ -272,6 +272,20 @@ _okc_p1ss_collect = False   # P1-SS: _forward_gathered_experts returns its _OkcG
 # b(j)'s gated rows pushes are enqueued after a(j+1)'s qkv record (STRUCTURAL.md §3.1a push-form amendment 3). For the
 # last layer there is no next qkv: the registrant must push ungated there, or M_b waits on flags nobody sets.
 _OKC_POST_QKV = {}
+_OKC_POST_QKV_N = {"fired": 0, "fallback": 0, "warned": False}
+
+
+def okc_post_qkv_settle(layer):
+    """W1b's consumer calls this right before M_b(layer)'s flag waits: a hook whose qkv never came (a path that skips
+    MuseSpark1xAttention.forward's qkv line, a cleared dict, a misregistered layer) runs now, ungated. A missed gate then
+    costs contention, never a hang (qa-p1ss on ea7114fedd)."""
+    hook = _OKC_POST_QKV.pop(layer, None)
+    if hook is not None:
+        _OKC_POST_QKV_N["fallback"] += 1
+        if not _OKC_POST_QKV_N["warned"]:
+            _OKC_POST_QKV_N["warned"] = True
+            logger.warning("OKC W1b gate hook did not fire at layer %d; its pushes go ungated", layer)
+        hook()
 
 
 def _use_split_bf16_router(num_tokens: int) -> bool:
@@ -519,6 +533,7 @@ class MuseSpark1xAttention(nn.Module):
         if _OKC_POST_QKV:
             hook = _OKC_POST_QKV.pop(self.layer_idx, None)
             if hook is not None:
+                _OKC_POST_QKV_N["fired"] += 1
                 hook()
         rows = _OKC_RSB and self._okc_block_rows(qkv.shape[0])
         if rows:   # OKC rsfold O1: attention through the o-proj RS (okc_attn_rs)
@@ -1829,6 +1844,11 @@ class MuseSpark1xModel(nn.Module):
         from sglang.srt.model_executor.forward_context import forward_context
 
         last = len(self.layers) - 1
+        if getattr(self.layers[last].mlp, "nvfp4_checkpoint", False):
+            # The order has no A_a(L) after R_a(L-1), so nothing all-rank separates a peer's M_b(L-1) gg2 stores into
+            # the parity M1-RS slots from this rank's R_a(L-1) receive (p1ss-k3b's order prover). Every earlier pg layer
+            # is covered by the next layer's A barriers; today's last layer has BF16 experts (no pg, no M1-RS).
+            raise RuntimeError("P1-SS: the last decoder layer runs NVFP4 experts; its M1-RS slots would be unprotected")
         st = []
         for fb, ctx in zip(kids, ctxs):
             s0, s1 = fb.tbo_parent_token_range
@@ -2026,9 +2046,17 @@ class MuseSpark1xForCausalLM(nn.Module):
 
         kids, ctxs = okc_p1ss.split(forward_batch, okc_patch.P1SS_CUT)
         _OKC_POST_QKV.clear()   # a hook left by the previous pass's last layer never fires in this one
+        n0 = (_OKC_POST_QKV_N["fired"], _OKC_POST_QKV_N["fallback"])
         logger.info("OKC P1-SS pass: %d + %d tokens", okc_patch.P1SS_CUT, positions.shape[0] - okc_patch.P1SS_CUT)
-        outs = getattr(self.model, "language_model", self.model)._forward_p1ss(
-            input_ids, positions, kids, ctxs, input_embeds)
+        try:
+            outs = getattr(self.model, "language_model", self.model)._forward_p1ss(
+                input_ids, positions, kids, ctxs, input_embeds)
+        finally:   # an exception must not leak a pending push (with a stale gate) into the next pass
+            left = len(_OKC_POST_QKV)
+            _OKC_POST_QKV.clear()
+        fired, fallback = _OKC_POST_QKV_N["fired"] - n0[0], _OKC_POST_QKV_N["fallback"] - n0[1]
+        if fired or fallback or left:
+            logger.info("OKC W1b gate hooks: %d fired, %d fallback, %d never settled", fired, fallback, left)
         packed = None
         if outs[0][1] and any(o[3] for o in outs):   # an SP pass hands over its taps packed (and projected)
             packed = [pack_aux_hidden_states(o[1]) for o in outs]

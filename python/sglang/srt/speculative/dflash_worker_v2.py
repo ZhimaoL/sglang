@@ -2047,7 +2047,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
         ):
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            from sglang.kernels.ops.muse_spark_v12 import okc_patch
+
+            cut, dm = okc_patch.P1SS_CUT, self.draft_model
+            projected = (getattr(dm, "num_context_features", 1) > 1 and not getattr(dm, "quantizable", False)
+                         and int(target_hidden.shape[-1]) == int(dm.config.hidden_size))   # project_target_hidden's no-op case
+            if okc_patch.SW_P1SS and cache_loc_2d is None and num_tokens > cut and not projected:
+                # OKC P1-SS: taps that reach the draft unprojected (a child below SP_MIN_TOKENS, or no projection at SP
+                # exit) are projected per chunk too, at the sequential chunks' fc shapes (qa-p1ss on 86537db2ee)
+                if not getattr(self, "_okc_p1ss_proj_logged", False):
+                    self._okc_p1ss_proj_logged = True
+                    logger.info("OKC P1-SS: draft projection per %d-row chunk (unprojected taps, %d rows)", cut, num_tokens)
+                ctx_hidden = torch.cat([self.draft_model.project_target_hidden(target_hidden[s:s + cut])
+                                        for s in range(0, num_tokens, cut)])
+            else:
+                ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
             if self.lilicorr is not None:
                 self._lilicorr_anchor = publish_anchor(
                     draft_sampler=self._draft_sampler,
@@ -2104,8 +2118,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                         attn.attn.v_scale,
                     )
                 return
-
-            from sglang.kernels.ops.muse_spark_v12 import okc_patch
 
             # OKC P1-SS: a two-child pass materializes the draft KV per chunk, at the sequential chunks' GEMM shapes
             # (one 32K block can take another nvjet variant and change the draft's bits; qa-p1ss D3)
