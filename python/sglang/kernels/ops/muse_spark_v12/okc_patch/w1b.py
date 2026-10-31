@@ -148,6 +148,9 @@ def stage(st, x, scores, ids, par):
     """Compute side of A_x(j)'s produce, on the compute stream: x [S, H] bf16 (the shard prenorm), scores [S, 8] fp32,
     ids [S, 8] int32. Words into my own slot (cat(out=)), the own rows by a side-stream copy (never on the push stream: a
     same-device copy is an SM kernel). push() enqueues the peer copies; until then they are pending."""
+    if st.pending[par] is not None:
+        # a second same-slot stage before its push would drop the first child's pushes and M would hang (QA-P1SS §3)
+        raise RuntimeError(f"W1b: slot {par} is staged and not pushed; push() or discard() it first")
     S, me = x.shape[0], st.me
     cur = torch.cuda.current_stream()
     if GUARD and st.ce_done[par] is not None:     # the own-source fence, unless join_push already took it
@@ -189,6 +192,11 @@ def push(st, par, gate=None, gate_gen=None):
     done = torch.cuda.Event()
     done.record(st.push)
     st.ce_done[par] = done
+
+
+def discard(st, par):
+    """Drop a staged, never-pushed slot (tests; an aborted pass). Its own-slot writes stay; nothing was sent."""
+    st.pending[par] = None
 
 
 def produce(st, x, scores, ids, par, gate=None, gate_gen=None):
