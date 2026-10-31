@@ -188,6 +188,8 @@ RS_ATTN_BLOCKS_MIN_ROWS = int(os.environ.get("OKC_RS_ATTN_BLOCKS_MIN_ROWS", "115
 RS_ATTN_BLOCKS_GROUP = int(os.environ.get("OKC_RS_ATTN_BLOCKS_GROUP", "2"))
 # Full-attention layers too, in groups of this many destinations per fmha launch (0 = off; R4: 2-4 launches).
 RS_ATTN_BLOCKS_FULL = int(os.environ.get("OKC_RS_ATTN_BLOCKS_FULL", "4"))
+# MSF: matmul_rs's 16K o-proj GEMMs on a pinned no-workspace cuBLASLt algorithm (no per-call memset); sp_tp_ce._mm.
+SW_MSF = _flag("OKC_SW_MSF", "0")
 # ... and a padded bucket (the last chunk's real rows < rows x 8): blocks over the real rows, none past them (extend E39).
 RS_ATTN_BLOCKS_PADDED = _flag("OKC_RS_ATTN_BLOCKS_PADDED", "1")
 # NCCL SP MoE section: the pre-expert RMSNorm (per row) on the shard before the all-gather, not on the gathered chunk.
@@ -368,7 +370,7 @@ __all__ = ["SW_MOE_PG", "MOE_PG_MIN_TOKENS", "MOE_PG_ONLY", "MOE_PACK_MAX_LAYERS
            "SW_AG_NORM_HOPPER", "SW_FA3_FUSED_KV",
            "AR_TP8_GRAPH_MC_MIN_BYTES", "AR_TP8_GRAPH_2PUSH_MAX_BYTES", "HICACHE_STAGING_PAGES", "SW_HICACHE_WB_SPLIT", "SW_PREFILL_HANDOFF", "SW_BETWEEN_CHUNK", "BETWEEN_CHUNK_MAX_REQS", "SW_FOLLOWUP_ADMIT", "SW_BOUNDARY_EARLY", "BOUNDARY_EARLY_LAYERS",
            "SW_FU_MERGE", "FU_MERGE_PASSES", "FU_MERGE_MIN_LOAD", "GEMM_AG_POOLER_MAX_TOKENS", "GEMM_AG_UNPOOLER_MAX_TOKENS",
-           "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "RS_ATTN_BLOCKS_FULL",
+           "SW_RS_ATTN_BLOCKS", "RS_ATTN_BLOCKS_MIN_ROWS", "RS_ATTN_BLOCKS_GROUP", "RS_ATTN_BLOCKS_FULL", "SW_MSF",
            "RS_ATTN_BLOCKS_PADDED",
            "ANY_ATTN"]
 SW_AG_NORM_WIDE = _flag("OKC_SW_AG_NORM_WIDE", "1")  # M 33..128: fused AG + norm, row kernel at 1024 threads

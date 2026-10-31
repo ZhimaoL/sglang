@@ -29,6 +29,8 @@ import os
 
 import torch
 
+from sglang.kernels.ops.muse_spark_v12.okc_patch import SW_MSF
+
 logger = logging.getLogger(__name__)
 
 # Session SI's 8-GPU bench (16K / 8K chunks, ms per layer vs torch's fused ops): matmul + RS -0.055..-0.065 at 16K and
@@ -47,6 +49,14 @@ _logged = set()
 # rsfold: whether the next matmul_rs defers its slot sum, and (out, slots) of the one that did
 _defer = False
 _deferred = None
+# MSF (OKC_SW_MSF; serving/kernels/k3attn MSF1): the 16K chunk's o-proj GEMM, rows [2048, 1024] @ W [8192, 1024]^T, runs
+# as cuBLAS's nvjet coopA with a per-call 4-byte memset (its dynamic tile scheduler's counter). The pinned
+# nvjet_sm90_tst_144x128_64x6_1x2_h_ssched_bz_TNN called with no workspace has no memset: -5.2 us per GEMM on dev2, bitwise
+# to torch.mm. Any other shape, a capture before init, or a refusal takes torch.mm (counted).
+_MSF_SHAPE = (2048, 1024, 8192)
+_MSF_ALGO = bytes((66, 0, 0, 0, 184, 0, 0, 0, 35, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 5, 0, 1, 0, 0, 0, 53, 252, 1, 0, 14, 0, 0, 0, 14, 0, 0, 0, 14, 0, 14, 0, 68, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+_msf = None   # None: not tried; False: declined; else the extension
+MSF = {"lt": 0, "torch": 0}
 
 
 @contextlib.contextmanager
@@ -173,6 +183,45 @@ def ag_matmul_steps(st, x_shard, weight):
     return out
 
 
+def _msf_ready(dev):
+    global _msf
+    if _msf is None:
+        why = "msf_init refused (cuBLASLt version / AlgoCheck)"
+        try:
+            from sglang.kernels.ops.muse_spark_v12.okc_patch.cuda_ext import msf_ext
+
+            ext = msf_ext()
+            with torch.cuda.device(dev):
+                ok = ext.msf_init(_MSF_SHAPE[0], _MSF_SHAPE[2], _MSF_SHAPE[1],
+                                  torch.frombuffer(bytearray(_MSF_ALGO), dtype=torch.uint8))
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, repr(e)[:120]
+        _msf = ext if ok else False
+        if ok:
+            logger.info("OKC path active: msf_lt")
+        else:
+            logger.warning("OKC msf fallback: %s", why)
+    return _msf
+
+
+def _mm(a, weight, out=None):
+    """matmul_rs's GEMM a @ weight^T (into out when given): MSF's pinned no-workspace algo at the 16K shape, else torch.mm."""
+    global _msf
+    if (SW_MSF and tuple(a.shape) == _MSF_SHAPE[:2] and weight.shape[0] == _MSF_SHAPE[2] and a.dtype is torch.bfloat16
+            and weight.dtype is torch.bfloat16 and a.is_contiguous() and weight.is_contiguous()
+            and (out is None or out.is_contiguous())):
+        ext = _msf if _msf is not None or torch.cuda.is_current_stream_capturing() else _msf_ready(a.device)
+        if ext:
+            o = torch.empty((a.shape[0], weight.shape[0]), dtype=a.dtype, device=a.device) if out is None else out
+            if ext.msf_mm(a, weight, o):
+                MSF["lt"] += 1
+                return o
+            _msf = False
+            logger.warning("OKC msf fallback: cublasLtMatmul refused")
+        MSF["torch"] += 1
+    return torch.mm(a, weight.t()) if out is None else torch.mm(a, weight.t(), out=out)
+
+
 def matmul_rs_steps(st, x, weight):
     """Generator (yields the stream that needs a barrier; returns [S, N]): x [W*S, K] @ weight [N, K]^T, reduce-scattered
     over the ranks. st: rank, world, o (flat views of every rank's receive buffer), streams."""
@@ -180,7 +229,6 @@ def matmul_rs_steps(st, x, weight):
     M, K = x.shape
     W, me = st.world, st.rank
     S, N = M // W, weight.shape[0]
-    wt = weight.t()
     cur = torch.cuda.current_stream()
     X = st.streams[0]
     for s in st.streams:
@@ -192,7 +240,7 @@ def matmul_rs_steps(st, x, weight):
         rows = lambda j: x[j * S:(j + 1) * S]   # noqa: E731
     keep = []
     for j, dest in enumerate(_order(me, W)):
-        part = torch.mm(rows(dest), wt)
+        part = _mm(rows(dest), weight)
         keep.append(part)
         ev = torch.cuda.Event()
         ev.record(cur)
@@ -200,7 +248,7 @@ def matmul_rs_steps(st, x, weight):
         s.wait_event(ev)
         with torch.cuda.stream(s):
             st.o[dest][me * S * N:(me + 1) * S * N].copy_(part.view(-1))
-    torch.mm(rows(me), wt, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
+    _mm(rows(me), weight, out=st.o[me][me * S * N:(me + 1) * S * N].view(S, N))
     ev = torch.cuda.Event()
     ev.record(cur)
     X.wait_event(ev)

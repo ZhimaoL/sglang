@@ -21,6 +21,7 @@ _VFG_EXT = None
 _DRAFT_EXT = None
 _FTNORM_EXT = None
 _ROUTE_EXT = None
+_MSF_EXT = None
 
 def _build_dir(name: str):
     """None (torch's default build directory) when that is writable, else one under the temp dir: a read-only home or
@@ -85,11 +86,11 @@ def prebuild() -> None:
     import sys
     import threading
 
-    from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_N4, QK_FOLD, SW_M1RS
+    from sglang.kernels.ops.muse_spark_v12.okc_patch import PG64_N4, QK_FOLD, SW_M1RS, SW_MSF
 
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     names = (_PREBUILD + (_PREBUILD_M1RS if SW_M1RS else ()) + (("pg_n4_ext",) if PG64_N4 else ())
-             + (("ftnorm_ext",) if QK_FOLD else ()))
+             + (("ftnorm_ext",) if QK_FOLD else ()) + (("msf_ext",) if SW_MSF else ()))
     todo = queue.Queue()
     for f in names:
         todo.put(f)
@@ -367,6 +368,56 @@ def fmha_ext(exact: bool = False):
                     verbose=False,
                 )
     return _FMHA_EXT[key]
+
+
+# MSF (sp_tp_ce._mm): out [m, n] = x [m, k] @ w [n, k]^T as cuBLASLt TN (A = w op T, B = x, column-major), 32F compute,
+# with a pinned algo and NO workspace, so cuBLASLt runs the nvjet kernel's static-scheduler build (no per-call 4-byte
+# memset). msf_init: cuBLASLt 13.1.1 + AlgoCheck of the pinned blob at (m, n, k); msf_mm: false = refused, nothing queued.
+_MSF_CPP = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cublasLt.h>
+#include <cstring>
+#define OK(x) ((x) == CUBLAS_STATUS_SUCCESS)
+static cublasLtMatmulDesc_t op_ = nullptr;
+static cublasLtMatrixLayout_t a_ = nullptr, b_ = nullptr, c_ = nullptr;
+static cublasLtMatmulAlgo_t algo_;
+bool msf_init(int64_t m, int64_t n, int64_t k, torch::Tensor blob) {
+  if (op_ || cublasLtGetVersion() != 130101 || blob.numel() != (int64_t)sizeof(algo_)) return false;
+  cublasOperation_t t = CUBLAS_OP_T, nn = CUBLAS_OP_N;
+  cublasLtMatmulDesc_t op = nullptr; cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+  bool r = OK(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) &&
+           OK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &t, sizeof(t))) &&
+           OK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &nn, sizeof(nn))) &&
+           OK(cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, k, n, k)) && OK(cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, k, m, k)) &&
+           OK(cublasLtMatrixLayoutCreate(&c, CUDA_R_16BF, n, m, n));
+  std::memcpy(&algo_, blob.data_ptr<uint8_t>(), sizeof(algo_));
+  cublasLtMatmulHeuristicResult_t res = {};
+  r = r && OK(cublasLtMatmulAlgoCheck(at::cuda::getCurrentCUDABlasLtHandle(), op, a, b, c, c, &algo_, &res)) && OK(res.state);
+  if (!r) {
+    for (auto l : {a, b, c}) if (l) cublasLtMatrixLayoutDestroy(l);
+    if (op) cublasLtMatmulDescDestroy(op);
+    return false;
+  }
+  op_ = op; a_ = a; b_ = b; c_ = c;
+  return true;
+}
+bool msf_mm(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
+  const float one = 1.f, zero = 0.f;
+  return op_ && OK(cublasLtMatmul(at::cuda::getCurrentCUDABlasLtHandle(), op_, &one, w.data_ptr(), a_, x.data_ptr(), b_, &zero,
+                                  out.data_ptr(), c_, out.data_ptr(), c_, &algo_, nullptr, 0, at::cuda::getCurrentCUDAStream()));
+}
+"""
+
+
+def msf_ext():
+    global _MSF_EXT
+    if _MSF_EXT is None:
+        with _lock:
+            if _MSF_EXT is None:
+                _MSF_EXT = _load_inline(name="okc_msf_v1", cpp_sources=[_MSF_CPP], functions=["msf_init", "msf_mm"],
+                                        with_cuda=True, extra_cflags=["-O3"], extra_ldflags=["-lcublasLt"])
+    return _MSF_EXT
 
 
 def smallm_ext():
